@@ -275,10 +275,7 @@ int wmain(int argc, wchar_t* argv[]) {
     wprintf(L"[VirtLauncher] Launcher: %s\n", self64 ? L"64-bit" : L"32-bit");
 
     if (target64 != self64) {
-        wprintf(L"[VirtLauncher] WARNING: Architecture mismatch!\n"
-                L"               Use VirtLauncher%s.exe for this target.\n"
-                L"               Injection may fail.\n",
-                target64 ? L"64" : L"32");
+        wprintf(L"[VirtLauncher] Note: cross-arch launch (Detours will use rundll32 helper).\n");
     }
 
     // --------------------------------------------------------
@@ -368,12 +365,35 @@ int wmain(int argc, wchar_t* argv[]) {
     wprintf(L"[VirtLauncher] Command  : %s\n\n", cmdLine.c_str());
 
     // --------------------------------------------------------
-    // Convert DLL path to ANSI (Detours API limitation)
+    // Convert DLL paths to ANSI and build the DLL list.
+    // Pass BOTH VirtHook32.dll and VirtHook64.dll.
+    // DetourCreateProcessWithDllsW picks the right one automatically:
+    //   - Same arch -> injects directly.
+    //   - Different arch -> uses rundll32 helper + DetourFinishHelperProcess.
     // --------------------------------------------------------
-    char dllPathA[MAX_PATH] = {};
-    WideCharToMultiByte(CP_ACP, 0, dllPath, -1,
-                         dllPathA, MAX_PATH, NULL, NULL);
-    const char* dlls[1] = { dllPathA };
+    char dll32A[MAX_PATH] = {}, dll64A[MAX_PATH] = {};
+    {
+        wchar_t dll32W[MAX_PATH] = {}, dll64W[MAX_PATH] = {};
+        BuildHookDllPath(dll32W, MAX_PATH, false);
+        BuildHookDllPath(dll64W, MAX_PATH, true);
+        WideCharToMultiByte(CP_ACP, 0, dll32W, -1, dll32A, MAX_PATH, NULL, NULL);
+        WideCharToMultiByte(CP_ACP, 0, dll64W, -1, dll64A, MAX_PATH, NULL, NULL);
+    }
+
+    // Build the array: include a path only if the file actually exists.
+    const char* dlls[2]; DWORD nDlls = 0;
+    if (GetFileAttributesA(dll32A) != INVALID_FILE_ATTRIBUTES) dlls[nDlls++] = dll32A;
+    if (GetFileAttributesA(dll64A) != INVALID_FILE_ATTRIBUTES) dlls[nDlls++] = dll64A;
+    if (nDlls == 0) {
+        // Absolute fallback: just the originally-selected DLL
+        static char primaryA[MAX_PATH];
+        WideCharToMultiByte(CP_ACP, 0, dllPath, -1, primaryA, MAX_PATH, NULL, NULL);
+        dlls[nDlls++] = primaryA;
+    }
+
+    wprintf(L"[VirtLauncher] DLL list (%u):\n", nDlls);
+    for (DWORD i = 0; i < nDlls; ++i)
+        wprintf(L"               [%u] %S\n", i, dlls[i]);
 
     // --------------------------------------------------------
     // Launch target with DLL injection via Detours
@@ -383,19 +403,19 @@ int wmain(int argc, wchar_t* argv[]) {
     PROCESS_INFORMATION pi = {};
 
     BOOL ok = DetourCreateProcessWithDllsW(
-        appFullPath,       // lpApplicationName
-        &cmdBuf[0],        // lpCommandLine  (mutable)
-        NULL,              // lpProcessAttributes
-        NULL,              // lpThreadAttributes
-        FALSE,             // bInheritHandles
-        CREATE_DEFAULT_ERROR_MODE, // dwCreationFlags
-        NULL,              // lpEnvironment  (inherit from us, includes VIRTLAUNCHER_*)
-        NULL,              // lpCurrentDirectory
+        appFullPath,              // lpApplicationName
+        &cmdBuf[0],               // lpCommandLine  (mutable)
+        NULL,                     // lpProcessAttributes
+        NULL,                     // lpThreadAttributes
+        FALSE,                    // bInheritHandles
+        CREATE_DEFAULT_ERROR_MODE,// dwCreationFlags
+        NULL,                     // lpEnvironment  (inherited, includes VIRTLAUNCHER_*)
+        NULL,                     // lpCurrentDirectory
         &si,
         &pi,
-        1,                 // nDlls
-        dlls,              // rlpDlls  (ANSI paths)
-        NULL               // pfCreateProcessW
+        nDlls,                    // nDlls
+        dlls,                     // rlpDlls  (ANSI paths, both 32+64)
+        NULL                      // pfCreateProcessW (NULL = standard CreateProcessW)
     );
 
     if (!ok) {
