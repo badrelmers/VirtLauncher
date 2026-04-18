@@ -836,11 +836,12 @@ static NTSTATUS NTAPI Hook_NtCreateKey(
         return VL_STATUS_SUCCESS;
     }
 
-    VL_DBG(L"Hook_NtCreateKey: virtual create FAILED st=0x%08X, fallback to real", (ULONG)st);
-    // Fallback to real if virtual creation failed
+    // Virtual creation failed -- do NOT fall back silently to real location.
+    // Return the failure so the caller knows, rather than writing to the
+    // real registry without the application's knowledge.
+    VL_DBG(L"Hook_NtCreateKey: virtual create FAILED st=0x%08X -- NOT falling back", (ULONG)st);
     SetReentrant(false);
-    return Real_NtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes,
-                             TitleIndex, Class, CreateOptions, Disposition);
+    return st;
 }
 
 // ---- NtQueryKey ----
@@ -1323,6 +1324,46 @@ static void InstallHooks() {
         VL_GETPROC(ntdll, NtOpenFile);
     }
 
+    // ---------------------------------------------------------------
+    // CRITICAL: Create the VirtApp root key and all ancestor components
+    // BEFORE installing hooks, using raw (unhooked) function pointers.
+    //
+    // EnsureVirtualPath only creates components *below* g_VirtNtBase.
+    // If g_VirtNtBase itself doesn't exist, every NtCreateKey that calls
+    // EnsureVirtualPath will silently fail and fall through to the real
+    // location.  We fix this here, once, at startup.
+    // ---------------------------------------------------------------
+    if (g_RegEnabled && Real_NtCreateKey && Real_NtClose) {
+        // Walk every component of g_VirtNtBase and create it if missing.
+        // e.g. for "\Registry\User\SID\VirtApp" we create:
+        //   \Registry\User              (already exists, REG_OPENED_EXISTING)
+        //   \Registry\User\SID          (already exists)
+        //   \Registry\User\SID\VirtApp  (may be new)
+        std::wstring path;
+        const std::wstring& base = g_VirtNtBase;
+        size_t start = 1; // skip the leading '\'
+        while (start < base.size()) {
+            size_t slash = base.find(L'\\', start);
+            if (slash == std::wstring::npos) slash = base.size();
+            path = base.substr(0, slash);
+            start = slash + 1;
+
+            VL_UNICODE_STRING us; MakeUStr(&us, path);
+            VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
+            HANDLE h = NULL; ULONG disp = 0;
+            NTSTATUS st = Real_NtCreateKey(&h, KEY_ALL_ACCESS, &oa,
+                                            0, NULL, 0, &disp);
+            if (NT_SUCCESS(st) && h) {
+                VL_DBG(L"EnsureVirtRoot: created/opened %s (disp=%u)",
+                       path.c_str(), disp);
+                Real_NtClose(h);
+            } else {
+                VL_DBG(L"EnsureVirtRoot: FAILED to create %s st=0x%08X",
+                       path.c_str(), (ULONG)st);
+            }
+        }
+    }
+
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
 
@@ -1350,7 +1391,8 @@ static void InstallHooks() {
         VL_ATTACH(NtOpenFile);
     }
 
-    DetourTransactionCommit();
+    LONG commitResult = DetourTransactionCommit();
+    VL_DBG(L"InstallHooks: DetourTransactionCommit = %d (0=OK)", commitResult);
 }
 
 static void UninstallHooks() {
