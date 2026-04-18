@@ -230,6 +230,9 @@ typedef NTSTATUS (NTAPI *PfnNtCreateFile)
 typedef NTSTATUS (NTAPI *PfnNtOpenFile)
     (PHANDLE, ULONG, PVL_OBJECT_ATTRIBUTES, PVL_IO_STATUS_BLOCK, ULONG, ULONG);
 
+typedef NTSTATUS (NTAPI *PfnNtQueryFullAttributesFile)
+    (PVL_OBJECT_ATTRIBUTES, PVOID);
+
 typedef NTSTATUS (NTAPI *PfnNtSetInformationFile)
     (HANDLE, PVL_IO_STATUS_BLOCK, PVOID, ULONG, ULONG);
 
@@ -262,7 +265,8 @@ static PfnNtNotifyChangeKey    Real_NtNotifyChangeKey;
 static PfnNtClose              Real_NtClose;
 static PfnNtQueryObject        Real_NtQueryObject;
 static PfnNtCreateFile         Real_NtCreateFile;
-static PfnNtOpenFile           Real_NtOpenFile;
+static PfnNtOpenFile                Real_NtOpenFile;
+static PfnNtQueryFullAttributesFile Real_NtQueryFullAttributesFile;
 static PfnNtSetInformationFile Real_NtSetInformationFile;
 static PfnCreateProcessW       Real_CreateProcessW;
 static PfnCreateProcessA       Real_CreateProcessA;
@@ -1322,7 +1326,40 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
                             IoStatusBlock, ShareAccess, OpenOptions);
 }
 
-// ---- NtSetInformationFile -- intercept FileRenameInformation ----
+// ---- NtQueryFullAttributesFile -- used by GetFileAttributesW ----
+//
+// cmd.exe calls GetFileAttributesW(src) to check file existence before rename.
+// This goes through NtQueryFullAttributesFile, NOT NtOpenFile/NtCreateFile.
+// Without this hook the existence check fails on the real path and cmd bails
+// before ever reaching MoveFileW.
+static NTSTATUS NTAPI Hook_NtQueryFullAttributesFile(
+    PVL_OBJECT_ATTRIBUTES ObjectAttributes,
+    PVOID                 FileInformation)  // FILE_NETWORK_OPEN_INFORMATION
+{
+    if (ObjectAttributes && ObjectAttributes->ObjectName)
+        VL_DBG(L"Hook_NtQueryFullAttributesFile: %s", FromUStr(ObjectAttributes->ObjectName).c_str());
+
+    if (!g_FsEnabled || !ObjectAttributes || !ObjectAttributes->ObjectName ||
+        IsReentrant())
+    {
+        return Real_NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
+    }
+
+    std::wstring ntPath  = FromUStr(ObjectAttributes->ObjectName);
+    std::wstring redPath = ApplyFsRedirect(ntPath);
+
+    if (redPath == ntPath) {
+        VL_DBG(L"Hook_NtQueryFullAttributesFile: no redirect for %s", ntPath.c_str());
+        return Real_NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
+    }
+
+    VL_DBG(L"Hook_NtQueryFullAttributesFile: REDIRECT %s -> %s", ntPath.c_str(), redPath.c_str());
+    VL_UNICODE_STRING newName; MakeUStr(&newName, redPath);
+    VL_OBJECT_ATTRIBUTES newOa = *ObjectAttributes;
+    newOa.ObjectName = &newName;
+
+    return Real_NtQueryFullAttributesFile(&newOa, FileInformation);
+}
 //
 // When an app renames a file the kernel path of the NEW name is embedded
 // inside a FILE_RENAME_INFORMATION / FILE_RENAME_INFORMATION_EX structure
@@ -1577,6 +1614,7 @@ static void InstallHooks() {
     if (g_FsEnabled) {
         VL_GETPROC(ntdll, NtCreateFile);
         VL_GETPROC(ntdll, NtOpenFile);
+        VL_GETPROC(ntdll, NtQueryFullAttributesFile);
         VL_GETPROC(ntdll, NtSetInformationFile);
         VL_GETPROC(k32,   MoveFileExW);
         // MoveFileExW may live in KernelBase on Win8+; fall back if needed
@@ -1654,6 +1692,7 @@ static void InstallHooks() {
     if (g_FsEnabled) {
         VL_ATTACH(NtCreateFile);
         VL_ATTACH(NtOpenFile);
+        if (Real_NtQueryFullAttributesFile) VL_ATTACH(NtQueryFullAttributesFile);
         if (Real_NtSetInformationFile) VL_ATTACH(NtSetInformationFile);
         if (Real_MoveFileExW)          VL_ATTACH(MoveFileExW);
     }
@@ -1685,6 +1724,7 @@ static void UninstallHooks() {
     if (g_FsEnabled) {
         VL_DETACH(NtCreateFile);
         VL_DETACH(NtOpenFile);
+        if (Real_NtQueryFullAttributesFile) VL_DETACH(NtQueryFullAttributesFile);
         if (Real_NtSetInformationFile) VL_DETACH(NtSetInformationFile);
         if (Real_MoveFileExW)          VL_DETACH(MoveFileExW);
     }
