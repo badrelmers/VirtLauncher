@@ -1251,6 +1251,10 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
     PVOID               EaBuffer,
     ULONG               EaLength)
 {
+    // Unconditional: if this never appears the hook is not installed at all
+    if (ObjectAttributes && ObjectAttributes->ObjectName)
+        VL_DBG(L"Hook_NtCreateFile ENTRY: %s", FromUStr(ObjectAttributes->ObjectName).c_str());
+
     if (!g_FsEnabled || !ObjectAttributes || !ObjectAttributes->ObjectName ||
         IsReentrant())
     {
@@ -1262,6 +1266,8 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
 
     std::wstring ntPath  = FromUStr(ObjectAttributes->ObjectName);
     std::wstring redPath = ApplyFsRedirect(ntPath);
+    VL_DBG(L"Hook_NtCreateFile: path=%s%s", ntPath.c_str(),
+           redPath != ntPath ? L" [REDIRECTED]" : L"");
 
     if (redPath == ntPath) {
         return Real_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
@@ -1421,7 +1427,7 @@ static BOOL WINAPI Hook_MoveFileExW(
     LPCWSTR lpNewFileName,
     DWORD   dwFlags)
 {
-    VL_DBG(L"Hook_MoveFileExW: src=%s dst=%s",
+    VL_DBG(L"Hook_MoveFileExW ENTRY: src=%s dst=%s",
            lpExistingFileName ? lpExistingFileName : L"(null)",
            lpNewFileName      ? lpNewFileName      : L"(null)");
 
@@ -1573,6 +1579,9 @@ static void InstallHooks() {
             HMODULE kb = GetModuleHandleA("KernelBase.dll");
             if (kb) Real_MoveFileExW = (PfnMoveFileExW)GetProcAddress(kb, "MoveFileExW");
         }
+        VL_DBG(L"InstallHooks: FS ptrs NtCreateFile=%p NtOpenFile=%p NtSetInfoFile=%p MoveFileExW=%p",
+               (void*)Real_NtCreateFile, (void*)Real_NtOpenFile,
+               (void*)Real_NtSetInformationFile, (void*)Real_MoveFileExW);
     }
 
     // ---------------------------------------------------------------
