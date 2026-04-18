@@ -241,6 +241,8 @@ typedef BOOL (WINAPI *PfnCreateProcessA)
     (LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES,
      BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
 
+typedef BOOL (WINAPI *PfnMoveFileExW)(LPCWSTR, LPCWSTR, DWORD);
+
 // ============================================================
 // Global State
 // ============================================================
@@ -264,6 +266,7 @@ static PfnNtOpenFile           Real_NtOpenFile;
 static PfnNtSetInformationFile Real_NtSetInformationFile;
 static PfnCreateProcessW       Real_CreateProcessW;
 static PfnCreateProcessA       Real_CreateProcessA;
+static PfnMoveFileExW          Real_MoveFileExW;
 
 // Config flags
 static bool g_RegEnabled = false;
@@ -1315,15 +1318,40 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
 // passed here.  We patch that target path through ApplyFsRedirect so that
 // both ends of the rename land in the virtual store.
 //
-// FILE_RENAME_INFORMATION layout (matches both 32-bit and 64-bit):
-//   BOOLEAN  ReplaceIfExists   (ULONG in EX variant)
-//   BOOLEAN  pad[3]
-//   HANDLE   RootDirectory
-//   ULONG    FileNameLength    (bytes, not chars)
-//   WCHAR    FileName[1]
+// FILE_RENAME_INFORMATION true layout (compiler-padded):
+//
+//   32-bit:
+//     offset  0 : BOOLEAN ReplaceIfExists (1 byte)
+//     offset  1 : pad[3]
+//     offset  4 : HANDLE  RootDirectory   (4 bytes)
+//     offset  8 : ULONG   FileNameLength  (4 bytes)
+//     offset 12 : WCHAR   FileName[1]
+//
+//   64-bit:
+//     offset  0 : BOOLEAN ReplaceIfExists (1 byte)
+//     offset  1 : pad[7]
+//     offset  8 : HANDLE  RootDirectory   (8 bytes)
+//     offset 16 : ULONG   FileNameLength  (4 bytes)
+//     offset 20 : WCHAR   FileName[1]
+//
+// FileRenameInformationEx (Win10 RS1+) has ULONG Flags at offset 0
+// instead of BOOLEAN, but the rest of the layout is identical per-bitness.
 
 #define FileRenameInformation   10
 #define FileRenameInformationEx 65   // Windows 10 RS1+
+
+// Correct offsets based on actual struct layout:
+#ifdef _WIN64
+  #define RENAME_INFO_HANDLE_OFFSET   8
+  #define RENAME_INFO_NAMELEN_OFFSET  16
+  #define RENAME_INFO_NAME_OFFSET     20
+  #define RENAME_INFO_MIN_SIZE        20
+#else
+  #define RENAME_INFO_HANDLE_OFFSET   4
+  #define RENAME_INFO_NAMELEN_OFFSET  8
+  #define RENAME_INFO_NAME_OFFSET     12
+  #define RENAME_INFO_MIN_SIZE        12
+#endif
 
 static NTSTATUS NTAPI Hook_NtSetInformationFile(
     HANDLE              FileHandle,
@@ -1332,74 +1360,108 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
     ULONG               Length,
     ULONG               FileInformationClass)
 {
+    VL_DBG(L"Hook_NtSetInformationFile: class=%u len=%u fsEnabled=%d",
+           FileInformationClass, Length, (int)g_FsEnabled);
+
     if (!g_FsEnabled || IsReentrant() ||
         (FileInformationClass != FileRenameInformation &&
          FileInformationClass != FileRenameInformationEx) ||
-        !FileInformation || Length < (ULONG)(sizeof(ULONG)*2 + sizeof(HANDLE) + sizeof(ULONG)))
+        !FileInformation || Length < RENAME_INFO_MIN_SIZE)
     {
         return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
                                           FileInformation, Length,
                                           FileInformationClass);
     }
 
-    // Both variants share the same layout for our purposes:
-    //   offset 0 : flags   (ULONG)
-    //   offset 4 : pad     (ULONG)  -- aligns HANDLE on 64-bit; same on 32
-    //   offset 4/8: RootDirectory (HANDLE -- 4 or 8 bytes)
-    //   after handle: FileNameLength (ULONG)
-    //   after that  : FileName (WCHAR[])
-    //
-    // We use byte arithmetic to stay layout-independent.
-    BYTE*  p              = (BYTE*)FileInformation;
-    ULONG  flagsSize      = sizeof(ULONG);          // ReplaceIfExists/Flags
-    ULONG  handleOffset   = flagsSize + sizeof(ULONG); // pad to align HANDLE
-    // On 32-bit the HANDLE is 4 bytes; on 64-bit it is 8.
-    ULONG  handleSize     = sizeof(HANDLE);
-    ULONG  nameLenOffset  = handleOffset + handleSize;
-    ULONG  nameOffset     = nameLenOffset + sizeof(ULONG);
+    BYTE* p           = (BYTE*)FileInformation;
+    ULONG nameByteLen = *(ULONG*)(p + RENAME_INFO_NAMELEN_OFFSET);
 
-    if (Length < nameOffset) {
+    if (nameByteLen == 0 || Length < (ULONG)(RENAME_INFO_NAME_OFFSET + nameByteLen)) {
         return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
                                           FileInformation, Length,
                                           FileInformationClass);
     }
 
-    ULONG  nameByteLen = *(ULONG*)(p + nameLenOffset);
-    if (Length < nameOffset + nameByteLen || nameByteLen == 0) {
-        return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
-                                          FileInformation, Length,
-                                          FileInformationClass);
-    }
+    std::wstring origName((WCHAR*)(p + RENAME_INFO_NAME_OFFSET),
+                          nameByteLen / sizeof(WCHAR));
+    VL_DBG(L"Hook_NtSetInformationFile: rename dest orig=%s", origName.c_str());
 
-    // Extract the target filename as a wstring (may be relative or absolute NT)
-    std::wstring origName((WCHAR*)(p + nameOffset), nameByteLen / sizeof(WCHAR));
     std::wstring redName = ApplyFsRedirect(origName);
 
-    VL_DBG(L"Hook_NtSetInformationFile: rename target orig=%s", origName.c_str());
-
     if (redName == origName) {
-        // No redirect needed
+        VL_DBG(L"Hook_NtSetInformationFile: no redirect for dest");
         return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
                                           FileInformation, Length,
                                           FileInformationClass);
     }
 
-    VL_DBG(L"Hook_NtSetInformationFile: rename target redir=%s", redName.c_str());
+    VL_DBG(L"Hook_NtSetInformationFile: rename dest redir=%s", redName.c_str());
 
-    // Build a new buffer with the redirected filename
     ULONG  newNameBytes = (ULONG)(redName.size() * sizeof(WCHAR));
-    ULONG  newLength    = nameOffset + newNameBytes;
+    ULONG  newLength    = RENAME_INFO_NAME_OFFSET + newNameBytes;
     std::vector<BYTE> buf(newLength, 0);
-    // Copy flags, pad, RootDirectory, FileNameLength fields verbatim
-    memcpy(buf.data(), p, nameOffset);
-    // Overwrite FileNameLength with new length
-    *(ULONG*)(buf.data() + nameLenOffset) = newNameBytes;
-    // Copy redirected filename
-    memcpy(buf.data() + nameOffset, redName.c_str(), newNameBytes);
+    memcpy(buf.data(), p, RENAME_INFO_NAME_OFFSET);
+    *(ULONG*)(buf.data() + RENAME_INFO_NAMELEN_OFFSET) = newNameBytes;
+    memcpy(buf.data() + RENAME_INFO_NAME_OFFSET, redName.c_str(), newNameBytes);
 
     return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
                                       buf.data(), newLength,
                                       FileInformationClass);
+}
+
+// ---- MoveFileW / MoveFileExW -- belt-and-suspenders FS rename hook ----
+//
+// NtSetInformationFile handles the kernel rename path, but we also hook
+// the Win32 MoveFile* APIs directly. This catches cases where the
+// destination path is constructed in Win32 space before ever reaching
+// the NT layer, and ensures both source and destination are redirected.
+
+static BOOL WINAPI Hook_MoveFileExW(
+    LPCWSTR lpExistingFileName,
+    LPCWSTR lpNewFileName,
+    DWORD   dwFlags)
+{
+    VL_DBG(L"Hook_MoveFileExW: src=%s dst=%s",
+           lpExistingFileName ? lpExistingFileName : L"(null)",
+           lpNewFileName      ? lpNewFileName      : L"(null)");
+
+    if (!g_FsEnabled || IsReentrant()) {
+        return Real_MoveFileExW(lpExistingFileName, lpNewFileName, dwFlags);
+    }
+
+    // Convert Win32 paths to NT, apply redirect, convert back to Win32
+    std::wstring srcNt = lpExistingFileName ? Win32ToNtPath(lpExistingFileName) : L"";
+    std::wstring dstNt = lpNewFileName      ? Win32ToNtPath(lpNewFileName)      : L"";
+
+    std::wstring srcRed = srcNt.empty() ? srcNt : ApplyFsRedirect(srcNt);
+    std::wstring dstRed = dstNt.empty() ? dstNt : ApplyFsRedirect(dstNt);
+
+    // Convert back to Win32 (strip \??\ prefix)
+    auto toWin32 = [](const std::wstring& nt) -> std::wstring {
+        if (nt.size() > 4 && nt[0]==L'\\' && nt[1]==L'?' &&
+            nt[2]==L'?' && nt[3]==L'\\')
+            return nt.substr(4);
+        return nt;
+    };
+
+    bool srcChanged = (!srcNt.empty() && srcRed != srcNt);
+    bool dstChanged = (!dstNt.empty() && dstRed != dstNt);
+
+    if (!srcChanged && !dstChanged) {
+        return Real_MoveFileExW(lpExistingFileName, lpNewFileName, dwFlags);
+    }
+
+    std::wstring newSrc = srcChanged ? toWin32(srcRed) : lpExistingFileName;
+    std::wstring newDst = dstChanged ? toWin32(dstRed) : (lpNewFileName ? lpNewFileName : L"");
+
+    VL_DBG(L"Hook_MoveFileExW: redir src=%s dst=%s", newSrc.c_str(), newDst.c_str());
+
+    SetReentrant(true);
+    BOOL result = Real_MoveFileExW(newSrc.c_str(),
+                                    lpNewFileName ? newDst.c_str() : NULL,
+                                    dwFlags);
+    SetReentrant(false);
+    return result;
 }
 
 // ============================================================
@@ -1505,6 +1567,12 @@ static void InstallHooks() {
         VL_GETPROC(ntdll, NtCreateFile);
         VL_GETPROC(ntdll, NtOpenFile);
         VL_GETPROC(ntdll, NtSetInformationFile);
+        VL_GETPROC(k32,   MoveFileExW);
+        // MoveFileExW may live in KernelBase on Win8+; fall back if needed
+        if (!Real_MoveFileExW) {
+            HMODULE kb = GetModuleHandleA("KernelBase.dll");
+            if (kb) Real_MoveFileExW = (PfnMoveFileExW)GetProcAddress(kb, "MoveFileExW");
+        }
     }
 
     // ---------------------------------------------------------------
@@ -1573,8 +1641,8 @@ static void InstallHooks() {
         VL_ATTACH(NtCreateFile);
         VL_ATTACH(NtOpenFile);
         if (Real_NtSetInformationFile) VL_ATTACH(NtSetInformationFile);
+        if (Real_MoveFileExW)          VL_ATTACH(MoveFileExW);
     }
-
     LONG commitResult = DetourTransactionCommit();
     VL_DBG(L"InstallHooks: DetourTransactionCommit = %d (0=OK)", commitResult);
 }
@@ -1604,6 +1672,7 @@ static void UninstallHooks() {
         VL_DETACH(NtCreateFile);
         VL_DETACH(NtOpenFile);
         if (Real_NtSetInformationFile) VL_DETACH(NtSetInformationFile);
+        if (Real_MoveFileExW)          VL_DETACH(MoveFileExW);
     }
 
     DetourTransactionCommit();
