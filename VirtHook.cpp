@@ -1259,8 +1259,10 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
     PVOID               EaBuffer,
     ULONG               EaLength)
 {
-    if (ObjectAttributes && ObjectAttributes->ObjectName)
-        VL_DBG(L"Hook_NtCreateFile: %s", FromUStr(ObjectAttributes->ObjectName).c_str());
+    // Resolve full path including RootDirectory handle (handles relative opens)
+    std::wstring ntPath = ObjectAttributes ? GetFullNtPath(ObjectAttributes) : L"";
+    if (!ntPath.empty())
+        VL_DBG(L"Hook_NtCreateFile: %s", ntPath.c_str());
 
     if (!g_FsEnabled || !ObjectAttributes || !ObjectAttributes->ObjectName ||
         IsReentrant())
@@ -1271,7 +1273,6 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
                                   EaBuffer, EaLength);
     }
 
-    std::wstring ntPath  = FromUStr(ObjectAttributes->ObjectName);
     std::wstring redPath = ApplyFsRedirect(ntPath);
 
     if (redPath == ntPath) {
@@ -1284,9 +1285,11 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
 
     VL_DBG(L"Hook_NtCreateFile: REDIRECT %s -> %s", ntPath.c_str(), redPath.c_str());
 
+    // Use absolute redirected path with no RootDirectory
     VL_UNICODE_STRING newName;  MakeUStr(&newName, redPath);
     VL_OBJECT_ATTRIBUTES newOa = *ObjectAttributes;
-    newOa.ObjectName = &newName;
+    newOa.ObjectName    = &newName;
+    newOa.RootDirectory = NULL;
 
     return Real_NtCreateFile(FileHandle, DesiredAccess, &newOa,
                               IoStatusBlock, AllocationSize, FileAttributes,
@@ -1302,8 +1305,9 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
     ULONG               ShareAccess,
     ULONG               OpenOptions)
 {
-    if (ObjectAttributes && ObjectAttributes->ObjectName)
-        VL_DBG(L"Hook_NtOpenFile: %s", FromUStr(ObjectAttributes->ObjectName).c_str());
+    std::wstring ntPath = ObjectAttributes ? GetFullNtPath(ObjectAttributes) : L"";
+    if (!ntPath.empty())
+        VL_DBG(L"Hook_NtOpenFile: %s", ntPath.c_str());
 
     if (!g_FsEnabled || !ObjectAttributes || !ObjectAttributes->ObjectName ||
         IsReentrant())
@@ -1312,7 +1316,6 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
                                 IoStatusBlock, ShareAccess, OpenOptions);
     }
 
-    std::wstring ntPath  = FromUStr(ObjectAttributes->ObjectName);
     std::wstring redPath = ApplyFsRedirect(ntPath);
 
     if (redPath == ntPath) {
@@ -1324,7 +1327,8 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
     VL_DBG(L"Hook_NtOpenFile: REDIRECT %s -> %s", ntPath.c_str(), redPath.c_str());
     VL_UNICODE_STRING newName;  MakeUStr(&newName, redPath);
     VL_OBJECT_ATTRIBUTES newOa = *ObjectAttributes;
-    newOa.ObjectName = &newName;
+    newOa.ObjectName    = &newName;
+    newOa.RootDirectory = NULL;
 
     return Real_NtOpenFile(FileHandle, DesiredAccess, &newOa,
                             IoStatusBlock, ShareAccess, OpenOptions);
@@ -1340,8 +1344,9 @@ static NTSTATUS NTAPI Hook_NtQueryFullAttributesFile(
     PVL_OBJECT_ATTRIBUTES ObjectAttributes,
     PVOID                 FileInformation)  // FILE_NETWORK_OPEN_INFORMATION
 {
-    if (ObjectAttributes && ObjectAttributes->ObjectName)
-        VL_DBG(L"Hook_NtQueryFullAttributesFile: %s", FromUStr(ObjectAttributes->ObjectName).c_str());
+    std::wstring ntPath = ObjectAttributes ? GetFullNtPath(ObjectAttributes) : L"";
+    if (!ntPath.empty())
+        VL_DBG(L"Hook_NtQueryFullAttributesFile: %s", ntPath.c_str());
 
     if (!g_FsEnabled || !ObjectAttributes || !ObjectAttributes->ObjectName ||
         IsReentrant())
@@ -1349,7 +1354,6 @@ static NTSTATUS NTAPI Hook_NtQueryFullAttributesFile(
         return Real_NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
     }
 
-    std::wstring ntPath  = FromUStr(ObjectAttributes->ObjectName);
     std::wstring redPath = ApplyFsRedirect(ntPath);
 
     if (redPath == ntPath) {
@@ -1360,7 +1364,8 @@ static NTSTATUS NTAPI Hook_NtQueryFullAttributesFile(
     VL_DBG(L"Hook_NtQueryFullAttributesFile: REDIRECT %s -> %s", ntPath.c_str(), redPath.c_str());
     VL_UNICODE_STRING newName; MakeUStr(&newName, redPath);
     VL_OBJECT_ATTRIBUTES newOa = *ObjectAttributes;
-    newOa.ObjectName = &newName;
+    newOa.ObjectName    = &newName;
+    newOa.RootDirectory = NULL;
 
     return Real_NtQueryFullAttributesFile(&newOa, FileInformation);
 }
