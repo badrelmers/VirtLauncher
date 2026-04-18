@@ -246,6 +246,9 @@ typedef BOOL (WINAPI *PfnCreateProcessA)
 
 typedef BOOL (WINAPI *PfnMoveFileExW)(LPCWSTR, LPCWSTR, DWORD);
 
+typedef HANDLE (WINAPI *PfnFindFirstFileExW)
+    (LPCWSTR, FINDEX_INFO_LEVELS, LPVOID, FINDEX_SEARCH_OPS, LPVOID, DWORD);
+
 // ============================================================
 // Global State
 // ============================================================
@@ -271,6 +274,7 @@ static PfnNtSetInformationFile Real_NtSetInformationFile;
 static PfnCreateProcessW       Real_CreateProcessW;
 static PfnCreateProcessA       Real_CreateProcessA;
 static PfnMoveFileExW          Real_MoveFileExW;
+static PfnFindFirstFileExW     Real_FindFirstFileExW;
 
 // Config flags
 static bool g_RegEnabled = false;
@@ -1457,6 +1461,52 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
                                       FileInformationClass);
 }
 
+// ---- FindFirstFileExW -- cmd.exe uses this to check file existence before rename ----
+//
+// cmd.exe calls FindFirstFileExW(src) for wildcard expansion BEFORE calling
+// MoveFileW. If the source doesn't appear to exist, cmd bails immediately.
+// We redirect the Win32 path here so the virtual file is found.
+
+static HANDLE WINAPI Hook_FindFirstFileExW(
+    LPCWSTR            lpFileName,
+    FINDEX_INFO_LEVELS fInfoLevelId,
+    LPVOID             lpFindFileData,
+    FINDEX_SEARCH_OPS  fSearchOp,
+    LPVOID             lpSearchFilter,
+    DWORD              dwAdditionalFlags)
+{
+    VL_DBG(L"Hook_FindFirstFileExW: %s", lpFileName ? lpFileName : L"(null)");
+
+    if (!g_FsEnabled || IsReentrant() || !lpFileName) {
+        return Real_FindFirstFileExW(lpFileName, fInfoLevelId, lpFindFileData,
+                                      fSearchOp, lpSearchFilter, dwAdditionalFlags);
+    }
+
+    std::wstring ntPath  = Win32ToNtPath(lpFileName);
+    std::wstring redNt   = ApplyFsRedirect(ntPath);
+
+    if (redNt == ntPath) {
+        VL_DBG(L"Hook_FindFirstFileExW: no redirect");
+        return Real_FindFirstFileExW(lpFileName, fInfoLevelId, lpFindFileData,
+                                      fSearchOp, lpSearchFilter, dwAdditionalFlags);
+    }
+
+    // Strip \??\ back to Win32 for the redirected path
+    std::wstring redWin32 = redNt;
+    if (redWin32.size() > 4 &&
+        redWin32[0]==L'\\' && redWin32[1]==L'?' &&
+        redWin32[2]==L'?' && redWin32[3]==L'\\')
+        redWin32 = redWin32.substr(4);
+
+    VL_DBG(L"Hook_FindFirstFileExW: REDIRECT %s -> %s", lpFileName, redWin32.c_str());
+
+    SetReentrant(true);
+    HANDLE h = Real_FindFirstFileExW(redWin32.c_str(), fInfoLevelId, lpFindFileData,
+                                      fSearchOp, lpSearchFilter, dwAdditionalFlags);
+    SetReentrant(false);
+    return h;
+}
+
 // ---- MoveFileW / MoveFileExW -- belt-and-suspenders FS rename hook ----
 //
 // NtSetInformationFile handles the kernel rename path, but we also hook
@@ -1622,6 +1672,11 @@ static void InstallHooks() {
             HMODULE kb = GetModuleHandleA("KernelBase.dll");
             if (kb) Real_MoveFileExW = (PfnMoveFileExW)GetProcAddress(kb, "MoveFileExW");
         }
+        VL_GETPROC(k32,   FindFirstFileExW);
+        if (!Real_FindFirstFileExW) {
+            HMODULE kb = GetModuleHandleA("KernelBase.dll");
+            if (kb) Real_FindFirstFileExW = (PfnFindFirstFileExW)GetProcAddress(kb, "FindFirstFileExW");
+        }
         VL_DBG(L"InstallHooks FS ptrs: NtCreateFile=%p NtOpenFile=%p NtSetInfoFile=%p MoveFileExW=%p",
                (void*)Real_NtCreateFile, (void*)Real_NtOpenFile,
                (void*)Real_NtSetInformationFile, (void*)Real_MoveFileExW);
@@ -1695,6 +1750,7 @@ static void InstallHooks() {
         if (Real_NtQueryFullAttributesFile) VL_ATTACH(NtQueryFullAttributesFile);
         if (Real_NtSetInformationFile) VL_ATTACH(NtSetInformationFile);
         if (Real_MoveFileExW)          VL_ATTACH(MoveFileExW);
+        if (Real_FindFirstFileExW)     VL_ATTACH(FindFirstFileExW);
     }
     LONG commitResult = DetourTransactionCommit();
     VL_DBG(L"InstallHooks: DetourTransactionCommit = %d (0=OK)", commitResult);
@@ -1727,6 +1783,7 @@ static void UninstallHooks() {
         if (Real_NtQueryFullAttributesFile) VL_DETACH(NtQueryFullAttributesFile);
         if (Real_NtSetInformationFile) VL_DETACH(NtSetInformationFile);
         if (Real_MoveFileExW)          VL_DETACH(MoveFileExW);
+        if (Real_FindFirstFileExW)     VL_DETACH(FindFirstFileExW);
     }
 
     DetourTransactionCommit();
