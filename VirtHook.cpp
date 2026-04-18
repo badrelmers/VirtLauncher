@@ -2172,23 +2172,25 @@ static bool IsProcess64(HANDLE hProcess) {
 #endif
 }
 
-static bool InjectIntoProcess(HANDLE hProcess) {
-    bool target64  = IsProcess64(hProcess);
-    // Pick arch-specific DLL; fall back to the launcher's primary DLL path
-    const char* dllPath = target64
-        ? (g_DllPathA64[0] ? g_DllPathA64 : g_DllPathA)
-        : (g_DllPathA32[0] ? g_DllPathA32 : g_DllPathA);
-
-    if (!dllPath || !dllPath[0]) {
-        VL_DBG(L"InjectIntoProcess: no DLL path available for target64=%d", (int)target64);
-        return false;
-    }
-
-    VL_DBG(L"InjectIntoProcess: target64=%d dll=%S process=%p",
-           (int)target64, dllPath, hProcess);
-    const char* dlls[] = { dllPath };
-    return DetourUpdateProcessWithDll(hProcess, dlls, 1) != FALSE;
-}
+// ============================================================
+// CHILD PROCESS PROPAGATION
+// ============================================================
+//
+// We use DetourCreateProcessWithDllsW / DetourCreateProcessWithDllExA
+// instead of the old DetourUpdateProcessWithDll.
+//
+// DetourCreateProcessWithDlls* is the ONLY Detours API that handles
+// cross-architecture injection (32->64 or 64->32) by spawning a
+// temporary rundll32.exe helper process.  DetourUpdateProcessWithDll
+// is a raw binary patcher that cannot cross the bitness boundary.
+//
+// Key rules (from Detours docs):
+//   - Pass our own-arch DLL path (ending in "32" or "64").
+//     Detours auto-swaps the suffix when the target differs.
+//   - Pass Real_CreateProcess* as pfCreateProcess so Detours
+//     calls the real API, not our hook (no infinite recursion).
+//   - Detours manages CREATE_SUSPENDED + ResumeThread internally.
+// ============================================================
 
 static BOOL WINAPI Hook_CreateProcessW(
     LPCWSTR               lpApplicationName,
@@ -2206,16 +2208,51 @@ static BOOL WINAPI Hook_CreateProcessW(
            lpApplicationName ? lpApplicationName : L"(null)",
            lpCommandLine     ? lpCommandLine     : L"(null)");
 
-    DWORD flags = dwCreationFlags | CREATE_SUSPENDED;
-    BOOL ok = Real_CreateProcessW(lpApplicationName, lpCommandLine,
+    // Pick our own-arch DLL so Detours can swap 32<->64 as needed.
+#ifdef _WIN64
+    const char* dllPath = g_DllPathA64[0] ? g_DllPathA64 : g_DllPathA;
+#else
+    const char* dllPath = g_DllPathA32[0] ? g_DllPathA32 : g_DllPathA;
+#endif
+
+    if (!dllPath || !dllPath[0]) {
+        VL_DBG(L"Hook_CreateProcessW: no DLL path, launching without injection");
+        return Real_CreateProcessW(lpApplicationName, lpCommandLine,
                                    lpProcessAttributes, lpThreadAttributes,
-                                   bInheritHandles, flags, lpEnvironment,
-                                   lpCurrentDirectory, lpStartupInfo,
-                                   lpProcessInformation);
-    if (ok && lpProcessInformation) {
-        InjectIntoProcess(lpProcessInformation->hProcess);
-        if (!(dwCreationFlags & CREATE_SUSPENDED))
-            ResumeThread(lpProcessInformation->hThread);
+                                   bInheritHandles, dwCreationFlags,
+                                   lpEnvironment, lpCurrentDirectory,
+                                   lpStartupInfo, lpProcessInformation);
+    }
+
+    VL_DBG(L"Hook_CreateProcessW: injecting dll=%S", dllPath);
+
+    const char* dlls[1] = { dllPath };
+    // Pass Real_CreateProcessW so Detours calls the real API,
+    // not our hook -- avoids infinite recursion.
+    BOOL ok = DetourCreateProcessWithDllsW(
+        lpApplicationName,
+        lpCommandLine,
+        lpProcessAttributes,
+        lpThreadAttributes,
+        bInheritHandles,
+        dwCreationFlags,        // DetourCreateProcessWithDlls manages SUSPENDED internally
+        lpEnvironment,
+        lpCurrentDirectory,
+        lpStartupInfo,
+        lpProcessInformation,
+        1,
+        dlls,
+        (PDETOUR_CREATE_PROCESS_ROUTINEW)Real_CreateProcessW
+    );
+
+    if (!ok) {
+        VL_DBG(L"Hook_CreateProcessW: DetourCreateProcessWithDllsW FAILED err=%u, "
+               L"falling back to plain launch", GetLastError());
+        ok = Real_CreateProcessW(lpApplicationName, lpCommandLine,
+                                 lpProcessAttributes, lpThreadAttributes,
+                                 bInheritHandles, dwCreationFlags,
+                                 lpEnvironment, lpCurrentDirectory,
+                                 lpStartupInfo, lpProcessInformation);
     }
     return ok;
 }
@@ -2236,16 +2273,48 @@ static BOOL WINAPI Hook_CreateProcessA(
            lpApplicationName ? lpApplicationName : "(null)",
            lpCommandLine     ? lpCommandLine     : "(null)");
 
-    DWORD flags = dwCreationFlags | CREATE_SUSPENDED;
-    BOOL ok = Real_CreateProcessA(lpApplicationName, lpCommandLine,
+#ifdef _WIN64
+    const char* dllPath = g_DllPathA64[0] ? g_DllPathA64 : g_DllPathA;
+#else
+    const char* dllPath = g_DllPathA32[0] ? g_DllPathA32 : g_DllPathA;
+#endif
+
+    if (!dllPath || !dllPath[0]) {
+        VL_DBG(L"Hook_CreateProcessA: no DLL path, launching without injection");
+        return Real_CreateProcessA(lpApplicationName, lpCommandLine,
                                    lpProcessAttributes, lpThreadAttributes,
-                                   bInheritHandles, flags, lpEnvironment,
-                                   lpCurrentDirectory, lpStartupInfo,
-                                   lpProcessInformation);
-    if (ok && lpProcessInformation) {
-        InjectIntoProcess(lpProcessInformation->hProcess);
-        if (!(dwCreationFlags & CREATE_SUSPENDED))
-            ResumeThread(lpProcessInformation->hThread);
+                                   bInheritHandles, dwCreationFlags,
+                                   lpEnvironment, lpCurrentDirectory,
+                                   lpStartupInfo, lpProcessInformation);
+    }
+
+    VL_DBG(L"Hook_CreateProcessA: injecting dll=%S", dllPath);
+
+    // DetourCreateProcessWithDllExA handles cross-arch (32<->64) injection.
+    // Pass Real_CreateProcessA to avoid re-entering this hook.
+    BOOL ok = DetourCreateProcessWithDllExA(
+        lpApplicationName,
+        lpCommandLine,
+        lpProcessAttributes,
+        lpThreadAttributes,
+        bInheritHandles,
+        dwCreationFlags,
+        lpEnvironment,
+        lpCurrentDirectory,
+        lpStartupInfo,
+        lpProcessInformation,
+        dllPath,
+        (PDETOUR_CREATE_PROCESS_ROUTINEA)Real_CreateProcessA
+    );
+
+    if (!ok) {
+        VL_DBG(L"Hook_CreateProcessA: DetourCreateProcessWithDllExA FAILED err=%u, "
+               L"falling back to plain launch", GetLastError());
+        ok = Real_CreateProcessA(lpApplicationName, lpCommandLine,
+                                 lpProcessAttributes, lpThreadAttributes,
+                                 bInheritHandles, dwCreationFlags,
+                                 lpEnvironment, lpCurrentDirectory,
+                                 lpStartupInfo, lpProcessInformation);
     }
     return ok;
 }
