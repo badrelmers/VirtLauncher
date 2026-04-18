@@ -59,10 +59,15 @@ static void VL_DBG(const wchar_t* fmt, ...) {
     _vsnwprintf(buf, 1023, fmt, va);
     va_end(va);
     buf[1023] = L'\0';
+    
     // Prefix so DebugView filter is easy
-    OutputDebugStringW(L"[VirtHook] ");
-    OutputDebugStringW(buf);
-    OutputDebugStringW(L"\n");
+    // Combine into a single buffer for one output call
+    wchar_t fullbuf[2048];
+    wcscpy(fullbuf, L"[VirtHook] ");
+    wcscat(fullbuf, buf);
+    wcscat(fullbuf, L"\n");
+
+    OutputDebugStringW(fullbuf);
 }
 #else
 static inline void VL_DBG(const wchar_t*, ...) {}
@@ -732,7 +737,7 @@ static NTSTATUS NTAPI Hook_NtOpenKey(
         if (hVirt) Real_NtClose(hVirt);
         VL_DBG(L"Hook_NtOpenKey: neither virtual nor real exists, returning NOT_FOUND");
         SetReentrant(false);
-        return STATUS_OBJECT_NAME_NOT_FOUND;
+        return VL_STATUS_OBJECT_NOT_FOUND;
     }
 
     HANDLE hVirtNew = NULL;
@@ -820,7 +825,7 @@ static NTSTATUS NTAPI Hook_NtOpenKeyEx(
         if (hVirt) Real_NtClose(hVirt);
         VL_DBG(L"Hook_NtOpenKeyEx: neither virtual nor real exists, returning NOT_FOUND");
         SetReentrant(false);
-        return STATUS_OBJECT_NAME_NOT_FOUND;
+        return VL_STATUS_OBJECT_NOT_FOUND;
     }
 
     HANDLE hVirtNew = NULL;
