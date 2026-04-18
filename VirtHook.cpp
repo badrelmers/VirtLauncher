@@ -246,6 +246,9 @@ typedef BOOL (WINAPI *PfnCreateProcessA)
 
 typedef BOOL (WINAPI *PfnMoveFileExW)(LPCWSTR, LPCWSTR, DWORD);
 
+typedef DWORD (WINAPI *PfnGetFileAttributesW)(LPCWSTR);
+typedef BOOL  (WINAPI *PfnGetFileAttributesExW)(LPCWSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
+
 typedef HANDLE (WINAPI *PfnFindFirstFileExW)
     (LPCWSTR, FINDEX_INFO_LEVELS, LPVOID, FINDEX_SEARCH_OPS, LPVOID, DWORD);
 
@@ -274,6 +277,8 @@ static PfnNtSetInformationFile Real_NtSetInformationFile;
 static PfnCreateProcessW       Real_CreateProcessW;
 static PfnCreateProcessA       Real_CreateProcessA;
 static PfnMoveFileExW          Real_MoveFileExW;
+static PfnGetFileAttributesW   Real_GetFileAttributesW;
+static PfnGetFileAttributesExW Real_GetFileAttributesExW;
 static PfnFindFirstFileExW     Real_FindFirstFileExW;
 
 // Config flags
@@ -1466,6 +1471,67 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
                                       FileInformationClass);
 }
 
+// ---- GetFileAttributesW / GetFileAttributesExW ----
+// cmd.exe calls one of these to verify the source file exists before rename.
+
+static DWORD WINAPI Hook_GetFileAttributesW(LPCWSTR lpFileName)
+{
+    VL_DBG(L"Hook_GetFileAttributesW: %s", lpFileName ? lpFileName : L"(null)");
+
+    if (!g_FsEnabled || IsReentrant() || !lpFileName)
+        return Real_GetFileAttributesW(lpFileName);
+
+    std::wstring ntPath  = Win32ToNtPath(lpFileName);
+    std::wstring redNt   = ApplyFsRedirect(ntPath);
+
+    if (redNt == ntPath) {
+        VL_DBG(L"Hook_GetFileAttributesW: no redirect");
+        return Real_GetFileAttributesW(lpFileName);
+    }
+
+    // Strip \??\ back to Win32
+    std::wstring redWin32 = redNt;
+    if (redWin32.size() > 4 && redWin32[0]==L'\\' && redWin32[1]==L'?' &&
+        redWin32[2]==L'?' && redWin32[3]==L'\\')
+        redWin32 = redWin32.substr(4);
+
+    VL_DBG(L"Hook_GetFileAttributesW: REDIRECT %s -> %s", lpFileName, redWin32.c_str());
+    SetReentrant(true);
+    DWORD result = Real_GetFileAttributesW(redWin32.c_str());
+    SetReentrant(false);
+    return result;
+}
+
+static BOOL WINAPI Hook_GetFileAttributesExW(
+    LPCWSTR                lpFileName,
+    GET_FILEEX_INFO_LEVELS fInfoLevelId,
+    LPVOID                 lpFileInformation)
+{
+    VL_DBG(L"Hook_GetFileAttributesExW: %s", lpFileName ? lpFileName : L"(null)");
+
+    if (!g_FsEnabled || IsReentrant() || !lpFileName)
+        return Real_GetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation);
+
+    std::wstring ntPath  = Win32ToNtPath(lpFileName);
+    std::wstring redNt   = ApplyFsRedirect(ntPath);
+
+    if (redNt == ntPath) {
+        VL_DBG(L"Hook_GetFileAttributesExW: no redirect");
+        return Real_GetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation);
+    }
+
+    std::wstring redWin32 = redNt;
+    if (redWin32.size() > 4 && redWin32[0]==L'\\' && redWin32[1]==L'?' &&
+        redWin32[2]==L'?' && redWin32[3]==L'\\')
+        redWin32 = redWin32.substr(4);
+
+    VL_DBG(L"Hook_GetFileAttributesExW: REDIRECT %s -> %s", lpFileName, redWin32.c_str());
+    SetReentrant(true);
+    BOOL result = Real_GetFileAttributesExW(redWin32.c_str(), fInfoLevelId, lpFileInformation);
+    SetReentrant(false);
+    return result;
+}
+
 // ---- FindFirstFileExW -- cmd.exe uses this to check file existence before rename ----
 //
 // cmd.exe calls FindFirstFileExW(src) for wildcard expansion BEFORE calling
@@ -1677,14 +1743,25 @@ static void InstallHooks() {
             HMODULE kb = GetModuleHandleA("KernelBase.dll");
             if (kb) Real_MoveFileExW = (PfnMoveFileExW)GetProcAddress(kb, "MoveFileExW");
         }
+        VL_GETPROC(k32,   GetFileAttributesW);
+        if (!Real_GetFileAttributesW) {
+            HMODULE kb = GetModuleHandleA("KernelBase.dll");
+            if (kb) Real_GetFileAttributesW = (PfnGetFileAttributesW)GetProcAddress(kb, "GetFileAttributesW");
+        }
+        VL_GETPROC(k32,   GetFileAttributesExW);
+        if (!Real_GetFileAttributesExW) {
+            HMODULE kb = GetModuleHandleA("KernelBase.dll");
+            if (kb) Real_GetFileAttributesExW = (PfnGetFileAttributesExW)GetProcAddress(kb, "GetFileAttributesExW");
+        }
         VL_GETPROC(k32,   FindFirstFileExW);
         if (!Real_FindFirstFileExW) {
             HMODULE kb = GetModuleHandleA("KernelBase.dll");
             if (kb) Real_FindFirstFileExW = (PfnFindFirstFileExW)GetProcAddress(kb, "FindFirstFileExW");
         }
-        VL_DBG(L"InstallHooks FS ptrs: NtCreateFile=%p NtOpenFile=%p NtSetInfoFile=%p MoveFileExW=%p",
+        VL_DBG(L"InstallHooks FS ptrs: NtCreateFile=%p NtOpenFile=%p NtSetInfoFile=%p MoveFileExW=%p GetFileAttrW=%p",
                (void*)Real_NtCreateFile, (void*)Real_NtOpenFile,
-               (void*)Real_NtSetInformationFile, (void*)Real_MoveFileExW);
+               (void*)Real_NtSetInformationFile, (void*)Real_MoveFileExW,
+               (void*)Real_GetFileAttributesW);
     }
 
     // ---------------------------------------------------------------
@@ -1755,6 +1832,8 @@ static void InstallHooks() {
         if (Real_NtQueryFullAttributesFile) VL_ATTACH(NtQueryFullAttributesFile);
         if (Real_NtSetInformationFile) VL_ATTACH(NtSetInformationFile);
         if (Real_MoveFileExW)          VL_ATTACH(MoveFileExW);
+        if (Real_GetFileAttributesW)   VL_ATTACH(GetFileAttributesW);
+        if (Real_GetFileAttributesExW) VL_ATTACH(GetFileAttributesExW);
         if (Real_FindFirstFileExW)     VL_ATTACH(FindFirstFileExW);
     }
     LONG commitResult = DetourTransactionCommit();
@@ -1788,6 +1867,8 @@ static void UninstallHooks() {
         if (Real_NtQueryFullAttributesFile) VL_DETACH(NtQueryFullAttributesFile);
         if (Real_NtSetInformationFile) VL_DETACH(NtSetInformationFile);
         if (Real_MoveFileExW)          VL_DETACH(MoveFileExW);
+        if (Real_GetFileAttributesW)   VL_DETACH(GetFileAttributesW);
+        if (Real_GetFileAttributesExW) VL_DETACH(GetFileAttributesExW);
         if (Real_FindFirstFileExW)     VL_DETACH(FindFirstFileExW);
     }
 
