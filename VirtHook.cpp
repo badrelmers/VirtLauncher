@@ -46,6 +46,29 @@
 #include <algorithm>
 
 // ============================================================
+// Debug logging -- output visible in Sysinternals DebugView
+// (run DebugView as admin before launching VirtLauncher).
+// Set VL_DEBUG 0 to disable for release builds.
+// ============================================================
+#define VL_DEBUG 1
+#if VL_DEBUG
+static void VL_DBG(const wchar_t* fmt, ...) {
+    wchar_t buf[1024];
+    va_list va;
+    va_start(va, fmt);
+    _vsnwprintf(buf, 1023, fmt, va);
+    va_end(va);
+    buf[1023] = L'\0';
+    // Prefix so DebugView filter is easy
+    OutputDebugStringW(L"[VirtHook] ");
+    OutputDebugStringW(buf);
+    OutputDebugStringW(L"\n");
+}
+#else
+static inline void VL_DBG(const wchar_t*, ...) {}
+#endif
+
+// ============================================================
 // NT Type Definitions
 // (winternl.h omitted to avoid redefinition conflicts)
 // ============================================================
@@ -193,6 +216,8 @@ typedef NTSTATUS (NTAPI *PfnNtNotifyChangeKey)
 
 typedef NTSTATUS (NTAPI *PfnNtClose)(HANDLE);
 
+typedef NTSTATUS (NTAPI *PfnNtQueryObject)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
 typedef NTSTATUS (NTAPI *PfnNtCreateFile)
     (PHANDLE, ULONG, PVL_OBJECT_ATTRIBUTES, PVL_IO_STATUS_BLOCK,
      PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
@@ -225,6 +250,7 @@ static PfnNtDeleteKey          Real_NtDeleteKey;
 static PfnNtDeleteValueKey     Real_NtDeleteValueKey;
 static PfnNtNotifyChangeKey    Real_NtNotifyChangeKey;
 static PfnNtClose              Real_NtClose;
+static PfnNtQueryObject        Real_NtQueryObject;
 static PfnNtCreateFile         Real_NtCreateFile;
 static PfnNtOpenFile           Real_NtOpenFile;
 static PfnCreateProcessW       Real_CreateProcessW;
@@ -341,23 +367,62 @@ static bool GetEntry(HANDLE h, VirtKeyEntry& out) {
 // which for untracked handles equals the logical path).
 static std::wstring GetHandleLogicalPath(HANDLE h) {
     if (!h) return L"";
-    VirtKeyEntry e;
-    if (GetEntry(h, e)) return e.logPath;
 
-    // Not tracked -- ask the kernel (not reentrant since we call Real_*)
-    std::vector<BYTE> buf(4096, 0);
-    ULONG resultLen = 0;
-    NTSTATUS st = Real_NtQueryKey(h, VlKeyNameInformation,
-                                   &buf[0], (ULONG)buf.size(), &resultLen);
-    if (st == VL_STATUS_BUFFER_TOO_SMALL || st == VL_STATUS_BUFFER_OVERFLOW) {
-        buf.assign(resultLen + 4, 0);
-        st = Real_NtQueryKey(h, VlKeyNameInformation,
-                              &buf[0], (ULONG)buf.size(), &resultLen);
+    // Check our own tracking map first
+    VirtKeyEntry e;
+    if (GetEntry(h, e)) {
+        VL_DBG(L"GetHandleLogicalPath: tracked handle -> %s", e.logPath.c_str());
+        return e.logPath;
     }
-    if (!NT_SUCCESS(st)) return L"";
-    VL_KEY_NAME_INFORMATION* kni =
-        reinterpret_cast<VL_KEY_NAME_INFORMATION*>(&buf[0]);
-    return std::wstring(kni->Name, kni->NameLength / sizeof(WCHAR));
+
+    // Strategy 1: NtQueryObject(ObjectNameInformation) = class 1
+    // Returns full NT path like \REGISTRY\USER\SID\key -- works on XP+
+    // and doesn't require KEY_QUERY_VALUE (unlike some NtQueryKey classes).
+    if (Real_NtQueryObject) {
+        std::vector<BYTE> buf(2048, 0);
+        ULONG resultLen = 0;
+        // ObjectNameInformation = 1
+        NTSTATUS st = Real_NtQueryObject(h, 1, &buf[0], (ULONG)buf.size(), &resultLen);
+        if (st == VL_STATUS_BUFFER_TOO_SMALL || st == VL_STATUS_BUFFER_OVERFLOW) {
+            buf.assign(resultLen + 8, 0);
+            st = Real_NtQueryObject(h, 1, &buf[0], (ULONG)buf.size(), &resultLen);
+        }
+        if (NT_SUCCESS(st) && resultLen >= sizeof(VL_UNICODE_STRING)) {
+            VL_UNICODE_STRING* us = reinterpret_cast<VL_UNICODE_STRING*>(&buf[0]);
+            if (us->Buffer && us->Length > 0) {
+                std::wstring path = std::wstring(us->Buffer, us->Length / sizeof(WCHAR));
+                VL_DBG(L"GetHandleLogicalPath: NtQueryObject -> %s", path.c_str());
+                return path;
+            }
+        }
+        VL_DBG(L"GetHandleLogicalPath: NtQueryObject failed st=0x%08X, trying NtQueryKey", (ULONG)st);
+    }
+
+    // Strategy 2: NtQueryKey(KeyNameInformation) = class 3 (Vista+)
+    if (Real_NtQueryKey) {
+        std::vector<BYTE> buf(4096, 0);
+        ULONG resultLen = 0;
+        NTSTATUS st = Real_NtQueryKey(h, VlKeyNameInformation,
+                                       &buf[0], (ULONG)buf.size(), &resultLen);
+        if (st == VL_STATUS_BUFFER_TOO_SMALL || st == VL_STATUS_BUFFER_OVERFLOW) {
+            buf.assign(resultLen + 8, 0);
+            st = Real_NtQueryKey(h, VlKeyNameInformation,
+                                  &buf[0], (ULONG)buf.size(), &resultLen);
+        }
+        if (NT_SUCCESS(st)) {
+            VL_KEY_NAME_INFORMATION* kni =
+                reinterpret_cast<VL_KEY_NAME_INFORMATION*>(&buf[0]);
+            if (kni->NameLength > 0) {
+                std::wstring path = std::wstring(kni->Name, kni->NameLength / sizeof(WCHAR));
+                VL_DBG(L"GetHandleLogicalPath: NtQueryKey -> %s", path.c_str());
+                return path;
+            }
+        }
+        VL_DBG(L"GetHandleLogicalPath: NtQueryKey also failed st=0x%08X", (ULONG)st);
+    }
+
+    VL_DBG(L"GetHandleLogicalPath: FAILED to resolve handle 0x%p", h);
+    return L"";
 }
 
 // Build the full NT path from an OBJECT_ATTRIBUTES
@@ -379,14 +444,24 @@ static bool LogicalToVirtual(const std::wstring& logical,
 {
     if (!g_RegEnabled) return false;
     // Must be under RealNtBase but NOT under VirtNtBase
-    if (!StartsWithI(logical, g_RealNtBase)) return false;
-    if (StartsWithI(logical, g_VirtNtBase))  return false;
+    if (!StartsWithI(logical, g_RealNtBase)) {
+        VL_DBG(L"LogicalToVirtual: SKIP (not under RealNtBase) path=%s base=%s",
+               logical.c_str(), g_RealNtBase.c_str());
+        return false;
+    }
+    if (StartsWithI(logical, g_VirtNtBase)) {
+        VL_DBG(L"LogicalToVirtual: SKIP (already under VirtNtBase) path=%s", logical.c_str());
+        return false;
+    }
 
     std::wstring sub = logical.substr(g_RealNtBase.size());
-    // sub starts with '\' or is empty
-    if (sub.empty()) return false; // opening the hive root itself -- don't redirect
+    if (sub.empty()) {
+        VL_DBG(L"LogicalToVirtual: SKIP (hive root itself)");
+        return false;
+    }
 
     virt = g_VirtNtBase + sub;
+    VL_DBG(L"LogicalToVirtual: REDIRECT %s -> %s", logical.c_str(), virt.c_str());
     return true;
 }
 
@@ -538,6 +613,13 @@ static void LoadConfig() {
 
     // DLL path for child injection
     GetEnvironmentVariableA("VIRTLAUNCHER_DLL", g_DllPathA, MAX_PATH);
+
+    // --- Debug summary ---
+    VL_DBG(L"LoadConfig: RegEnabled=%d  VirtNtBase=%s",
+           (int)g_RegEnabled, g_VirtNtBase.c_str());
+    VL_DBG(L"LoadConfig:             RealNtBase=%s", g_RealNtBase.c_str());
+    VL_DBG(L"LoadConfig: FsEnabled=%d  redirects=%u",
+           (int)g_FsEnabled, (unsigned)g_FsRedirects.size());
 }
 
 // ============================================================
@@ -721,6 +803,7 @@ static NTSTATUS NTAPI Hook_NtCreateKey(
     SetReentrant(true);
 
     std::wstring fullPath = GetFullNtPath(ObjectAttributes);
+    VL_DBG(L"Hook_NtCreateKey: fullPath=%s", fullPath.c_str());
     std::wstring virtPath;
 
     if (!LogicalToVirtual(fullPath, virtPath)) {
@@ -728,6 +811,8 @@ static NTSTATUS NTAPI Hook_NtCreateKey(
         return Real_NtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes,
                                  TitleIndex, Class, CreateOptions, Disposition);
     }
+
+    VL_DBG(L"Hook_NtCreateKey: VIRT creating %s", virtPath.c_str());
 
     // Ensure all parent virtual keys exist
     EnsureVirtualPath(virtPath);
@@ -746,10 +831,12 @@ static NTSTATUS NTAPI Hook_NtCreateKey(
         Real_NtOpenKey(&hReal, KEY_READ, ObjectAttributes);
         *KeyHandle = hVirt;
         TrackHandle(hVirt, hVirt, hReal, fullPath);
+        VL_DBG(L"Hook_NtCreateKey: OK hVirt=%p hReal=%p", hVirt, hReal);
         SetReentrant(false);
         return VL_STATUS_SUCCESS;
     }
 
+    VL_DBG(L"Hook_NtCreateKey: virtual create FAILED st=0x%08X, fallback to real", (ULONG)st);
     // Fallback to real if virtual creation failed
     SetReentrant(false);
     return Real_NtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes,
@@ -1214,6 +1301,7 @@ static void InstallHooks() {
 
     // Resolve NT functions via GetProcAddress
     VL_GETPROC(ntdll, NtClose);
+    VL_GETPROC(ntdll, NtQueryObject);  // for robust handle path resolution
     VL_GETPROC(k32,   CreateProcessW);
     VL_GETPROC(k32,   CreateProcessA);
 
@@ -1314,11 +1402,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
         g_TlsIdx = TlsAlloc();
         InitializeCriticalSectionAndSpinCount(&g_KeyMapLock, 4000);
 
+        VL_DBG(L"DllMain: DLL_PROCESS_ATTACH -- VirtHook loading");
+
         // Read config from environment variables
         LoadConfig();
 
         // Install API hooks
         InstallHooks();
+
+        VL_DBG(L"DllMain: hooks installed OK");
     }
     else if (reason == DLL_PROCESS_DETACH) {
         UninstallHooks();
