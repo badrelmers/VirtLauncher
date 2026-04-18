@@ -1,29 +1,62 @@
 // ============================================================
-// VirtHook.cpp  - VirtLauncher Hook DLL
+// VirtHook.cpp  - VirtLauncher Hook DLL  (v8 - pure ntdll hooks)
 // Injected into target process by VirtLauncher.exe via Detours
 //
 // Virtualizes:
-//   Registry : NtOpenKey, NtOpenKeyEx, NtCreateKey, NtQueryKey,
-//              NtEnumerateKey, NtEnumerateValueKey, NtQueryValueKey,
-//              NtSetValueKey, NtDeleteKey, NtDeleteValueKey,
-//              NtNotifyChangeKey, NtClose
-//   Files    : NtCreateFile, NtOpenFile
-//   Children : CreateProcessW/A (propagate injection)
+//
+//   REGISTRY:
+//     NtCreateKey, NtCreateKeyTransacted
+//     NtOpenKey,   NtOpenKeyEx,   NtOpenKeyTransacted, NtOpenKeyTransactedEx
+//     NtDeleteKey, NtDeleteValueKey
+//     NtEnumerateKey, NtEnumerateValueKey
+//     NtQueryKey, NtQueryValueKey, NtQueryMultipleValueKey
+//     NtSetValueKey
+//     NtRenameKey
+//     NtReplaceKey
+//     NtSaveKey,  NtSaveKeyEx
+//     NtLoadKey,  NtLoadKey2, NtLoadKeyEx
+//     NtNotifyChangeKey, NtNotifyChangeMultipleKeys
+//     NtClose  (filtered: only for tracked virtual handles)
+//
+//   FILES (all pure ntdll):
+//     NtCreateFile, NtOpenFile
+//     NtCreateDirectoryObject, NtOpenDirectoryObject
+//     NtCreateMailslotFile, NtCreateNamedPipeFile
+//     NtDeleteFile
+//     NtQueryAttributesFile, NtQueryFullAttributesFile
+//     NtQueryInformationByName
+//     NtQueryInformationFile    (handle-based, pass-through + log)
+//     NtQueryVolumeInformationFile (handle-based, pass-through + log)
+//     NtQueryDirectoryFile      (handle-based, pass-through + log)
+//     NtQueryDirectoryFileEx    (handle-based, pass-through + log, Win10+)
+//     NtSetInformationFile      (intercepts FileRenameInformation)
+//     NtDeviceIoControlFile     (handle-based, pass-through + log)
+//     NtFsControlFile           (handle-based, pass-through + log)
+//     NtReadFile                (handle-based, pass-through + log)
+//     NtWriteFile               (handle-based, pass-through + log)
+//
+//   CHILDREN: CreateProcessW/A (propagate injection)
+//
+// NOTE: Win32 wrappers (GetFileAttributesW, FindFirstFileExW,
+//       MoveFileExW, etc.) are intentionally NOT hooked.
+//       All interception happens at the ntdll layer.
 //
 // Config via environment variables set by VirtLauncher.exe:
 //   VIRTLAUNCHER_REG = NT reg base  e.g. \Registry\User\SID\VirtApp
 //   VIRTLAUNCHER_FS  = path to FS redirect config file
 //   VIRTLAUNCHER_DLL = absolute path to this DLL (for child injection)
 //
-// Build x86  (run from VS2010 x86 command prompt):
-//   cl /nologo /EHsc /O2 /MD /W3 /LD VirtHook.cpp
+// Build x86  (VS2010 x86 command prompt):
+//   cl /nologo /EHsc /O2 /MT /W3 /LD VirtHook.cpp
 //      /I<detours>\include /Fe:VirtHook32.dll
-//      /link /DLL <detours>\lib.X86\detours.lib
+//      /link /OUT:VirtHook32.dll /DEF:VirtHook.def
+//         <detours>\lib.X86\detours.lib
 //
-// Build x64  (run from VS2010 x64 command prompt):
-//   cl /nologo /EHsc /O2 /MD /W3 /LD VirtHook.cpp
+// Build x64  (VS2010 x64 command prompt):
+//   cl /nologo /EHsc /O2 /MT /W3 /LD VirtHook.cpp
 //      /I<detours>\include /Fe:VirtHook64.dll
-//      /link /DLL <detours>\lib.X64\detours.lib
+//      /link /OUT:VirtHook64.dll /DEF:VirtHook.def
+//         <detours>\lib.X64\detours.lib
 //
 // NOTE: MinGW is NOT supported -- Microsoft Detours requires MSVC.
 // ============================================================
@@ -36,9 +69,6 @@
 
 #include <windows.h>
 #include <detours.h>
-
-// DetourFinishHelperProcess is exported as ordinal 1 via VirtHook.def
-// DetourRestoreAfterWith() is called in DllMain DLL_PROCESS_ATTACH below
 
 #include <string>
 #include <vector>
@@ -59,14 +89,10 @@ static void VL_DBG(const wchar_t* fmt, ...) {
     _vsnwprintf(buf, 1023, fmt, va);
     va_end(va);
     buf[1023] = L'\0';
-    
-    // Prefix so DebugView filter is easy
-    // Combine into a single buffer for one output call
     wchar_t fullbuf[2048];
     wcscpy(fullbuf, L"[VirtHook] ");
     wcscat(fullbuf, buf);
     wcscat(fullbuf, L"\n");
-
     OutputDebugStringW(fullbuf);
 }
 #else
@@ -75,7 +101,6 @@ static inline void VL_DBG(const wchar_t*, ...) {}
 
 // ============================================================
 // NT Type Definitions
-// (winternl.h omitted to avoid redefinition conflicts)
 // ============================================================
 
 typedef LONG NTSTATUS;
@@ -103,12 +128,12 @@ typedef struct _VL_UNICODE_STRING {
 } VL_UNICODE_STRING, *PVL_UNICODE_STRING;
 
 typedef struct _VL_OBJECT_ATTRIBUTES {
-    ULONG           Length;
-    HANDLE          RootDirectory;
+    ULONG              Length;
+    HANDLE             RootDirectory;
     PVL_UNICODE_STRING ObjectName;
-    ULONG           Attributes;
-    PVOID           SecurityDescriptor;
-    PVOID           SecurityQualityOfService;
+    ULONG              Attributes;
+    PVOID              SecurityDescriptor;
+    PVOID              SecurityQualityOfService;
 } VL_OBJECT_ATTRIBUTES, *PVL_OBJECT_ATTRIBUTES;
 
 typedef struct _VL_IO_STATUS_BLOCK {
@@ -137,12 +162,12 @@ typedef enum _VL_KEY_VALUE_INFORMATION_CLASS {
 typedef struct _VL_KEY_BASIC_INFORMATION {
     LARGE_INTEGER LastWriteTime;
     ULONG         TitleIndex;
-    ULONG         NameLength; // bytes
+    ULONG         NameLength;
     WCHAR         Name[1];
 } VL_KEY_BASIC_INFORMATION;
 
 typedef struct _VL_KEY_NAME_INFORMATION {
-    ULONG NameLength; // bytes
+    ULONG NameLength;
     WCHAR Name[1];
 } VL_KEY_NAME_INFORMATION;
 
@@ -163,7 +188,7 @@ typedef struct _VL_KEY_FULL_INFORMATION {
 typedef struct _VL_KEY_VALUE_BASIC_INFORMATION {
     ULONG TitleIndex;
     ULONG Type;
-    ULONG NameLength;  // bytes
+    ULONG NameLength;
     WCHAR Name[1];
 } VL_KEY_VALUE_BASIC_INFORMATION;
 
@@ -182,20 +207,41 @@ typedef struct _VL_KEY_VALUE_PARTIAL_INFORMATION {
     ULONG DataLength;
     UCHAR Data[1];
 } VL_KEY_VALUE_PARTIAL_INFORMATION;
+
+// KEY_VALUE_ENTRY for NtQueryMultipleValueKey
+typedef struct _VL_KEY_VALUE_ENTRY {
+    PVL_UNICODE_STRING ValueName;
+    ULONG              DataLength;
+    ULONG              DataOffset;
+    ULONG              Type;
+} VL_KEY_VALUE_ENTRY, *PVL_KEY_VALUE_ENTRY;
 #pragma pack(pop)
 
 // ============================================================
 // NT Function Pointer Types
 // ============================================================
 
+// ---- Registry ----
 typedef NTSTATUS (NTAPI *PfnNtOpenKey)
     (PHANDLE, ULONG, PVL_OBJECT_ATTRIBUTES);
 
 typedef NTSTATUS (NTAPI *PfnNtOpenKeyEx)
     (PHANDLE, ULONG, PVL_OBJECT_ATTRIBUTES, ULONG);
 
+typedef NTSTATUS (NTAPI *PfnNtOpenKeyTransacted)
+    (PHANDLE, ULONG, PVL_OBJECT_ATTRIBUTES, HANDLE);
+
+typedef NTSTATUS (NTAPI *PfnNtOpenKeyTransactedEx)
+    (PHANDLE, ULONG, PVL_OBJECT_ATTRIBUTES, ULONG, HANDLE);
+
 typedef NTSTATUS (NTAPI *PfnNtCreateKey)
     (PHANDLE, ULONG, PVL_OBJECT_ATTRIBUTES, ULONG, PVL_UNICODE_STRING, ULONG, PULONG);
+
+typedef NTSTATUS (NTAPI *PfnNtCreateKeyTransacted)
+    (PHANDLE, ULONG, PVL_OBJECT_ATTRIBUTES, ULONG, PVL_UNICODE_STRING, ULONG, HANDLE, PULONG);
+
+typedef NTSTATUS (NTAPI *PfnNtDeleteKey)    (HANDLE);
+typedef NTSTATUS (NTAPI *PfnNtDeleteValueKey)(HANDLE, PVL_UNICODE_STRING);
 
 typedef NTSTATUS (NTAPI *PfnNtEnumerateKey)
     (HANDLE, ULONG, VL_KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG);
@@ -209,20 +255,46 @@ typedef NTSTATUS (NTAPI *PfnNtQueryKey)
 typedef NTSTATUS (NTAPI *PfnNtQueryValueKey)
     (HANDLE, PVL_UNICODE_STRING, VL_KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 
+typedef NTSTATUS (NTAPI *PfnNtQueryMultipleValueKey)
+    (HANDLE, PVL_KEY_VALUE_ENTRY, ULONG, PVOID, PULONG, PULONG);
+
 typedef NTSTATUS (NTAPI *PfnNtSetValueKey)
     (HANDLE, PVL_UNICODE_STRING, ULONG, ULONG, PVOID, ULONG);
 
-typedef NTSTATUS (NTAPI *PfnNtDeleteKey)    (HANDLE);
-typedef NTSTATUS (NTAPI *PfnNtDeleteValueKey)(HANDLE, PVL_UNICODE_STRING);
+typedef NTSTATUS (NTAPI *PfnNtRenameKey)
+    (HANDLE, PVL_UNICODE_STRING);
+
+typedef NTSTATUS (NTAPI *PfnNtReplaceKey)
+    (PVL_OBJECT_ATTRIBUTES, HANDLE, PVL_OBJECT_ATTRIBUTES);
+
+typedef NTSTATUS (NTAPI *PfnNtSaveKey)
+    (HANDLE, HANDLE);
+
+typedef NTSTATUS (NTAPI *PfnNtSaveKeyEx)
+    (HANDLE, HANDLE, ULONG);
+
+typedef NTSTATUS (NTAPI *PfnNtLoadKey)
+    (PVL_OBJECT_ATTRIBUTES, PVL_OBJECT_ATTRIBUTES);
+
+typedef NTSTATUS (NTAPI *PfnNtLoadKey2)
+    (PVL_OBJECT_ATTRIBUTES, PVL_OBJECT_ATTRIBUTES, ULONG);
+
+typedef NTSTATUS (NTAPI *PfnNtLoadKeyEx)
+    (PVL_OBJECT_ATTRIBUTES, PVL_OBJECT_ATTRIBUTES, ULONG, HANDLE, HANDLE, ULONG, PHANDLE, PVOID);
 
 typedef NTSTATUS (NTAPI *PfnNtNotifyChangeKey)
     (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
      ULONG, BOOLEAN, PVOID, ULONG, BOOLEAN);
 
+typedef NTSTATUS (NTAPI *PfnNtNotifyChangeMultipleKeys)
+    (HANDLE, ULONG, PVL_OBJECT_ATTRIBUTES, HANDLE, VL_PIO_APC_ROUTINE,
+     PVOID, PVL_IO_STATUS_BLOCK, ULONG, BOOLEAN, PVOID, ULONG, BOOLEAN);
+
 typedef NTSTATUS (NTAPI *PfnNtClose)(HANDLE);
 
 typedef NTSTATUS (NTAPI *PfnNtQueryObject)(HANDLE, ULONG, PVOID, ULONG, PULONG);
 
+// ---- Files ----
 typedef NTSTATUS (NTAPI *PfnNtCreateFile)
     (PHANDLE, ULONG, PVL_OBJECT_ATTRIBUTES, PVL_IO_STATUS_BLOCK,
      PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
@@ -230,12 +302,66 @@ typedef NTSTATUS (NTAPI *PfnNtCreateFile)
 typedef NTSTATUS (NTAPI *PfnNtOpenFile)
     (PHANDLE, ULONG, PVL_OBJECT_ATTRIBUTES, PVL_IO_STATUS_BLOCK, ULONG, ULONG);
 
+typedef NTSTATUS (NTAPI *PfnNtCreateDirectoryObject)
+    (PHANDLE, ULONG, PVL_OBJECT_ATTRIBUTES);
+
+typedef NTSTATUS (NTAPI *PfnNtOpenDirectoryObject)
+    (PHANDLE, ULONG, PVL_OBJECT_ATTRIBUTES);
+
+typedef NTSTATUS (NTAPI *PfnNtCreateMailslotFile)
+    (PHANDLE, ULONG, PVL_OBJECT_ATTRIBUTES, PVL_IO_STATUS_BLOCK,
+     ULONG, ULONG, ULONG, PLARGE_INTEGER);
+
+typedef NTSTATUS (NTAPI *PfnNtCreateNamedPipeFile)
+    (PHANDLE, ULONG, PVL_OBJECT_ATTRIBUTES, PVL_IO_STATUS_BLOCK,
+     ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, PLARGE_INTEGER);
+
+typedef NTSTATUS (NTAPI *PfnNtDeleteFile)
+    (PVL_OBJECT_ATTRIBUTES);
+
+typedef NTSTATUS (NTAPI *PfnNtQueryAttributesFile)
+    (PVL_OBJECT_ATTRIBUTES, PVOID);  // PFILE_BASIC_INFORMATION
+
 typedef NTSTATUS (NTAPI *PfnNtQueryFullAttributesFile)
-    (PVL_OBJECT_ATTRIBUTES, PVOID);
+    (PVL_OBJECT_ATTRIBUTES, PVOID);  // PFILE_NETWORK_OPEN_INFORMATION
+
+typedef NTSTATUS (NTAPI *PfnNtQueryInformationByName)
+    (PVL_OBJECT_ATTRIBUTES, PVL_IO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+
+typedef NTSTATUS (NTAPI *PfnNtQueryInformationFile)
+    (HANDLE, PVL_IO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+
+typedef NTSTATUS (NTAPI *PfnNtQueryVolumeInformationFile)
+    (HANDLE, PVL_IO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+
+typedef NTSTATUS (NTAPI *PfnNtQueryDirectoryFile)
+    (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
+     PVOID, ULONG, ULONG, BOOLEAN, PVL_UNICODE_STRING, BOOLEAN);
+
+typedef NTSTATUS (NTAPI *PfnNtQueryDirectoryFileEx)
+    (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
+     PVOID, ULONG, ULONG, ULONG, PVL_UNICODE_STRING);
 
 typedef NTSTATUS (NTAPI *PfnNtSetInformationFile)
     (HANDLE, PVL_IO_STATUS_BLOCK, PVOID, ULONG, ULONG);
 
+typedef NTSTATUS (NTAPI *PfnNtDeviceIoControlFile)
+    (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
+     ULONG, PVOID, ULONG, PVOID, ULONG);
+
+typedef NTSTATUS (NTAPI *PfnNtFsControlFile)
+    (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
+     ULONG, PVOID, ULONG, PVOID, ULONG);
+
+typedef NTSTATUS (NTAPI *PfnNtReadFile)
+    (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
+     PVOID, ULONG, PLARGE_INTEGER, PULONG);
+
+typedef NTSTATUS (NTAPI *PfnNtWriteFile)
+    (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
+     PVOID, ULONG, PLARGE_INTEGER, PULONG);
+
+// ---- Child process ----
 typedef BOOL (WINAPI *PfnCreateProcessW)
     (LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES,
      BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
@@ -244,42 +370,61 @@ typedef BOOL (WINAPI *PfnCreateProcessA)
     (LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES,
      BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
 
-typedef BOOL (WINAPI *PfnMoveFileExW)(LPCWSTR, LPCWSTR, DWORD);
-
-typedef DWORD (WINAPI *PfnGetFileAttributesW)(LPCWSTR);
-typedef BOOL  (WINAPI *PfnGetFileAttributesExW)(LPCWSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
-
-typedef HANDLE (WINAPI *PfnFindFirstFileExW)
-    (LPCWSTR, FINDEX_INFO_LEVELS, LPVOID, FINDEX_SEARCH_OPS, LPVOID, DWORD);
-
 // ============================================================
 // Global State
 // ============================================================
 
-// Original (real) function pointers -- modified by Detours in-place
-static PfnNtOpenKey            Real_NtOpenKey;
-static PfnNtOpenKeyEx          Real_NtOpenKeyEx;
-static PfnNtCreateKey          Real_NtCreateKey;
-static PfnNtEnumerateKey       Real_NtEnumerateKey;
-static PfnNtEnumerateValueKey  Real_NtEnumerateValueKey;
-static PfnNtQueryKey           Real_NtQueryKey;
-static PfnNtQueryValueKey      Real_NtQueryValueKey;
-static PfnNtSetValueKey        Real_NtSetValueKey;
-static PfnNtDeleteKey          Real_NtDeleteKey;
-static PfnNtDeleteValueKey     Real_NtDeleteValueKey;
-static PfnNtNotifyChangeKey    Real_NtNotifyChangeKey;
-static PfnNtClose              Real_NtClose;
-static PfnNtQueryObject        Real_NtQueryObject;
-static PfnNtCreateFile         Real_NtCreateFile;
+// ----- Registry -----
+static PfnNtOpenKey               Real_NtOpenKey;
+static PfnNtOpenKeyEx             Real_NtOpenKeyEx;
+static PfnNtOpenKeyTransacted     Real_NtOpenKeyTransacted;
+static PfnNtOpenKeyTransactedEx   Real_NtOpenKeyTransactedEx;
+static PfnNtCreateKey             Real_NtCreateKey;
+static PfnNtCreateKeyTransacted   Real_NtCreateKeyTransacted;
+static PfnNtDeleteKey             Real_NtDeleteKey;
+static PfnNtDeleteValueKey        Real_NtDeleteValueKey;
+static PfnNtEnumerateKey          Real_NtEnumerateKey;
+static PfnNtEnumerateValueKey     Real_NtEnumerateValueKey;
+static PfnNtQueryKey              Real_NtQueryKey;
+static PfnNtQueryValueKey         Real_NtQueryValueKey;
+static PfnNtQueryMultipleValueKey Real_NtQueryMultipleValueKey;
+static PfnNtSetValueKey           Real_NtSetValueKey;
+static PfnNtRenameKey             Real_NtRenameKey;
+static PfnNtReplaceKey            Real_NtReplaceKey;
+static PfnNtSaveKey               Real_NtSaveKey;
+static PfnNtSaveKeyEx             Real_NtSaveKeyEx;
+static PfnNtLoadKey               Real_NtLoadKey;
+static PfnNtLoadKey2              Real_NtLoadKey2;
+static PfnNtLoadKeyEx             Real_NtLoadKeyEx;
+static PfnNtNotifyChangeKey       Real_NtNotifyChangeKey;
+static PfnNtNotifyChangeMultipleKeys Real_NtNotifyChangeMultipleKeys;
+static PfnNtClose                 Real_NtClose;
+static PfnNtQueryObject           Real_NtQueryObject;
+
+// ----- Files -----
+static PfnNtCreateFile              Real_NtCreateFile;
 static PfnNtOpenFile                Real_NtOpenFile;
+static PfnNtCreateDirectoryObject   Real_NtCreateDirectoryObject;
+static PfnNtOpenDirectoryObject     Real_NtOpenDirectoryObject;
+static PfnNtCreateMailslotFile      Real_NtCreateMailslotFile;
+static PfnNtCreateNamedPipeFile     Real_NtCreateNamedPipeFile;
+static PfnNtDeleteFile              Real_NtDeleteFile;
+static PfnNtQueryAttributesFile     Real_NtQueryAttributesFile;
 static PfnNtQueryFullAttributesFile Real_NtQueryFullAttributesFile;
-static PfnNtSetInformationFile Real_NtSetInformationFile;
-static PfnCreateProcessW       Real_CreateProcessW;
-static PfnCreateProcessA       Real_CreateProcessA;
-static PfnMoveFileExW          Real_MoveFileExW;
-static PfnGetFileAttributesW   Real_GetFileAttributesW;
-static PfnGetFileAttributesExW Real_GetFileAttributesExW;
-static PfnFindFirstFileExW     Real_FindFirstFileExW;
+static PfnNtQueryInformationByName  Real_NtQueryInformationByName;
+static PfnNtQueryInformationFile    Real_NtQueryInformationFile;
+static PfnNtQueryVolumeInformationFile Real_NtQueryVolumeInformationFile;
+static PfnNtQueryDirectoryFile      Real_NtQueryDirectoryFile;
+static PfnNtQueryDirectoryFileEx    Real_NtQueryDirectoryFileEx;    // Win10+, may be NULL
+static PfnNtSetInformationFile      Real_NtSetInformationFile;
+static PfnNtDeviceIoControlFile     Real_NtDeviceIoControlFile;
+static PfnNtFsControlFile           Real_NtFsControlFile;
+static PfnNtReadFile                Real_NtReadFile;
+static PfnNtWriteFile               Real_NtWriteFile;
+
+// ----- Children -----
+static PfnCreateProcessW  Real_CreateProcessW;
+static PfnCreateProcessA  Real_CreateProcessA;
 
 // Config flags
 static bool g_RegEnabled = false;
@@ -328,9 +473,9 @@ static inline bool StartsWithI(const std::wstring& s, const std::wstring& pfx) {
 }
 
 static inline void MakeUStr(VL_UNICODE_STRING* us, const std::wstring& s) {
-    us->Buffer         = const_cast<PWSTR>(s.c_str());
-    us->Length         = static_cast<USHORT>(s.size() * sizeof(WCHAR));
-    us->MaximumLength  = us->Length + sizeof(WCHAR);
+    us->Buffer        = const_cast<PWSTR>(s.c_str());
+    us->Length        = static_cast<USHORT>(s.size() * sizeof(WCHAR));
+    us->MaximumLength = us->Length + sizeof(WCHAR);
 }
 
 static inline std::wstring FromUStr(const VL_UNICODE_STRING* us) {
@@ -351,8 +496,7 @@ static inline void MakeOA(VL_OBJECT_ATTRIBUTES* oa,
 }
 
 // ============================================================
-// Registry handle map helpers  (lock must be held by caller
-// for TrackHandle / UntrackHandle, but GetEntry locks itself)
+// Registry handle map helpers
 // ============================================================
 
 static void TrackHandle(HANDLE h, HANDLE hVirt, HANDLE hReal,
@@ -383,30 +527,22 @@ static bool GetEntry(HANDLE h, VirtKeyEntry& out) {
 }
 
 // ============================================================
-// Path Resolution
+// Registry Path Resolution
 // ============================================================
 
-// Return the LOGICAL NT path for a registry handle.
-// For tracked virtual handles we return the stored logical path.
-// For untracked handles we call Real_NtQueryKey (returns physical path
-// which for untracked handles equals the logical path).
 static std::wstring GetHandleLogicalPath(HANDLE h) {
     if (!h) return L"";
 
-    // Check our own tracking map first
     VirtKeyEntry e;
     if (GetEntry(h, e)) {
-        VL_DBG(L"GetHandleLogicalPath: tracked handle -> %s", e.logPath.c_str());
+        VL_DBG(L"GetHandleLogicalPath: tracked -> %s", e.logPath.c_str());
         return e.logPath;
     }
 
-    // Strategy 1: NtQueryObject(ObjectNameInformation) = class 1
-    // Returns full NT path like \REGISTRY\USER\SID\key -- works on XP+
-    // and doesn't require KEY_QUERY_VALUE (unlike some NtQueryKey classes).
+    // NtQueryObject(ObjectNameInformation = class 1)
     if (Real_NtQueryObject) {
         std::vector<BYTE> buf(2048, 0);
         ULONG resultLen = 0;
-        // ObjectNameInformation = 1
         NTSTATUS st = Real_NtQueryObject(h, 1, &buf[0], (ULONG)buf.size(), &resultLen);
         if (st == VL_STATUS_BUFFER_TOO_SMALL || st == VL_STATUS_BUFFER_OVERFLOW) {
             buf.assign(resultLen + 8, 0);
@@ -420,10 +556,9 @@ static std::wstring GetHandleLogicalPath(HANDLE h) {
                 return path;
             }
         }
-        VL_DBG(L"GetHandleLogicalPath: NtQueryObject failed st=0x%08X, trying NtQueryKey", (ULONG)st);
     }
 
-    // Strategy 2: NtQueryKey(KeyNameInformation) = class 3 (Vista+)
+    // NtQueryKey(KeyNameInformation = class 3, Vista+)
     if (Real_NtQueryKey) {
         std::vector<BYTE> buf(4096, 0);
         ULONG resultLen = 0;
@@ -443,10 +578,9 @@ static std::wstring GetHandleLogicalPath(HANDLE h) {
                 return path;
             }
         }
-        VL_DBG(L"GetHandleLogicalPath: NtQueryKey also failed st=0x%08X", (ULONG)st);
     }
 
-    VL_DBG(L"GetHandleLogicalPath: FAILED to resolve handle 0x%p", h);
+    VL_DBG(L"GetHandleLogicalPath: FAILED for handle %p", h);
     return L"";
 }
 
@@ -455,36 +589,30 @@ static std::wstring GetFullNtPath(PVL_OBJECT_ATTRIBUTES oa) {
     if (!oa) return L"";
     std::wstring name = FromUStr(oa->ObjectName);
     if (!oa->RootDirectory) return name;
-
     std::wstring parentPath = GetHandleLogicalPath(oa->RootDirectory);
     if (name.empty()) return parentPath;
     return parentPath + L"\\" + name;
 }
 
 // Compute virtual NT path from logical path.
-// Logical: \Registry\User\SID\foo\bar
-// Virtual: \Registry\User\SID\VirtApp\foo\bar
 static bool LogicalToVirtual(const std::wstring& logical,
                                std::wstring& virt)
 {
     if (!g_RegEnabled) return false;
-    // Must be under RealNtBase but NOT under VirtNtBase
     if (!StartsWithI(logical, g_RealNtBase)) {
         VL_DBG(L"LogicalToVirtual: SKIP (not under RealNtBase) path=%s base=%s",
                logical.c_str(), g_RealNtBase.c_str());
         return false;
     }
     if (StartsWithI(logical, g_VirtNtBase)) {
-        VL_DBG(L"LogicalToVirtual: SKIP (already under VirtNtBase) path=%s", logical.c_str());
+        VL_DBG(L"LogicalToVirtual: SKIP (already under VirtNtBase) %s", logical.c_str());
         return false;
     }
-
     std::wstring sub = logical.substr(g_RealNtBase.size());
     if (sub.empty()) {
         VL_DBG(L"LogicalToVirtual: SKIP (hive root itself)");
         return false;
     }
-
     virt = g_VirtNtBase + sub;
     VL_DBG(L"LogicalToVirtual: REDIRECT %s -> %s", logical.c_str(), virt.c_str());
     return true;
@@ -494,12 +622,10 @@ static bool LogicalToVirtual(const std::wstring& logical,
 static void EnsureVirtualPath(const std::wstring& virtPath) {
     if (!StartsWithI(virtPath, g_VirtNtBase)) return;
 
-    // Walk components after g_VirtNtBase
     std::wstring remaining = virtPath.substr(g_VirtNtBase.size());
     std::wstring current   = g_VirtNtBase;
 
     while (!remaining.empty()) {
-        // strip leading backslash
         size_t start = (remaining[0] == L'\\') ? 1u : 0u;
         size_t slash = remaining.find(L'\\', start);
         std::wstring seg;
@@ -531,28 +657,43 @@ static std::wstring Win32ToNtPath(const std::wstring& win32) {
     if (StartsWithI(win32, L"\\??\\") ||
         StartsWithI(win32, L"\\\\?\\") ||
         StartsWithI(win32, L"\\Device\\")) return win32;
-
     if (win32.size() >= 2 && iswalpha(win32[0]) && win32[1] == L':')
         return L"\\??\\" + win32;
-
     if (StartsWithI(win32, L"\\\\"))
         return L"\\??\\UNC\\" + win32.substr(2);
-
     return win32;
 }
 
-// Apply FS redirections to an NT path.  Returns redirected NT path or original.
+// Apply FS redirections to an NT path.
 static std::wstring ApplyFsRedirect(const std::wstring& ntPath) {
     if (!g_FsEnabled) return ntPath;
     for (size_t i = 0; i < g_FsRedirects.size(); ++i) {
         const std::wstring& from = g_FsRedirects[i].first;
         const std::wstring& to   = g_FsRedirects[i].second;
         if (StartsWithI(ntPath, from)) {
-            std::wstring suffix = ntPath.substr(from.size());
-            return to + suffix;
+            return to + ntPath.substr(from.size());
         }
     }
     return ntPath;
+}
+
+// Helper: redirect OA path-based file call -- returns true if redirect happened.
+// If true, caller should use newOa / newName instead of the original OA.
+static bool RedirectFileOA(PVL_OBJECT_ATTRIBUTES oa,
+                             VL_UNICODE_STRING& newName,
+                             VL_OBJECT_ATTRIBUTES& newOa,
+                             std::wstring& ntPath,
+                             std::wstring& redPath)
+{
+    if (!g_FsEnabled || !oa || !oa->ObjectName || IsReentrant()) return false;
+    ntPath  = GetFullNtPath(oa);
+    redPath = ApplyFsRedirect(ntPath);
+    if (redPath == ntPath) return false;
+    MakeUStr(&newName, redPath);
+    newOa               = *oa;
+    newOa.ObjectName    = &newName;
+    newOa.RootDirectory = NULL;
+    return true;
 }
 
 // ============================================================
@@ -572,15 +713,13 @@ static void LoadFsConfig(const std::wstring& path) {
     ReadFile(hf, &raw[0], sz, &read, NULL);
     CloseHandle(hf);
 
-    // Convert to wide
     int wlen = MultiByteToWideChar(CP_UTF8, 0, &raw[0], -1, NULL, 0);
-    if (wlen <= 0) {
+    if (wlen <= 0)
         wlen = MultiByteToWideChar(CP_ACP, 0, &raw[0], -1, NULL, 0);
-    }
+
     std::wstring content(wlen + 1, L'\0');
     MultiByteToWideChar(CP_ACP, 0, &raw[0], -1, &content[0], wlen);
 
-    // Parse line by line
     size_t pos = 0;
     while (pos < content.size()) {
         size_t nl = content.find(L'\n', pos);
@@ -589,27 +728,23 @@ static void LoadFsConfig(const std::wstring& path) {
                             : content.substr(pos);
         pos = (nl != std::wstring::npos) ? nl + 1 : content.size();
 
-        // Trim CR/spaces
         while (!line.empty() && (line.back() == L'\r' || line.back() == L' '))
             line.resize(line.size() - 1);
-        while (!line.empty() && (line[0] == L' '))
+        while (!line.empty() && line[0] == L' ')
             line = line.substr(1);
 
         if (line.empty() || line[0] == L'#' || line[0] == L';') continue;
-        if (line[0] == L'[') continue; // section header
+        if (line[0] == L'[') continue;
 
         size_t eq = line.find(L'=');
         if (eq == std::wstring::npos) continue;
 
         std::wstring src = line.substr(0, eq);
         std::wstring dst = line.substr(eq + 1);
-
-        // Trim
         while (!src.empty() && src.back() == L' ') src.resize(src.size()-1);
         while (!dst.empty() && dst[0]   == L' ') dst = dst.substr(1);
         if (src.empty() || dst.empty()) continue;
 
-        // Convert to NT paths and store
         g_FsRedirects.push_back(
             std::make_pair(Win32ToNtPath(src), Win32ToNtPath(dst)));
     }
@@ -618,10 +753,8 @@ static void LoadFsConfig(const std::wstring& path) {
 static void LoadConfig() {
     wchar_t buf[2048] = {};
 
-    // Registry virtualisation
     if (GetEnvironmentVariableW(L"VIRTLAUNCHER_REG", buf, 2047) > 0) {
         g_VirtNtBase = buf;
-        // Derive RealNtBase = parent of VirtNtBase
         size_t sl = g_VirtNtBase.rfind(L'\\');
         if (sl != std::wstring::npos)
             g_RealNtBase = g_VirtNtBase.substr(0, sl);
@@ -629,17 +762,14 @@ static void LoadConfig() {
             g_RegEnabled = true;
     }
 
-    // FS redirection
     if (GetEnvironmentVariableW(L"VIRTLAUNCHER_FS", buf, 2047) > 0) {
         LoadFsConfig(buf);
         if (!g_FsRedirects.empty())
             g_FsEnabled = true;
     }
 
-    // DLL path for child injection
     GetEnvironmentVariableA("VIRTLAUNCHER_DLL", g_DllPathA, MAX_PATH);
 
-    // --- Debug summary ---
     VL_DBG(L"LoadConfig: RegEnabled=%d  VirtNtBase=%s",
            (int)g_RegEnabled, g_VirtNtBase.c_str());
     VL_DBG(L"LoadConfig:             RealNtBase=%s", g_RealNtBase.c_str());
@@ -648,7 +778,7 @@ static void LoadConfig() {
 }
 
 // ============================================================
-// Collect subkey names from a handle (for merge enumeration)
+// Collect subkey/value names from a handle (for merge enumeration)
 // ============================================================
 
 static std::vector<std::wstring> CollectSubkeyNames(HANDLE h) {
@@ -672,7 +802,6 @@ static std::vector<std::wstring> CollectSubkeyNames(HANDLE h) {
     return names;
 }
 
-// Collect value names from a handle
 static std::vector<std::wstring> CollectValueNames(HANDLE h) {
     std::vector<std::wstring> names;
     if (!h) return names;
@@ -705,6 +834,101 @@ static bool NameInList(const std::wstring& name,
 }
 
 // ============================================================
+// Shared open/create helper
+// (avoids code duplication across Nt*Key and Nt*KeyTransacted)
+// ============================================================
+
+static NTSTATUS DoVirtOpen(
+    PVL_OBJECT_ATTRIBUTES OrigOA,
+    ULONG                 DesiredAccess,
+    PHANDLE               KeyHandle,
+    bool                  isCreate,
+    ULONG                 TitleIndex,
+    PVL_UNICODE_STRING    Class,
+    ULONG                 CreateOptions,
+    PULONG                Disposition)
+{
+    std::wstring fullPath = GetFullNtPath(OrigOA);
+    std::wstring virtPath;
+
+    if (!LogicalToVirtual(fullPath, virtPath)) {
+        // Not in our scope -- let caller decide which real function to call
+        return VL_STATUS_OBJECT_NOT_FOUND; // sentinel: caller must call real fn
+    }
+
+    VL_DBG(L"DoVirtOpen: fullPath=%s  isCreate=%d", fullPath.c_str(), (int)isCreate);
+
+    if (isCreate) {
+        EnsureVirtualPath(virtPath);
+        VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
+        VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
+            OrigOA->Attributes | OBJ_CASE_INSENSITIVE);
+
+        HANDLE hVirt = NULL;
+        NTSTATUS st = Real_NtCreateKey(&hVirt, DesiredAccess, &voa,
+                                        TitleIndex, Class, CreateOptions, Disposition);
+        if (NT_SUCCESS(st)) {
+            HANDLE hReal = NULL;
+            Real_NtOpenKey(&hReal, KEY_READ, OrigOA);
+            *KeyHandle = hVirt;
+            TrackHandle(hVirt, hVirt, hReal, fullPath);
+            VL_DBG(L"DoVirtOpen: CREATE OK hVirt=%p hReal=%p", hVirt, hReal);
+            return VL_STATUS_SUCCESS;
+        }
+        VL_DBG(L"DoVirtOpen: CREATE FAILED st=0x%08X", (ULONG)st);
+        return st;
+    }
+
+    // Open path: try virtual first
+    VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
+    VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
+        OrigOA->Attributes | OBJ_CASE_INSENSITIVE);
+
+    HANDLE hVirt = NULL;
+    NTSTATUS stV = Real_NtOpenKey(&hVirt, DesiredAccess, &voa);
+
+    HANDLE hReal = NULL;
+    Real_NtOpenKey(&hReal, KEY_READ, OrigOA);
+
+    if (NT_SUCCESS(stV)) {
+        *KeyHandle = hVirt;
+        TrackHandle(hVirt, hVirt, hReal, fullPath);
+        VL_DBG(L"DoVirtOpen: OPEN virtual hVirt=%p hReal=%p", hVirt, hReal);
+        return VL_STATUS_SUCCESS;
+    }
+
+    if (!hReal) {
+        if (hVirt) Real_NtClose(hVirt);
+        VL_DBG(L"DoVirtOpen: OPEN neither exists -> NOT_FOUND");
+        return VL_STATUS_OBJECT_NOT_FOUND;
+    }
+
+    // Copy-on-write
+    HANDLE hVirtNew = NULL;
+    ULONG disp = 0;
+    EnsureVirtualPath(virtPath);
+    VL_UNICODE_STRING vus2; MakeUStr(&vus2, virtPath);
+    VL_OBJECT_ATTRIBUTES voa2; MakeOA(&voa2, &vus2,
+        OrigOA->Attributes | OBJ_CASE_INSENSITIVE);
+    NTSTATUS stC = Real_NtCreateKey(&hVirtNew, DesiredAccess | KEY_READ,
+                                     &voa2, 0, NULL, 0, &disp);
+    if (NT_SUCCESS(stC)) {
+        *KeyHandle = hVirtNew;
+        TrackHandle(hVirtNew, hVirtNew, hReal, fullPath);
+        VL_DBG(L"DoVirtOpen: OPEN CoW hVirt=%p hReal=%p", hVirtNew, hReal);
+        return VL_STATUS_SUCCESS;
+    }
+
+    VL_DBG(L"DoVirtOpen: OPEN CoW FAILED st=0x%08X -- using real untracked", (ULONG)stC);
+    if (hVirtNew) Real_NtClose(hVirtNew);
+    if (hReal) {
+        *KeyHandle = hReal;
+        return VL_STATUS_SUCCESS;
+    }
+    return stC;
+}
+
+// ============================================================
 // REGISTRY HOOKS
 // ============================================================
 
@@ -714,90 +938,23 @@ static NTSTATUS NTAPI Hook_NtOpenKey(
     ULONG                 DesiredAccess,
     PVL_OBJECT_ATTRIBUTES ObjectAttributes)
 {
+    VL_DBG(L"Hook_NtOpenKey: path=%s",
+           (ObjectAttributes && ObjectAttributes->ObjectName)
+           ? FromUStr(ObjectAttributes->ObjectName).c_str() : L"(null)");
+
     if (!g_RegEnabled || IsReentrant() || !ObjectAttributes)
         return Real_NtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
 
     SetReentrant(true);
+    NTSTATUS st = DoVirtOpen(ObjectAttributes, DesiredAccess, KeyHandle,
+                              false, 0, NULL, 0, NULL);
+    SetReentrant(false);
 
-    std::wstring fullPath = GetFullNtPath(ObjectAttributes);
-    std::wstring virtPath;
-
-    if (!LogicalToVirtual(fullPath, virtPath)) {
-        SetReentrant(false);
+    if (st == VL_STATUS_OBJECT_NOT_FOUND) {
+        // Sentinel: not in our scope, call real
         return Real_NtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
     }
-
-    VL_DBG(L"Hook_NtOpenKey: fullPath=%s", fullPath.c_str());
-
-    // Try virtual key first
-    VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
-    VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
-        ObjectAttributes->Attributes | OBJ_CASE_INSENSITIVE);
-
-    HANDLE hVirt = NULL;
-    NTSTATUS stV = Real_NtOpenKey(&hVirt, DesiredAccess, &voa);
-
-    // Also open real key (for merge reads)
-    HANDLE hReal = NULL;
-    Real_NtOpenKey(&hReal, KEY_READ, ObjectAttributes);
-
-    if (NT_SUCCESS(stV)) {
-        // Virtual key exists -- use it
-        *KeyHandle = hVirt;
-        TrackHandle(hVirt, hVirt, hReal, fullPath);
-        VL_DBG(L"Hook_NtOpenKey: opened virtual hVirt=%p hReal=%p", hVirt, hReal);
-        SetReentrant(false);
-        return VL_STATUS_SUCCESS;
-    }
-
-    // Virtual key doesn't exist yet.
-    // COPY-ON-WRITE: only if the real key exists -- if neither exists we must
-    // return failure so callers probing for unique names (e.g. regedit's
-    // "New Key #N" loop) get the correct NOT_FOUND status instead of
-    // accidentally creating phantom virtual keys.
-    if (!hReal) {
-        if (hVirt) Real_NtClose(hVirt);
-        VL_DBG(L"Hook_NtOpenKey: neither virtual nor real exists, returning NOT_FOUND");
-        SetReentrant(false);
-        return VL_STATUS_OBJECT_NOT_FOUND;
-    }
-
-    HANDLE hVirtNew = NULL;
-    ULONG disp = 0;
-    EnsureVirtualPath(virtPath);
-
-    VL_UNICODE_STRING vus2; MakeUStr(&vus2, virtPath);
-    VL_OBJECT_ATTRIBUTES voa2; MakeOA(&voa2, &vus2,
-        ObjectAttributes->Attributes | OBJ_CASE_INSENSITIVE);
-    NTSTATUS stC = Real_NtCreateKey(&hVirtNew, DesiredAccess | KEY_READ,
-                                     &voa2, 0, NULL, 0, &disp);
-
-    if (NT_SUCCESS(stC)) {
-        *KeyHandle = hVirtNew;
-        TrackHandle(hVirtNew, hVirtNew, hReal, fullPath);
-        VL_DBG(L"Hook_NtOpenKey: CoW created virtual hVirt=%p hReal=%p disp=%u",
-               hVirtNew, hReal, disp);
-        SetReentrant(false);
-        return VL_STATUS_SUCCESS;
-    }
-
-    // Virtual creation failed -- use real handle untracked (unusual path)
-    VL_DBG(L"Hook_NtOpenKey: virtual CoW FAILED st=0x%08X -- using real handle (untracked)", (ULONG)stC);
-    if (hVirtNew) Real_NtClose(hVirtNew);
-
-    HANDLE hRealWrite = NULL;
-    NTSTATUS stR = Real_NtOpenKey(&hRealWrite, DesiredAccess, ObjectAttributes);
-    if (hReal && hReal != hRealWrite) Real_NtClose(hReal);
-
-    if (NT_SUCCESS(stR)) {
-        *KeyHandle = hRealWrite;
-        SetReentrant(false);
-        return VL_STATUS_SUCCESS;
-    }
-
-    if (hRealWrite) Real_NtClose(hRealWrite);
-    SetReentrant(false);
-    return stR;
+    return st;
 }
 
 // ---- NtOpenKeyEx (Vista+) ----
@@ -807,87 +964,81 @@ static NTSTATUS NTAPI Hook_NtOpenKeyEx(
     PVL_OBJECT_ATTRIBUTES ObjectAttributes,
     ULONG                 OpenOptions)
 {
-    // Delegate to NtOpenKey hook logic by re-using it
-    // (OpenOptions is mostly for transactions -- ignore for virtualisation)
+    VL_DBG(L"Hook_NtOpenKeyEx: opts=0x%X path=%s", OpenOptions,
+           (ObjectAttributes && ObjectAttributes->ObjectName)
+           ? FromUStr(ObjectAttributes->ObjectName).c_str() : L"(null)");
+
     if (!g_RegEnabled || IsReentrant() || !ObjectAttributes)
         return Real_NtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
 
     SetReentrant(true);
-
-    std::wstring fullPath = GetFullNtPath(ObjectAttributes);
-    std::wstring virtPath;
-
-    if (!LogicalToVirtual(fullPath, virtPath)) {
-        SetReentrant(false);
-        return Real_NtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
-    }
-
-    VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
-    VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
-        ObjectAttributes->Attributes | OBJ_CASE_INSENSITIVE);
-
-    HANDLE hVirt = NULL;
-    NTSTATUS stV = Real_NtOpenKeyEx(&hVirt, DesiredAccess, &voa, OpenOptions);
-
-    // Also open real key for merge reads
-    HANDLE hReal = NULL;
-    Real_NtOpenKeyEx(&hReal, KEY_READ, ObjectAttributes, OpenOptions);
-
-    if (NT_SUCCESS(stV)) {
-        // Virtual key exists -- use it
-        *KeyHandle = hVirt;
-        TrackHandle(hVirt, hVirt, hReal, fullPath);
-        VL_DBG(L"Hook_NtOpenKeyEx: opened virtual hVirt=%p hReal=%p", hVirt, hReal);
-        SetReentrant(false);
-        return VL_STATUS_SUCCESS;
-    }
-
-    // Virtual key doesn't exist yet -- CoW only if the real key exists.
-    // If neither exists return failure so name-probing loops (e.g. regedit's
-    // "New Key #N") get the correct NOT_FOUND and don't loop forever.
-    if (!hReal) {
-        if (hVirt) Real_NtClose(hVirt);
-        VL_DBG(L"Hook_NtOpenKeyEx: neither virtual nor real exists, returning NOT_FOUND");
-        SetReentrant(false);
-        return VL_STATUS_OBJECT_NOT_FOUND;
-    }
-
-    HANDLE hVirtNew = NULL;
-    ULONG disp = 0;
-    EnsureVirtualPath(virtPath);
-
-    VL_UNICODE_STRING vus2; MakeUStr(&vus2, virtPath);
-    VL_OBJECT_ATTRIBUTES voa2; MakeOA(&voa2, &vus2,
-        ObjectAttributes->Attributes | OBJ_CASE_INSENSITIVE);
-    NTSTATUS stC = Real_NtCreateKey(&hVirtNew, DesiredAccess | KEY_READ,
-                                     &voa2, 0, NULL, 0, &disp);
-
-    if (NT_SUCCESS(stC)) {
-        *KeyHandle = hVirtNew;
-        TrackHandle(hVirtNew, hVirtNew, hReal, fullPath);
-        VL_DBG(L"Hook_NtOpenKeyEx: CoW created virtual hVirt=%p hReal=%p disp=%u",
-               hVirtNew, hReal, disp);
-        SetReentrant(false);
-        return VL_STATUS_SUCCESS;
-    }
-
-    // CoW failed -- fall back to real but warn
-    VL_DBG(L"Hook_NtOpenKeyEx: virtual CoW FAILED st=0x%08X -- using real handle (untracked)", (ULONG)stC);
-    if (hVirtNew) Real_NtClose(hVirtNew);
-
-    if (hReal) {
-        *KeyHandle = hReal;
-        SetReentrant(false);
-        return VL_STATUS_SUCCESS;
-    }
-
-    // Re-open real with full access for the caller
-    HANDLE hRealWrite = NULL;
-    NTSTATUS stR = Real_NtOpenKeyEx(&hRealWrite, DesiredAccess, ObjectAttributes, OpenOptions);
+    NTSTATUS st = DoVirtOpen(ObjectAttributes, DesiredAccess, KeyHandle,
+                              false, 0, NULL, 0, NULL);
     SetReentrant(false);
-    if (NT_SUCCESS(stR)) { *KeyHandle = hRealWrite; return VL_STATUS_SUCCESS; }
-    if (hRealWrite) Real_NtClose(hRealWrite);
-    return stR;
+
+    if (st == VL_STATUS_OBJECT_NOT_FOUND)
+        return Real_NtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
+    return st;
+}
+
+// ---- NtOpenKeyTransacted (Vista+) ----
+// We strip the transaction and open a non-transacted virtual key.
+// This is safe for virtualisation: transactions on virtual keys add
+// complexity without benefit since the virtual store is our own.
+static NTSTATUS NTAPI Hook_NtOpenKeyTransacted(
+    PHANDLE               KeyHandle,
+    ULONG                 DesiredAccess,
+    PVL_OBJECT_ATTRIBUTES ObjectAttributes,
+    HANDLE                TransactionHandle)
+{
+    VL_DBG(L"Hook_NtOpenKeyTransacted: TxH=%p path=%s",
+           TransactionHandle,
+           (ObjectAttributes && ObjectAttributes->ObjectName)
+           ? FromUStr(ObjectAttributes->ObjectName).c_str() : L"(null)");
+
+    if (!g_RegEnabled || IsReentrant() || !ObjectAttributes)
+        return Real_NtOpenKeyTransacted(KeyHandle, DesiredAccess,
+                                         ObjectAttributes, TransactionHandle);
+
+    SetReentrant(true);
+    NTSTATUS st = DoVirtOpen(ObjectAttributes, DesiredAccess, KeyHandle,
+                              false, 0, NULL, 0, NULL);
+    SetReentrant(false);
+
+    if (st == VL_STATUS_OBJECT_NOT_FOUND)
+        return Real_NtOpenKeyTransacted(KeyHandle, DesiredAccess,
+                                         ObjectAttributes, TransactionHandle);
+    return st;
+}
+
+// ---- NtOpenKeyTransactedEx (Win8+) ----
+static NTSTATUS NTAPI Hook_NtOpenKeyTransactedEx(
+    PHANDLE               KeyHandle,
+    ULONG                 DesiredAccess,
+    PVL_OBJECT_ATTRIBUTES ObjectAttributes,
+    ULONG                 OpenOptions,
+    HANDLE                TransactionHandle)
+{
+    VL_DBG(L"Hook_NtOpenKeyTransactedEx: TxH=%p opts=0x%X path=%s",
+           TransactionHandle, OpenOptions,
+           (ObjectAttributes && ObjectAttributes->ObjectName)
+           ? FromUStr(ObjectAttributes->ObjectName).c_str() : L"(null)");
+
+    if (!g_RegEnabled || IsReentrant() || !ObjectAttributes)
+        return Real_NtOpenKeyTransactedEx(KeyHandle, DesiredAccess,
+                                           ObjectAttributes, OpenOptions,
+                                           TransactionHandle);
+
+    SetReentrant(true);
+    NTSTATUS st = DoVirtOpen(ObjectAttributes, DesiredAccess, KeyHandle,
+                              false, 0, NULL, 0, NULL);
+    SetReentrant(false);
+
+    if (st == VL_STATUS_OBJECT_NOT_FOUND)
+        return Real_NtOpenKeyTransactedEx(KeyHandle, DesiredAccess,
+                                           ObjectAttributes, OpenOptions,
+                                           TransactionHandle);
+    return st;
 }
 
 // ---- NtCreateKey -- always creates in virtual store ----
@@ -900,84 +1051,89 @@ static NTSTATUS NTAPI Hook_NtCreateKey(
     ULONG                 CreateOptions,
     PULONG                Disposition)
 {
+    VL_DBG(L"Hook_NtCreateKey: path=%s",
+           (ObjectAttributes && ObjectAttributes->ObjectName)
+           ? FromUStr(ObjectAttributes->ObjectName).c_str() : L"(null)");
+
     if (!g_RegEnabled || IsReentrant() || !ObjectAttributes)
         return Real_NtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes,
                                  TitleIndex, Class, CreateOptions, Disposition);
 
     SetReentrant(true);
+    NTSTATUS st = DoVirtOpen(ObjectAttributes, DesiredAccess, KeyHandle,
+                              true, TitleIndex, Class, CreateOptions, Disposition);
+    SetReentrant(false);
 
-    std::wstring fullPath = GetFullNtPath(ObjectAttributes);
-    VL_DBG(L"Hook_NtCreateKey: fullPath=%s", fullPath.c_str());
-    std::wstring virtPath;
-
-    if (!LogicalToVirtual(fullPath, virtPath)) {
-        SetReentrant(false);
+    if (st == VL_STATUS_OBJECT_NOT_FOUND)
         return Real_NtCreateKey(KeyHandle, DesiredAccess, ObjectAttributes,
                                  TitleIndex, Class, CreateOptions, Disposition);
-    }
+    return st;
+}
 
-    VL_DBG(L"Hook_NtCreateKey: VIRT creating %s", virtPath.c_str());
+// ---- NtCreateKeyTransacted (Vista+) ----
+static NTSTATUS NTAPI Hook_NtCreateKeyTransacted(
+    PHANDLE               KeyHandle,
+    ULONG                 DesiredAccess,
+    PVL_OBJECT_ATTRIBUTES ObjectAttributes,
+    ULONG                 TitleIndex,
+    PVL_UNICODE_STRING    Class,
+    ULONG                 CreateOptions,
+    HANDLE                TransactionHandle,
+    PULONG                Disposition)
+{
+    VL_DBG(L"Hook_NtCreateKeyTransacted: TxH=%p path=%s",
+           TransactionHandle,
+           (ObjectAttributes && ObjectAttributes->ObjectName)
+           ? FromUStr(ObjectAttributes->ObjectName).c_str() : L"(null)");
 
-    // Ensure all parent virtual keys exist
-    EnsureVirtualPath(virtPath);
+    if (!g_RegEnabled || IsReentrant() || !ObjectAttributes)
+        return Real_NtCreateKeyTransacted(KeyHandle, DesiredAccess, ObjectAttributes,
+                                           TitleIndex, Class, CreateOptions,
+                                           TransactionHandle, Disposition);
 
-    VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
-    VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
-        ObjectAttributes->Attributes | OBJ_CASE_INSENSITIVE);
-
-    HANDLE hVirt = NULL;
-    NTSTATUS st = Real_NtCreateKey(&hVirt, DesiredAccess, &voa,
-                                    TitleIndex, Class, CreateOptions, Disposition);
-
-    if (NT_SUCCESS(st)) {
-        // Also open real key (if exists) for merge reads
-        HANDLE hReal = NULL;
-        Real_NtOpenKey(&hReal, KEY_READ, ObjectAttributes);
-        *KeyHandle = hVirt;
-        TrackHandle(hVirt, hVirt, hReal, fullPath);
-        VL_DBG(L"Hook_NtCreateKey: OK hVirt=%p hReal=%p", hVirt, hReal);
-        SetReentrant(false);
-        return VL_STATUS_SUCCESS;
-    }
-
-    // Virtual creation failed -- do NOT fall back silently to real location.
-    // Return the failure so the caller knows, rather than writing to the
-    // real registry without the application's knowledge.
-    VL_DBG(L"Hook_NtCreateKey: virtual create FAILED st=0x%08X -- NOT falling back", (ULONG)st);
+    SetReentrant(true);
+    // Strip transaction -- virtual store is non-transacted
+    NTSTATUS st = DoVirtOpen(ObjectAttributes, DesiredAccess, KeyHandle,
+                              true, TitleIndex, Class, CreateOptions, Disposition);
     SetReentrant(false);
+
+    if (st == VL_STATUS_OBJECT_NOT_FOUND)
+        return Real_NtCreateKeyTransacted(KeyHandle, DesiredAccess, ObjectAttributes,
+                                           TitleIndex, Class, CreateOptions,
+                                           TransactionHandle, Disposition);
     return st;
 }
 
 // ---- NtQueryKey ----
 static NTSTATUS NTAPI Hook_NtQueryKey(
-    HANDLE                 KeyHandle,
+    HANDLE                   KeyHandle,
     VL_KEY_INFORMATION_CLASS KeyInformationClass,
-    PVOID                  KeyInformation,
-    ULONG                  Length,
-    PULONG                 ResultLength)
+    PVOID                    KeyInformation,
+    ULONG                    Length,
+    PULONG                   ResultLength)
 {
     VirtKeyEntry e;
-    if (!g_RegEnabled || !GetEntry(KeyHandle, e))
+    if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
         return Real_NtQueryKey(KeyHandle, KeyInformationClass,
                                KeyInformation, Length, ResultLength);
+    }
+
+    VL_DBG(L"Hook_NtQueryKey: class=%d handle=%p virt=%p real=%p",
+           (int)KeyInformationClass, KeyHandle, e.hVirt, e.hReal);
 
     HANDLE queryH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : KeyHandle);
-    NTSTATUS st = Real_NtQueryKey(queryH, KeyInformationClass,
-                                   KeyInformation, Length, ResultLength);
-
-    // For KeyFullInformation we could merge SubKeys/Values counts
-    // For now return virtual (priority) info as-is
-    return st;
+    return Real_NtQueryKey(queryH, KeyInformationClass,
+                            KeyInformation, Length, ResultLength);
 }
 
 // ---- NtEnumerateKey -- merged view ----
 static NTSTATUS NTAPI Hook_NtEnumerateKey(
-    HANDLE                 KeyHandle,
-    ULONG                  Index,
+    HANDLE                   KeyHandle,
+    ULONG                    Index,
     VL_KEY_INFORMATION_CLASS KeyInformationClass,
-    PVOID                  KeyInformation,
-    ULONG                  Length,
-    PULONG                 ResultLength)
+    PVOID                    KeyInformation,
+    ULONG                    Length,
+    PULONG                   ResultLength)
 {
     VirtKeyEntry e;
     if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
@@ -985,32 +1141,29 @@ static NTSTATUS NTAPI Hook_NtEnumerateKey(
                                     KeyInformation, Length, ResultLength);
     }
 
+    VL_DBG(L"Hook_NtEnumerateKey: index=%u handle=%p virt=%p real=%p",
+           Index, KeyHandle, e.hVirt, e.hReal);
+
     HANDLE hV = e.hVirt;
     HANDLE hR = e.hReal;
 
-    // If only one handle is available, no merging needed
-    if (!hV) {
+    if (!hV)
         return Real_NtEnumerateKey(hR ? hR : KeyHandle, Index, KeyInformationClass,
                                     KeyInformation, Length, ResultLength);
-    }
-    if (!hR) {
+    if (!hR)
         return Real_NtEnumerateKey(hV, Index, KeyInformationClass,
                                     KeyInformation, Length, ResultLength);
-    }
 
-    // Merge: virtual first, then real entries not in virtual
+    // Merge: virtual first, then real entries not shadowed by virtual
     SetReentrant(true);
     std::vector<std::wstring> virtNames = CollectSubkeyNames(hV);
     SetReentrant(false);
 
-    ULONG virtCount = static_cast<ULONG>(virtNames.size());
-
-    if (Index < virtCount) {
+    ULONG virtCount = (ULONG)virtNames.size();
+    if (Index < virtCount)
         return Real_NtEnumerateKey(hV, Index, KeyInformationClass,
                                     KeyInformation, Length, ResultLength);
-    }
 
-    // Walk real keys, skipping those shadowed by virtual
     ULONG want    = Index - virtCount;
     ULONG skipped = 0;
     std::vector<BYTE> tmpBuf(1024, 0);
@@ -1031,10 +1184,9 @@ static NTSTATUS NTAPI Hook_NtEnumerateKey(
         std::wstring name(kbi->Name, kbi->NameLength / sizeof(WCHAR));
 
         if (!NameInList(name, virtNames)) {
-            if (skipped == want) {
+            if (skipped == want)
                 return Real_NtEnumerateKey(hR, ri, KeyInformationClass,
                                             KeyInformation, Length, ResultLength);
-            }
             ++skipped;
         }
     }
@@ -1042,12 +1194,12 @@ static NTSTATUS NTAPI Hook_NtEnumerateKey(
 
 // ---- NtEnumerateValueKey -- merged view ----
 static NTSTATUS NTAPI Hook_NtEnumerateValueKey(
-    HANDLE                        KeyHandle,
-    ULONG                         Index,
+    HANDLE                         KeyHandle,
+    ULONG                          Index,
     VL_KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass,
-    PVOID                         KeyValueInformation,
-    ULONG                         Length,
-    PULONG                        ResultLength)
+    PVOID                          KeyValueInformation,
+    ULONG                          Length,
+    PULONG                         ResultLength)
 {
     VirtKeyEntry e;
     if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
@@ -1056,30 +1208,28 @@ static NTSTATUS NTAPI Hook_NtEnumerateValueKey(
                     Length, ResultLength);
     }
 
+    VL_DBG(L"Hook_NtEnumerateValueKey: index=%u handle=%p virt=%p real=%p",
+           Index, KeyHandle, e.hVirt, e.hReal);
+
     HANDLE hV = e.hVirt;
     HANDLE hR = e.hReal;
 
-    if (!hV) {
+    if (!hV)
         return Real_NtEnumerateValueKey(hR ? hR : KeyHandle, Index,
                     KeyValueInformationClass, KeyValueInformation,
                     Length, ResultLength);
-    }
-    if (!hR) {
-        return Real_NtEnumerateValueKey(hV, Index,
-                    KeyValueInformationClass, KeyValueInformation,
-                    Length, ResultLength);
-    }
+    if (!hR)
+        return Real_NtEnumerateValueKey(hV, Index, KeyValueInformationClass,
+                                         KeyValueInformation, Length, ResultLength);
 
     SetReentrant(true);
     std::vector<std::wstring> virtVals = CollectValueNames(hV);
     SetReentrant(false);
 
-    ULONG virtCount = static_cast<ULONG>(virtVals.size());
-
-    if (Index < virtCount) {
+    ULONG virtCount = (ULONG)virtVals.size();
+    if (Index < virtCount)
         return Real_NtEnumerateValueKey(hV, Index, KeyValueInformationClass,
                                          KeyValueInformation, Length, ResultLength);
-    }
 
     ULONG want = Index - virtCount;
     ULONG skipped = 0;
@@ -1103,10 +1253,9 @@ static NTSTATUS NTAPI Hook_NtEnumerateValueKey(
         std::wstring name(kvbi->Name, kvbi->NameLength / sizeof(WCHAR));
 
         if (!NameInList(name, virtVals)) {
-            if (skipped == want) {
+            if (skipped == want)
                 return Real_NtEnumerateValueKey(hR, ri, KeyValueInformationClass,
                                                  KeyValueInformation, Length, ResultLength);
-            }
             ++skipped;
         }
     }
@@ -1114,12 +1263,12 @@ static NTSTATUS NTAPI Hook_NtEnumerateValueKey(
 
 // ---- NtQueryValueKey -- virtual takes priority ----
 static NTSTATUS NTAPI Hook_NtQueryValueKey(
-    HANDLE                        KeyHandle,
-    PVL_UNICODE_STRING             ValueName,
+    HANDLE                         KeyHandle,
+    PVL_UNICODE_STRING              ValueName,
     VL_KEY_VALUE_INFORMATION_CLASS KeyValueInformationClass,
-    PVOID                         KeyValueInformation,
-    ULONG                         Length,
-    PULONG                        ResultLength)
+    PVOID                          KeyValueInformation,
+    ULONG                          Length,
+    PULONG                         ResultLength)
 {
     VirtKeyEntry e;
     if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
@@ -1128,7 +1277,11 @@ static NTSTATUS NTAPI Hook_NtQueryValueKey(
                     Length, ResultLength);
     }
 
-    // Try virtual first
+    VL_DBG(L"Hook_NtQueryValueKey: name=%s handle=%p virt=%p real=%p",
+           ValueName ? FromUStr(ValueName).c_str() : L"(null)",
+           KeyHandle, e.hVirt, e.hReal);
+
+    // Virtual has priority
     if (e.hVirt) {
         NTSTATUS st = Real_NtQueryValueKey(e.hVirt, ValueName,
                             KeyValueInformationClass, KeyValueInformation,
@@ -1137,32 +1290,67 @@ static NTSTATUS NTAPI Hook_NtQueryValueKey(
             st == VL_STATUS_BUFFER_OVERFLOW)
             return st;
     }
-
-    // Fall back to real
     if (e.hReal) {
         return Real_NtQueryValueKey(e.hReal, ValueName,
                     KeyValueInformationClass, KeyValueInformation,
                     Length, ResultLength);
     }
-
     return Real_NtQueryValueKey(KeyHandle, ValueName,
                 KeyValueInformationClass, KeyValueInformation,
                 Length, ResultLength);
 }
 
-// ---- NtSetValueKey -- write to virtual ----
-static NTSTATUS NTAPI Hook_NtSetValueKey(
-    HANDLE              KeyHandle,
-    PVL_UNICODE_STRING  ValueName,
-    ULONG               TitleIndex,
-    ULONG               Type,
-    PVOID               Data,
-    ULONG               DataSize)
+// ---- NtQueryMultipleValueKey -- route to virtual handle ----
+static NTSTATUS NTAPI Hook_NtQueryMultipleValueKey(
+    HANDLE             KeyHandle,
+    PVL_KEY_VALUE_ENTRY ValueEntries,
+    ULONG              EntryCount,
+    PVOID              ValueBuffer,
+    PULONG             BufferLength,
+    PULONG             RequiredBufferLength)
 {
     VirtKeyEntry e;
-    if (!g_RegEnabled || !GetEntry(KeyHandle, e))
+    if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
+        return Real_NtQueryMultipleValueKey(KeyHandle, ValueEntries, EntryCount,
+                                             ValueBuffer, BufferLength,
+                                             RequiredBufferLength);
+    }
+
+    VL_DBG(L"Hook_NtQueryMultipleValueKey: entryCount=%u handle=%p virt=%p real=%p",
+           EntryCount, KeyHandle, e.hVirt, e.hReal);
+
+    // Try virtual first; fall back to real for entries not found
+    HANDLE useH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : KeyHandle);
+    NTSTATUS st = Real_NtQueryMultipleValueKey(useH, ValueEntries, EntryCount,
+                                                ValueBuffer, BufferLength,
+                                                RequiredBufferLength);
+    if (!NT_SUCCESS(st) && e.hReal && e.hReal != useH) {
+        VL_DBG(L"Hook_NtQueryMultipleValueKey: virtual failed, trying real");
+        st = Real_NtQueryMultipleValueKey(e.hReal, ValueEntries, EntryCount,
+                                           ValueBuffer, BufferLength,
+                                           RequiredBufferLength);
+    }
+    return st;
+}
+
+// ---- NtSetValueKey -- write to virtual ----
+static NTSTATUS NTAPI Hook_NtSetValueKey(
+    HANDLE             KeyHandle,
+    PVL_UNICODE_STRING ValueName,
+    ULONG              TitleIndex,
+    ULONG              Type,
+    PVOID              Data,
+    ULONG              DataSize)
+{
+    VirtKeyEntry e;
+    if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
         return Real_NtSetValueKey(KeyHandle, ValueName, TitleIndex,
                                    Type, Data, DataSize);
+    }
+
+    VL_DBG(L"Hook_NtSetValueKey: name=%s handle=%p virt=%p",
+           ValueName ? FromUStr(ValueName).c_str() : L"(null)",
+           KeyHandle, e.hVirt);
 
     HANDLE writeH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : KeyHandle);
     return Real_NtSetValueKey(writeH, ValueName, TitleIndex, Type, Data, DataSize);
@@ -1171,11 +1359,15 @@ static NTSTATUS NTAPI Hook_NtSetValueKey(
 // ---- NtDeleteKey -- delete from virtual only ----
 static NTSTATUS NTAPI Hook_NtDeleteKey(HANDLE KeyHandle) {
     VirtKeyEntry e;
-    if (!g_RegEnabled || !GetEntry(KeyHandle, e))
+    if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
+        VL_DBG(L"Hook_NtDeleteKey: untracked handle=%p", KeyHandle);
         return Real_NtDeleteKey(KeyHandle);
+    }
+
+    VL_DBG(L"Hook_NtDeleteKey: handle=%p virt=%p real=%p",
+           KeyHandle, e.hVirt, e.hReal);
 
     if (e.hVirt) return Real_NtDeleteKey(e.hVirt);
-    // If no virtual key, pass through to real
     return Real_NtDeleteKey(e.hReal ? e.hReal : KeyHandle);
 }
 
@@ -1185,65 +1377,239 @@ static NTSTATUS NTAPI Hook_NtDeleteValueKey(
     PVL_UNICODE_STRING ValueName)
 {
     VirtKeyEntry e;
-    if (!g_RegEnabled || !GetEntry(KeyHandle, e))
+    if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
+        VL_DBG(L"Hook_NtDeleteValueKey: untracked handle=%p name=%s",
+               KeyHandle, ValueName ? FromUStr(ValueName).c_str() : L"(null)");
         return Real_NtDeleteValueKey(KeyHandle, ValueName);
+    }
+
+    VL_DBG(L"Hook_NtDeleteValueKey: name=%s handle=%p virt=%p",
+           ValueName ? FromUStr(ValueName).c_str() : L"(null)",
+           KeyHandle, e.hVirt);
 
     if (e.hVirt) return Real_NtDeleteValueKey(e.hVirt, ValueName);
     return Real_NtDeleteValueKey(e.hReal ? e.hReal : KeyHandle, ValueName);
 }
 
+// ---- NtRenameKey -- rename in virtual store ----
+static NTSTATUS NTAPI Hook_NtRenameKey(
+    HANDLE             KeyHandle,
+    PVL_UNICODE_STRING NewName)
+{
+    VirtKeyEntry e;
+    bool tracked = g_RegEnabled && GetEntry(KeyHandle, e);
+    HANDLE useH  = tracked ? (e.hVirt ? e.hVirt : e.hReal) : KeyHandle;
+
+    VL_DBG(L"Hook_NtRenameKey: handle=%p useH=%p newName=%s",
+           KeyHandle, useH,
+           NewName ? FromUStr(NewName).c_str() : L"(null)");
+
+    return Real_NtRenameKey(useH, NewName);
+}
+
+// ---- NtReplaceKey -- complex (hive replacement); pass through with log ----
+static NTSTATUS NTAPI Hook_NtReplaceKey(
+    PVL_OBJECT_ATTRIBUTES NewFile,
+    HANDLE                TargetHandle,
+    PVL_OBJECT_ATTRIBUTES OldFile)
+{
+    VL_DBG(L"Hook_NtReplaceKey: TargetHandle=%p NewFile=%s OldFile=%s",
+           TargetHandle,
+           (NewFile && NewFile->ObjectName) ? FromUStr(NewFile->ObjectName).c_str() : L"(null)",
+           (OldFile && OldFile->ObjectName) ? FromUStr(OldFile->ObjectName).c_str() : L"(null)");
+
+    // NtReplaceKey is an admin operation (replaces a whole hive from a file).
+    // We route the target handle to virtual if tracked; file paths pass through.
+    VirtKeyEntry e;
+    HANDLE useH = TargetHandle;
+    if (g_RegEnabled && GetEntry(TargetHandle, e))
+        useH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : TargetHandle);
+
+    return Real_NtReplaceKey(NewFile, useH, OldFile);
+}
+
+// ---- NtSaveKey -- save virtual key to file ----
+static NTSTATUS NTAPI Hook_NtSaveKey(HANDLE KeyHandle, HANDLE FileHandle) {
+    VirtKeyEntry e;
+    HANDLE useH = KeyHandle;
+    if (g_RegEnabled && GetEntry(KeyHandle, e))
+        useH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : KeyHandle);
+
+    VL_DBG(L"Hook_NtSaveKey: handle=%p useH=%p fileH=%p",
+           KeyHandle, useH, FileHandle);
+
+    return Real_NtSaveKey(useH, FileHandle);
+}
+
+// ---- NtSaveKeyEx -- save virtual key to file (extended) ----
+static NTSTATUS NTAPI Hook_NtSaveKeyEx(HANDLE KeyHandle, HANDLE FileHandle, ULONG Format) {
+    VirtKeyEntry e;
+    HANDLE useH = KeyHandle;
+    if (g_RegEnabled && GetEntry(KeyHandle, e))
+        useH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : KeyHandle);
+
+    VL_DBG(L"Hook_NtSaveKeyEx: handle=%p useH=%p fileH=%p fmt=%u",
+           KeyHandle, useH, FileHandle, Format);
+
+    return Real_NtSaveKeyEx(useH, FileHandle, Format);
+}
+
+// ---- NtLoadKey -- redirect TargetKey to virtual path ----
+static NTSTATUS NTAPI Hook_NtLoadKey(
+    PVL_OBJECT_ATTRIBUTES TargetKey,
+    PVL_OBJECT_ATTRIBUTES SourceFile)
+{
+    std::wstring fullPath = GetFullNtPath(TargetKey);
+    VL_DBG(L"Hook_NtLoadKey: target=%s", fullPath.c_str());
+
+    std::wstring virtPath;
+    if (!g_RegEnabled || !LogicalToVirtual(fullPath, virtPath))
+        return Real_NtLoadKey(TargetKey, SourceFile);
+
+    VL_DBG(L"Hook_NtLoadKey: REDIRECT target -> %s", virtPath.c_str());
+    EnsureVirtualPath(virtPath);
+    VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
+    VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
+        TargetKey->Attributes | OBJ_CASE_INSENSITIVE);
+
+    return Real_NtLoadKey(&voa, SourceFile);
+}
+
+// ---- NtLoadKey2 -- redirect TargetKey to virtual path ----
+static NTSTATUS NTAPI Hook_NtLoadKey2(
+    PVL_OBJECT_ATTRIBUTES TargetKey,
+    PVL_OBJECT_ATTRIBUTES SourceFile,
+    ULONG                 Flags)
+{
+    std::wstring fullPath = GetFullNtPath(TargetKey);
+    VL_DBG(L"Hook_NtLoadKey2: flags=0x%X target=%s", Flags, fullPath.c_str());
+
+    std::wstring virtPath;
+    if (!g_RegEnabled || !LogicalToVirtual(fullPath, virtPath))
+        return Real_NtLoadKey2(TargetKey, SourceFile, Flags);
+
+    VL_DBG(L"Hook_NtLoadKey2: REDIRECT target -> %s", virtPath.c_str());
+    EnsureVirtualPath(virtPath);
+    VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
+    VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
+        TargetKey->Attributes | OBJ_CASE_INSENSITIVE);
+
+    return Real_NtLoadKey2(&voa, SourceFile, Flags);
+}
+
+// ---- NtLoadKeyEx -- redirect TargetKey to virtual path ----
+static NTSTATUS NTAPI Hook_NtLoadKeyEx(
+    PVL_OBJECT_ATTRIBUTES TargetKey,
+    PVL_OBJECT_ATTRIBUTES SourceFile,
+    ULONG                 Flags,
+    HANDLE                TrustClassKey,
+    HANDLE                Event,
+    ULONG                 DesiredAccess,
+    PHANDLE               RootHandle,
+    PVOID                 Reserved)
+{
+    std::wstring fullPath = GetFullNtPath(TargetKey);
+    VL_DBG(L"Hook_NtLoadKeyEx: flags=0x%X target=%s", Flags, fullPath.c_str());
+
+    std::wstring virtPath;
+    if (!g_RegEnabled || !LogicalToVirtual(fullPath, virtPath))
+        return Real_NtLoadKeyEx(TargetKey, SourceFile, Flags,
+                                 TrustClassKey, Event, DesiredAccess,
+                                 RootHandle, Reserved);
+
+    VL_DBG(L"Hook_NtLoadKeyEx: REDIRECT target -> %s", virtPath.c_str());
+    EnsureVirtualPath(virtPath);
+    VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
+    VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
+        TargetKey->Attributes | OBJ_CASE_INSENSITIVE);
+
+    return Real_NtLoadKeyEx(&voa, SourceFile, Flags,
+                             TrustClassKey, Event, DesiredAccess,
+                             RootHandle, Reserved);
+}
+
 // ---- NtNotifyChangeKey -- forward to virtual handle ----
 static NTSTATUS NTAPI Hook_NtNotifyChangeKey(
-    HANDLE                 KeyHandle,
-    HANDLE                 Event,
-    VL_PIO_APC_ROUTINE     ApcRoutine,
-    PVOID                  ApcContext,
-    PVL_IO_STATUS_BLOCK    IoStatusBlock,
-    ULONG                  CompletionFilter,
-    BOOLEAN                WatchTree,
-    PVOID                  Buffer,
-    ULONG                  BufferSize,
-    BOOLEAN                Asynchronous)
+    HANDLE              KeyHandle,
+    HANDLE              Event,
+    VL_PIO_APC_ROUTINE  ApcRoutine,
+    PVOID               ApcContext,
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    ULONG               CompletionFilter,
+    BOOLEAN             WatchTree,
+    PVOID               Buffer,
+    ULONG               BufferSize,
+    BOOLEAN             Asynchronous)
 {
     VirtKeyEntry e;
     HANDLE useH = KeyHandle;
     if (g_RegEnabled && GetEntry(KeyHandle, e))
         useH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : KeyHandle);
 
+    VL_DBG(L"Hook_NtNotifyChangeKey: handle=%p useH=%p filter=0x%X async=%d",
+           KeyHandle, useH, CompletionFilter, (int)Asynchronous);
+
     return Real_NtNotifyChangeKey(useH, Event, ApcRoutine, ApcContext,
                                    IoStatusBlock, CompletionFilter, WatchTree,
                                    Buffer, BufferSize, Asynchronous);
 }
 
+// ---- NtNotifyChangeMultipleKeys -- forward master handle to virtual ----
+static NTSTATUS NTAPI Hook_NtNotifyChangeMultipleKeys(
+    HANDLE              MasterKeyHandle,
+    ULONG               Count,
+    PVL_OBJECT_ATTRIBUTES SubordinateObjects,
+    HANDLE              Event,
+    VL_PIO_APC_ROUTINE  ApcRoutine,
+    PVOID               ApcContext,
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    ULONG               CompletionFilter,
+    BOOLEAN             WatchTree,
+    PVOID               Buffer,
+    ULONG               BufferSize,
+    BOOLEAN             Asynchronous)
+{
+    VirtKeyEntry e;
+    HANDLE useH = MasterKeyHandle;
+    if (g_RegEnabled && GetEntry(MasterKeyHandle, e))
+        useH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : MasterKeyHandle);
+
+    VL_DBG(L"Hook_NtNotifyChangeMultipleKeys: masterH=%p useH=%p count=%u filter=0x%X",
+           MasterKeyHandle, useH, Count, CompletionFilter);
+
+    return Real_NtNotifyChangeMultipleKeys(useH, Count, SubordinateObjects,
+                                            Event, ApcRoutine, ApcContext,
+                                            IoStatusBlock, CompletionFilter,
+                                            WatchTree, Buffer, BufferSize,
+                                            Asynchronous);
+}
+
 // ---- NtClose -- CRITICAL: only special-case tracked handles ----
 static NTSTATUS NTAPI Hook_NtClose(HANDLE Handle) {
     VirtKeyEntry e;
-    if (!GetEntry(Handle, e))
+    if (!GetEntry(Handle, e)) {
         return Real_NtClose(Handle);
+    }
 
-    // Close both physical handles
+    VL_DBG(L"Hook_NtClose: tracked handle=%p hVirt=%p hReal=%p",
+           Handle, e.hVirt, e.hReal);
+
     UntrackHandle(Handle);
 
     NTSTATUS st = VL_STATUS_SUCCESS;
     if (e.hVirt == Handle) {
-        // Handle IS the virtual handle -- close it
         st = Real_NtClose(Handle);
-        // Also close the real handle if different
         if (e.hReal && e.hReal != Handle)
             Real_NtClose(e.hReal);
     } else if (e.hReal == Handle) {
-        // Handle is the real handle -- close it
         st = Real_NtClose(Handle);
-        // Also close the virtual handle if different
         if (e.hVirt && e.hVirt != Handle)
             Real_NtClose(e.hVirt);
     } else {
-        // Shouldn't happen -- close both and the handle itself
         if (e.hVirt) Real_NtClose(e.hVirt);
         if (e.hReal) Real_NtClose(e.hReal);
         st = Real_NtClose(Handle);
     }
-
     return st;
 }
 
@@ -1251,168 +1617,280 @@ static NTSTATUS NTAPI Hook_NtClose(HANDLE Handle) {
 // FILE SYSTEM HOOKS
 // ============================================================
 
+// ---- NtCreateFile ----
 static NTSTATUS NTAPI Hook_NtCreateFile(
-    PHANDLE             FileHandle,
-    ULONG               DesiredAccess,
+    PHANDLE               FileHandle,
+    ULONG                 DesiredAccess,
     PVL_OBJECT_ATTRIBUTES ObjectAttributes,
-    PVL_IO_STATUS_BLOCK IoStatusBlock,
-    PLARGE_INTEGER      AllocationSize,
-    ULONG               FileAttributes,
-    ULONG               ShareAccess,
-    ULONG               CreateDisposition,
-    ULONG               CreateOptions,
-    PVOID               EaBuffer,
-    ULONG               EaLength)
+    PVL_IO_STATUS_BLOCK   IoStatusBlock,
+    PLARGE_INTEGER        AllocationSize,
+    ULONG                 FileAttributes,
+    ULONG                 ShareAccess,
+    ULONG                 CreateDisposition,
+    ULONG                 CreateOptions,
+    PVOID                 EaBuffer,
+    ULONG                 EaLength)
 {
-    // Resolve full path including RootDirectory handle (handles relative opens)
-    std::wstring ntPath = ObjectAttributes ? GetFullNtPath(ObjectAttributes) : L"";
-    if (!ntPath.empty())
-        VL_DBG(L"Hook_NtCreateFile: %s", ntPath.c_str());
+    std::wstring ntPath, redPath;
+    VL_UNICODE_STRING newName; VL_OBJECT_ATTRIBUTES newOa;
+    bool redirected = RedirectFileOA(ObjectAttributes, newName, newOa, ntPath, redPath);
 
-    if (!g_FsEnabled || !ObjectAttributes || !ObjectAttributes->ObjectName ||
-        IsReentrant())
-    {
+    VL_DBG(L"Hook_NtCreateFile: %s%s",
+           ntPath.c_str(), redirected ? L" [REDIRECT]" : L"");
+
+    if (!redirected)
         return Real_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
                                   IoStatusBlock, AllocationSize, FileAttributes,
                                   ShareAccess, CreateDisposition, CreateOptions,
                                   EaBuffer, EaLength);
-    }
 
-    std::wstring redPath = ApplyFsRedirect(ntPath);
-
-    if (redPath == ntPath) {
-        VL_DBG(L"Hook_NtCreateFile: no redirect for %s", ntPath.c_str());
-        return Real_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
-                                  IoStatusBlock, AllocationSize, FileAttributes,
-                                  ShareAccess, CreateDisposition, CreateOptions,
-                                  EaBuffer, EaLength);
-    }
-
-    VL_DBG(L"Hook_NtCreateFile: REDIRECT %s -> %s", ntPath.c_str(), redPath.c_str());
-
-    // Use absolute redirected path with no RootDirectory
-    VL_UNICODE_STRING newName;  MakeUStr(&newName, redPath);
-    VL_OBJECT_ATTRIBUTES newOa = *ObjectAttributes;
-    newOa.ObjectName    = &newName;
-    newOa.RootDirectory = NULL;
-
+    VL_DBG(L"Hook_NtCreateFile: -> %s", redPath.c_str());
     return Real_NtCreateFile(FileHandle, DesiredAccess, &newOa,
                               IoStatusBlock, AllocationSize, FileAttributes,
                               ShareAccess, CreateDisposition, CreateOptions,
                               EaBuffer, EaLength);
 }
 
+// ---- NtOpenFile ----
 static NTSTATUS NTAPI Hook_NtOpenFile(
-    PHANDLE             FileHandle,
-    ULONG               DesiredAccess,
+    PHANDLE               FileHandle,
+    ULONG                 DesiredAccess,
     PVL_OBJECT_ATTRIBUTES ObjectAttributes,
-    PVL_IO_STATUS_BLOCK IoStatusBlock,
-    ULONG               ShareAccess,
-    ULONG               OpenOptions)
+    PVL_IO_STATUS_BLOCK   IoStatusBlock,
+    ULONG                 ShareAccess,
+    ULONG                 OpenOptions)
 {
-    std::wstring ntPath = ObjectAttributes ? GetFullNtPath(ObjectAttributes) : L"";
-    if (!ntPath.empty())
-        VL_DBG(L"Hook_NtOpenFile: %s", ntPath.c_str());
+    std::wstring ntPath, redPath;
+    VL_UNICODE_STRING newName; VL_OBJECT_ATTRIBUTES newOa;
+    bool redirected = RedirectFileOA(ObjectAttributes, newName, newOa, ntPath, redPath);
 
-    if (!g_FsEnabled || !ObjectAttributes || !ObjectAttributes->ObjectName ||
-        IsReentrant())
-    {
+    VL_DBG(L"Hook_NtOpenFile: %s%s",
+           ntPath.c_str(), redirected ? L" [REDIRECT]" : L"");
+
+    if (!redirected)
         return Real_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
                                 IoStatusBlock, ShareAccess, OpenOptions);
-    }
 
-    std::wstring redPath = ApplyFsRedirect(ntPath);
-
-    if (redPath == ntPath) {
-        VL_DBG(L"Hook_NtOpenFile: no redirect for %s", ntPath.c_str());
-        return Real_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
-                                IoStatusBlock, ShareAccess, OpenOptions);
-    }
-
-    VL_DBG(L"Hook_NtOpenFile: REDIRECT %s -> %s", ntPath.c_str(), redPath.c_str());
-    VL_UNICODE_STRING newName;  MakeUStr(&newName, redPath);
-    VL_OBJECT_ATTRIBUTES newOa = *ObjectAttributes;
-    newOa.ObjectName    = &newName;
-    newOa.RootDirectory = NULL;
-
+    VL_DBG(L"Hook_NtOpenFile: -> %s", redPath.c_str());
     return Real_NtOpenFile(FileHandle, DesiredAccess, &newOa,
                             IoStatusBlock, ShareAccess, OpenOptions);
 }
 
-// ---- NtQueryFullAttributesFile -- used by GetFileAttributesW ----
-//
-// cmd.exe calls GetFileAttributesW(src) to check file existence before rename.
-// This goes through NtQueryFullAttributesFile, NOT NtOpenFile/NtCreateFile.
-// Without this hook the existence check fails on the real path and cmd bails
-// before ever reaching MoveFileW.
+// ---- NtCreateDirectoryObject ----
+static NTSTATUS NTAPI Hook_NtCreateDirectoryObject(
+    PHANDLE               DirectoryHandle,
+    ULONG                 DesiredAccess,
+    PVL_OBJECT_ATTRIBUTES ObjectAttributes)
+{
+    std::wstring ntPath, redPath;
+    VL_UNICODE_STRING newName; VL_OBJECT_ATTRIBUTES newOa;
+    bool redirected = RedirectFileOA(ObjectAttributes, newName, newOa, ntPath, redPath);
+
+    VL_DBG(L"Hook_NtCreateDirectoryObject: %s%s",
+           ntPath.c_str(), redirected ? L" [REDIRECT]" : L"");
+
+    if (!redirected)
+        return Real_NtCreateDirectoryObject(DirectoryHandle, DesiredAccess, ObjectAttributes);
+
+    VL_DBG(L"Hook_NtCreateDirectoryObject: -> %s", redPath.c_str());
+    return Real_NtCreateDirectoryObject(DirectoryHandle, DesiredAccess, &newOa);
+}
+
+// ---- NtOpenDirectoryObject ----
+static NTSTATUS NTAPI Hook_NtOpenDirectoryObject(
+    PHANDLE               DirectoryHandle,
+    ULONG                 DesiredAccess,
+    PVL_OBJECT_ATTRIBUTES ObjectAttributes)
+{
+    std::wstring ntPath, redPath;
+    VL_UNICODE_STRING newName; VL_OBJECT_ATTRIBUTES newOa;
+    bool redirected = RedirectFileOA(ObjectAttributes, newName, newOa, ntPath, redPath);
+
+    VL_DBG(L"Hook_NtOpenDirectoryObject: %s%s",
+           ntPath.c_str(), redirected ? L" [REDIRECT]" : L"");
+
+    if (!redirected)
+        return Real_NtOpenDirectoryObject(DirectoryHandle, DesiredAccess, ObjectAttributes);
+
+    VL_DBG(L"Hook_NtOpenDirectoryObject: -> %s", redPath.c_str());
+    return Real_NtOpenDirectoryObject(DirectoryHandle, DesiredAccess, &newOa);
+}
+
+// ---- NtCreateMailslotFile ----
+static NTSTATUS NTAPI Hook_NtCreateMailslotFile(
+    PHANDLE               FileHandle,
+    ULONG                 DesiredAccess,
+    PVL_OBJECT_ATTRIBUTES ObjectAttributes,
+    PVL_IO_STATUS_BLOCK   IoStatusBlock,
+    ULONG                 CreateOptions,
+    ULONG                 MailslotQuota,
+    ULONG                 MaximumMessageSize,
+    PLARGE_INTEGER        ReadTimeout)
+{
+    std::wstring ntPath, redPath;
+    VL_UNICODE_STRING newName; VL_OBJECT_ATTRIBUTES newOa;
+    bool redirected = RedirectFileOA(ObjectAttributes, newName, newOa, ntPath, redPath);
+
+    VL_DBG(L"Hook_NtCreateMailslotFile: %s%s",
+           ntPath.c_str(), redirected ? L" [REDIRECT]" : L"");
+
+    if (!redirected)
+        return Real_NtCreateMailslotFile(FileHandle, DesiredAccess, ObjectAttributes,
+                                          IoStatusBlock, CreateOptions,
+                                          MailslotQuota, MaximumMessageSize, ReadTimeout);
+
+    VL_DBG(L"Hook_NtCreateMailslotFile: -> %s", redPath.c_str());
+    return Real_NtCreateMailslotFile(FileHandle, DesiredAccess, &newOa,
+                                      IoStatusBlock, CreateOptions,
+                                      MailslotQuota, MaximumMessageSize, ReadTimeout);
+}
+
+// ---- NtCreateNamedPipeFile ----
+static NTSTATUS NTAPI Hook_NtCreateNamedPipeFile(
+    PHANDLE               FileHandle,
+    ULONG                 DesiredAccess,
+    PVL_OBJECT_ATTRIBUTES ObjectAttributes,
+    PVL_IO_STATUS_BLOCK   IoStatusBlock,
+    ULONG                 ShareAccess,
+    ULONG                 CreateDisposition,
+    ULONG                 CreateOptions,
+    ULONG                 NamedPipeType,
+    ULONG                 ReadMode,
+    ULONG                 CompletionMode,
+    ULONG                 MaximumInstances,
+    ULONG                 InboundQuota,
+    ULONG                 OutboundQuota,
+    PLARGE_INTEGER        DefaultTimeout)
+{
+    std::wstring ntPath, redPath;
+    VL_UNICODE_STRING newName; VL_OBJECT_ATTRIBUTES newOa;
+    bool redirected = RedirectFileOA(ObjectAttributes, newName, newOa, ntPath, redPath);
+
+    VL_DBG(L"Hook_NtCreateNamedPipeFile: %s%s",
+           ntPath.c_str(), redirected ? L" [REDIRECT]" : L"");
+
+    if (!redirected)
+        return Real_NtCreateNamedPipeFile(FileHandle, DesiredAccess, ObjectAttributes,
+                                           IoStatusBlock, ShareAccess, CreateDisposition,
+                                           CreateOptions, NamedPipeType, ReadMode,
+                                           CompletionMode, MaximumInstances,
+                                           InboundQuota, OutboundQuota, DefaultTimeout);
+
+    VL_DBG(L"Hook_NtCreateNamedPipeFile: -> %s", redPath.c_str());
+    return Real_NtCreateNamedPipeFile(FileHandle, DesiredAccess, &newOa,
+                                       IoStatusBlock, ShareAccess, CreateDisposition,
+                                       CreateOptions, NamedPipeType, ReadMode,
+                                       CompletionMode, MaximumInstances,
+                                       InboundQuota, OutboundQuota, DefaultTimeout);
+}
+
+// ---- NtDeleteFile ----
+static NTSTATUS NTAPI Hook_NtDeleteFile(PVL_OBJECT_ATTRIBUTES ObjectAttributes)
+{
+    std::wstring ntPath, redPath;
+    VL_UNICODE_STRING newName; VL_OBJECT_ATTRIBUTES newOa;
+    bool redirected = RedirectFileOA(ObjectAttributes, newName, newOa, ntPath, redPath);
+
+    VL_DBG(L"Hook_NtDeleteFile: %s%s",
+           ntPath.c_str(), redirected ? L" [REDIRECT]" : L"");
+
+    if (!redirected)
+        return Real_NtDeleteFile(ObjectAttributes);
+
+    VL_DBG(L"Hook_NtDeleteFile: -> %s", redPath.c_str());
+    return Real_NtDeleteFile(&newOa);
+}
+
+// ---- NtQueryAttributesFile ----
+// Simpler variant of NtQueryFullAttributesFile (returns FILE_BASIC_INFORMATION).
+static NTSTATUS NTAPI Hook_NtQueryAttributesFile(
+    PVL_OBJECT_ATTRIBUTES ObjectAttributes,
+    PVOID                 FileInformation)
+{
+    std::wstring ntPath, redPath;
+    VL_UNICODE_STRING newName; VL_OBJECT_ATTRIBUTES newOa;
+    bool redirected = RedirectFileOA(ObjectAttributes, newName, newOa, ntPath, redPath);
+
+    VL_DBG(L"Hook_NtQueryAttributesFile: %s%s",
+           ntPath.c_str(), redirected ? L" [REDIRECT]" : L"");
+
+    if (!redirected)
+        return Real_NtQueryAttributesFile(ObjectAttributes, FileInformation);
+
+    VL_DBG(L"Hook_NtQueryAttributesFile: -> %s", redPath.c_str());
+    return Real_NtQueryAttributesFile(&newOa, FileInformation);
+}
+
+// ---- NtQueryFullAttributesFile ----
+// Used by GetFileAttributesW internally.
 static NTSTATUS NTAPI Hook_NtQueryFullAttributesFile(
     PVL_OBJECT_ATTRIBUTES ObjectAttributes,
-    PVOID                 FileInformation)  // FILE_NETWORK_OPEN_INFORMATION
+    PVOID                 FileInformation)
 {
-    std::wstring ntPath = ObjectAttributes ? GetFullNtPath(ObjectAttributes) : L"";
-    if (!ntPath.empty())
-        VL_DBG(L"Hook_NtQueryFullAttributesFile: %s", ntPath.c_str());
+    std::wstring ntPath, redPath;
+    VL_UNICODE_STRING newName; VL_OBJECT_ATTRIBUTES newOa;
+    bool redirected = RedirectFileOA(ObjectAttributes, newName, newOa, ntPath, redPath);
 
-    if (!g_FsEnabled || !ObjectAttributes || !ObjectAttributes->ObjectName ||
-        IsReentrant())
-    {
+    VL_DBG(L"Hook_NtQueryFullAttributesFile: %s%s",
+           ntPath.c_str(), redirected ? L" [REDIRECT]" : L"");
+
+    if (!redirected)
         return Real_NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
-    }
 
-    std::wstring redPath = ApplyFsRedirect(ntPath);
-
-    if (redPath == ntPath) {
-        VL_DBG(L"Hook_NtQueryFullAttributesFile: no redirect for %s", ntPath.c_str());
-        return Real_NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
-    }
-
-    VL_DBG(L"Hook_NtQueryFullAttributesFile: REDIRECT %s -> %s", ntPath.c_str(), redPath.c_str());
-    VL_UNICODE_STRING newName; MakeUStr(&newName, redPath);
-    VL_OBJECT_ATTRIBUTES newOa = *ObjectAttributes;
-    newOa.ObjectName    = &newName;
-    newOa.RootDirectory = NULL;
-
+    VL_DBG(L"Hook_NtQueryFullAttributesFile: -> %s", redPath.c_str());
     return Real_NtQueryFullAttributesFile(&newOa, FileInformation);
 }
-//
-// When an app renames a file the kernel path of the NEW name is embedded
-// inside a FILE_RENAME_INFORMATION / FILE_RENAME_INFORMATION_EX structure
-// passed here.  We patch that target path through ApplyFsRedirect so that
-// both ends of the rename land in the virtual store.
-//
-// FILE_RENAME_INFORMATION true layout (compiler-padded):
-//
-//   32-bit:
-//     offset  0 : BOOLEAN ReplaceIfExists (1 byte)
-//     offset  1 : pad[3]
-//     offset  4 : HANDLE  RootDirectory   (4 bytes)
-//     offset  8 : ULONG   FileNameLength  (4 bytes)
-//     offset 12 : WCHAR   FileName[1]
-//
-//   64-bit:
-//     offset  0 : BOOLEAN ReplaceIfExists (1 byte)
-//     offset  1 : pad[7]
-//     offset  8 : HANDLE  RootDirectory   (8 bytes)
-//     offset 16 : ULONG   FileNameLength  (4 bytes)
-//     offset 20 : WCHAR   FileName[1]
-//
-// FileRenameInformationEx (Win10 RS1+) has ULONG Flags at offset 0
-// instead of BOOLEAN, but the rest of the layout is identical per-bitness.
 
+// ---- NtQueryInformationByName (Win10+) ----
+// Queries file information by name without opening a handle.
+static NTSTATUS NTAPI Hook_NtQueryInformationByName(
+    PVL_OBJECT_ATTRIBUTES ObjectAttributes,
+    PVL_IO_STATUS_BLOCK   IoStatusBlock,
+    PVOID                 FileInformation,
+    ULONG                 Length,
+    ULONG                 FileInformationClass)
+{
+    std::wstring ntPath, redPath;
+    VL_UNICODE_STRING newName; VL_OBJECT_ATTRIBUTES newOa;
+    bool redirected = RedirectFileOA(ObjectAttributes, newName, newOa, ntPath, redPath);
+
+    VL_DBG(L"Hook_NtQueryInformationByName: class=%u %s%s",
+           FileInformationClass, ntPath.c_str(),
+           redirected ? L" [REDIRECT]" : L"");
+
+    if (!redirected)
+        return Real_NtQueryInformationByName(ObjectAttributes, IoStatusBlock,
+                                              FileInformation, Length,
+                                              FileInformationClass);
+
+    VL_DBG(L"Hook_NtQueryInformationByName: -> %s", redPath.c_str());
+    return Real_NtQueryInformationByName(&newOa, IoStatusBlock,
+                                          FileInformation, Length,
+                                          FileInformationClass);
+}
+
+// ---- NtSetInformationFile -- intercepts rename (FileRenameInformation) ----
+//
+// When an app renames a file, the new path is embedded inside a
+// FILE_RENAME_INFORMATION structure passed here. We redirect that target path
+// through ApplyFsRedirect so both ends of the rename land in the virtual store.
+//
+//   32-bit layout: offset 0 BOOLEAN, +4 HANDLE, +8 ULONG NameLen, +12 WCHAR Name[]
+//   64-bit layout: offset 0 BOOLEAN, +8 HANDLE, +16 ULONG NameLen, +20 WCHAR Name[]
+//
 #define FileRenameInformation   10
 #define FileRenameInformationEx 65   // Windows 10 RS1+
 
-// Correct offsets based on actual struct layout:
 #ifdef _WIN64
-  #define RENAME_INFO_HANDLE_OFFSET   8
-  #define RENAME_INFO_NAMELEN_OFFSET  16
-  #define RENAME_INFO_NAME_OFFSET     20
-  #define RENAME_INFO_MIN_SIZE        20
+#  define RENAME_INFO_HANDLE_OFFSET   8
+#  define RENAME_INFO_NAMELEN_OFFSET  16
+#  define RENAME_INFO_NAME_OFFSET     20
+#  define RENAME_INFO_MIN_SIZE        20
 #else
-  #define RENAME_INFO_HANDLE_OFFSET   4
-  #define RENAME_INFO_NAMELEN_OFFSET  8
-  #define RENAME_INFO_NAME_OFFSET     12
-  #define RENAME_INFO_MIN_SIZE        12
+#  define RENAME_INFO_HANDLE_OFFSET   4
+#  define RENAME_INFO_NAMELEN_OFFSET  8
+#  define RENAME_INFO_NAME_OFFSET     12
+#  define RENAME_INFO_MIN_SIZE        12
 #endif
 
 static NTSTATUS NTAPI Hook_NtSetInformationFile(
@@ -1422,8 +1900,8 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
     ULONG               Length,
     ULONG               FileInformationClass)
 {
-    VL_DBG(L"Hook_NtSetInformationFile: class=%u len=%u fsEnabled=%d",
-           FileInformationClass, Length, (int)g_FsEnabled);
+    VL_DBG(L"Hook_NtSetInformationFile: handle=%p class=%u len=%u",
+           FileHandle, FileInformationClass, Length);
 
     if (!g_FsEnabled || IsReentrant() ||
         (FileInformationClass != FileRenameInformation &&
@@ -1435,32 +1913,29 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
                                           FileInformationClass);
     }
 
-    BYTE* p           = (BYTE*)FileInformation;
-    ULONG nameByteLen = *(ULONG*)(p + RENAME_INFO_NAMELEN_OFFSET);
+    BYTE*  p           = (BYTE*)FileInformation;
+    ULONG  nameByteLen = *(ULONG*)(p + RENAME_INFO_NAMELEN_OFFSET);
 
-    if (nameByteLen == 0 || Length < (ULONG)(RENAME_INFO_NAME_OFFSET + nameByteLen)) {
+    if (nameByteLen == 0 || Length < (ULONG)(RENAME_INFO_NAME_OFFSET + nameByteLen))
         return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
                                           FileInformation, Length,
                                           FileInformationClass);
-    }
 
     std::wstring origName((WCHAR*)(p + RENAME_INFO_NAME_OFFSET),
-                          nameByteLen / sizeof(WCHAR));
+                           nameByteLen / sizeof(WCHAR));
     VL_DBG(L"Hook_NtSetInformationFile: rename dest orig=%s", origName.c_str());
 
     std::wstring redName = ApplyFsRedirect(origName);
-
     if (redName == origName) {
-        VL_DBG(L"Hook_NtSetInformationFile: no redirect for dest");
+        VL_DBG(L"Hook_NtSetInformationFile: no redirect for rename dest");
         return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
                                           FileInformation, Length,
                                           FileInformationClass);
     }
 
-    VL_DBG(L"Hook_NtSetInformationFile: rename dest redir=%s", redName.c_str());
-
-    ULONG  newNameBytes = (ULONG)(redName.size() * sizeof(WCHAR));
-    ULONG  newLength    = RENAME_INFO_NAME_OFFSET + newNameBytes;
+    VL_DBG(L"Hook_NtSetInformationFile: rename dest -> %s", redName.c_str());
+    ULONG newNameBytes = (ULONG)(redName.size() * sizeof(WCHAR));
+    ULONG newLength    = RENAME_INFO_NAME_OFFSET + newNameBytes;
     std::vector<BYTE> buf(newLength, 0);
     memcpy(buf.data(), p, RENAME_INFO_NAME_OFFSET);
     *(ULONG*)(buf.data() + RENAME_INFO_NAMELEN_OFFSET) = newNameBytes;
@@ -1471,166 +1946,162 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
                                       FileInformationClass);
 }
 
-// ---- GetFileAttributesW / GetFileAttributesExW ----
-// cmd.exe calls one of these to verify the source file exists before rename.
-
-static DWORD WINAPI Hook_GetFileAttributesW(LPCWSTR lpFileName)
+// ---- NtQueryInformationFile -- handle-based, pass-through + log ----
+// The handle was already redirected at NtCreateFile/NtOpenFile time.
+static NTSTATUS NTAPI Hook_NtQueryInformationFile(
+    HANDLE              FileHandle,
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID               FileInformation,
+    ULONG               Length,
+    ULONG               FileInformationClass)
 {
-    VL_DBG(L"Hook_GetFileAttributesW: %s", lpFileName ? lpFileName : L"(null)");
-
-    if (!g_FsEnabled || IsReentrant() || !lpFileName)
-        return Real_GetFileAttributesW(lpFileName);
-
-    std::wstring ntPath  = Win32ToNtPath(lpFileName);
-    std::wstring redNt   = ApplyFsRedirect(ntPath);
-
-    if (redNt == ntPath) {
-        VL_DBG(L"Hook_GetFileAttributesW: no redirect");
-        return Real_GetFileAttributesW(lpFileName);
-    }
-
-    // Strip \??\ back to Win32
-    std::wstring redWin32 = redNt;
-    if (redWin32.size() > 4 && redWin32[0]==L'\\' && redWin32[1]==L'?' &&
-        redWin32[2]==L'?' && redWin32[3]==L'\\')
-        redWin32 = redWin32.substr(4);
-
-    VL_DBG(L"Hook_GetFileAttributesW: REDIRECT %s -> %s", lpFileName, redWin32.c_str());
-    SetReentrant(true);
-    DWORD result = Real_GetFileAttributesW(redWin32.c_str());
-    SetReentrant(false);
-    return result;
+    VL_DBG(L"Hook_NtQueryInformationFile: handle=%p class=%u len=%u",
+           FileHandle, FileInformationClass, Length);
+    return Real_NtQueryInformationFile(FileHandle, IoStatusBlock,
+                                        FileInformation, Length,
+                                        FileInformationClass);
 }
 
-static BOOL WINAPI Hook_GetFileAttributesExW(
-    LPCWSTR                lpFileName,
-    GET_FILEEX_INFO_LEVELS fInfoLevelId,
-    LPVOID                 lpFileInformation)
+// ---- NtQueryVolumeInformationFile -- handle-based, pass-through + log ----
+static NTSTATUS NTAPI Hook_NtQueryVolumeInformationFile(
+    HANDLE              FileHandle,
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID               FsInformation,
+    ULONG               Length,
+    ULONG               FsInformationClass)
 {
-    VL_DBG(L"Hook_GetFileAttributesExW: %s", lpFileName ? lpFileName : L"(null)");
-
-    if (!g_FsEnabled || IsReentrant() || !lpFileName)
-        return Real_GetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation);
-
-    std::wstring ntPath  = Win32ToNtPath(lpFileName);
-    std::wstring redNt   = ApplyFsRedirect(ntPath);
-
-    if (redNt == ntPath) {
-        VL_DBG(L"Hook_GetFileAttributesExW: no redirect");
-        return Real_GetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation);
-    }
-
-    std::wstring redWin32 = redNt;
-    if (redWin32.size() > 4 && redWin32[0]==L'\\' && redWin32[1]==L'?' &&
-        redWin32[2]==L'?' && redWin32[3]==L'\\')
-        redWin32 = redWin32.substr(4);
-
-    VL_DBG(L"Hook_GetFileAttributesExW: REDIRECT %s -> %s", lpFileName, redWin32.c_str());
-    SetReentrant(true);
-    BOOL result = Real_GetFileAttributesExW(redWin32.c_str(), fInfoLevelId, lpFileInformation);
-    SetReentrant(false);
-    return result;
+    VL_DBG(L"Hook_NtQueryVolumeInformationFile: handle=%p class=%u len=%u",
+           FileHandle, FsInformationClass, Length);
+    return Real_NtQueryVolumeInformationFile(FileHandle, IoStatusBlock,
+                                              FsInformation, Length,
+                                              FsInformationClass);
 }
 
-// ---- FindFirstFileExW -- cmd.exe uses this to check file existence before rename ----
-//
-// cmd.exe calls FindFirstFileExW(src) for wildcard expansion BEFORE calling
-// MoveFileW. If the source doesn't appear to exist, cmd bails immediately.
-// We redirect the Win32 path here so the virtual file is found.
-
-static HANDLE WINAPI Hook_FindFirstFileExW(
-    LPCWSTR            lpFileName,
-    FINDEX_INFO_LEVELS fInfoLevelId,
-    LPVOID             lpFindFileData,
-    FINDEX_SEARCH_OPS  fSearchOp,
-    LPVOID             lpSearchFilter,
-    DWORD              dwAdditionalFlags)
+// ---- NtQueryDirectoryFile -- handle-based, pass-through + log ----
+// The directory handle already points to the virtual location (redirected at
+// NtOpenFile time), so no path substitution is needed here.
+static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
+    HANDLE              FileHandle,
+    HANDLE              Event,
+    VL_PIO_APC_ROUTINE  ApcRoutine,
+    PVOID               ApcContext,
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID               FileInformation,
+    ULONG               Length,
+    ULONG               FileInformationClass,
+    BOOLEAN             ReturnSingleEntry,
+    PVL_UNICODE_STRING  FileName,
+    BOOLEAN             RestartScan)
 {
-    VL_DBG(L"Hook_FindFirstFileExW: %s", lpFileName ? lpFileName : L"(null)");
-
-    if (!g_FsEnabled || IsReentrant() || !lpFileName) {
-        return Real_FindFirstFileExW(lpFileName, fInfoLevelId, lpFindFileData,
-                                      fSearchOp, lpSearchFilter, dwAdditionalFlags);
-    }
-
-    std::wstring ntPath  = Win32ToNtPath(lpFileName);
-    std::wstring redNt   = ApplyFsRedirect(ntPath);
-
-    if (redNt == ntPath) {
-        VL_DBG(L"Hook_FindFirstFileExW: no redirect");
-        return Real_FindFirstFileExW(lpFileName, fInfoLevelId, lpFindFileData,
-                                      fSearchOp, lpSearchFilter, dwAdditionalFlags);
-    }
-
-    // Strip \??\ back to Win32 for the redirected path
-    std::wstring redWin32 = redNt;
-    if (redWin32.size() > 4 &&
-        redWin32[0]==L'\\' && redWin32[1]==L'?' &&
-        redWin32[2]==L'?' && redWin32[3]==L'\\')
-        redWin32 = redWin32.substr(4);
-
-    VL_DBG(L"Hook_FindFirstFileExW: REDIRECT %s -> %s", lpFileName, redWin32.c_str());
-
-    SetReentrant(true);
-    HANDLE h = Real_FindFirstFileExW(redWin32.c_str(), fInfoLevelId, lpFindFileData,
-                                      fSearchOp, lpSearchFilter, dwAdditionalFlags);
-    SetReentrant(false);
-    return h;
+    VL_DBG(L"Hook_NtQueryDirectoryFile: handle=%p class=%u filter=%s restart=%d",
+           FileHandle, FileInformationClass,
+           FileName ? FromUStr(FileName).c_str() : L"*",
+           (int)RestartScan);
+    return Real_NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                      IoStatusBlock, FileInformation, Length,
+                                      FileInformationClass, ReturnSingleEntry,
+                                      FileName, RestartScan);
 }
 
-// ---- MoveFileW / MoveFileExW -- belt-and-suspenders FS rename hook ----
-//
-// NtSetInformationFile handles the kernel rename path, but we also hook
-// the Win32 MoveFile* APIs directly. This catches cases where the
-// destination path is constructed in Win32 space before ever reaching
-// the NT layer, and ensures both source and destination are redirected.
-
-static BOOL WINAPI Hook_MoveFileExW(
-    LPCWSTR lpExistingFileName,
-    LPCWSTR lpNewFileName,
-    DWORD   dwFlags)
+// ---- NtQueryDirectoryFileEx (Win10+) -- handle-based, pass-through + log ----
+static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
+    HANDLE              FileHandle,
+    HANDLE              Event,
+    VL_PIO_APC_ROUTINE  ApcRoutine,
+    PVOID               ApcContext,
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID               FileInformation,
+    ULONG               Length,
+    ULONG               FileInformationClass,
+    ULONG               QueryFlags,
+    PVL_UNICODE_STRING  FileName)
 {
-    VL_DBG(L"Hook_MoveFileExW: src=%s dst=%s",
-           lpExistingFileName ? lpExistingFileName : L"(null)",
-           lpNewFileName      ? lpNewFileName      : L"(null)");
+    VL_DBG(L"Hook_NtQueryDirectoryFileEx: handle=%p class=%u flags=0x%X filter=%s",
+           FileHandle, FileInformationClass, QueryFlags,
+           FileName ? FromUStr(FileName).c_str() : L"*");
+    return Real_NtQueryDirectoryFileEx(FileHandle, Event, ApcRoutine, ApcContext,
+                                        IoStatusBlock, FileInformation, Length,
+                                        FileInformationClass, QueryFlags, FileName);
+}
 
-    if (!g_FsEnabled || IsReentrant()) {
-        return Real_MoveFileExW(lpExistingFileName, lpNewFileName, dwFlags);
-    }
+// ---- NtDeviceIoControlFile -- handle-based, pass-through + log ----
+static NTSTATUS NTAPI Hook_NtDeviceIoControlFile(
+    HANDLE              FileHandle,
+    HANDLE              Event,
+    VL_PIO_APC_ROUTINE  ApcRoutine,
+    PVOID               ApcContext,
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    ULONG               IoControlCode,
+    PVOID               InputBuffer,
+    ULONG               InputBufferLength,
+    PVOID               OutputBuffer,
+    ULONG               OutputBufferLength)
+{
+    VL_DBG(L"Hook_NtDeviceIoControlFile: handle=%p ioctl=0x%08X inLen=%u outLen=%u",
+           FileHandle, IoControlCode, InputBufferLength, OutputBufferLength);
+    return Real_NtDeviceIoControlFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                       IoStatusBlock, IoControlCode,
+                                       InputBuffer, InputBufferLength,
+                                       OutputBuffer, OutputBufferLength);
+}
 
-    // Convert Win32 paths to NT, apply redirect, convert back to Win32
-    std::wstring srcNt = lpExistingFileName ? Win32ToNtPath(lpExistingFileName) : L"";
-    std::wstring dstNt = lpNewFileName      ? Win32ToNtPath(lpNewFileName)      : L"";
+// ---- NtFsControlFile -- handle-based, pass-through + log ----
+static NTSTATUS NTAPI Hook_NtFsControlFile(
+    HANDLE              FileHandle,
+    HANDLE              Event,
+    VL_PIO_APC_ROUTINE  ApcRoutine,
+    PVOID               ApcContext,
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    ULONG               FsControlCode,
+    PVOID               InputBuffer,
+    ULONG               InputBufferLength,
+    PVOID               OutputBuffer,
+    ULONG               OutputBufferLength)
+{
+    VL_DBG(L"Hook_NtFsControlFile: handle=%p fsctl=0x%08X inLen=%u outLen=%u",
+           FileHandle, FsControlCode, InputBufferLength, OutputBufferLength);
+    return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                 IoStatusBlock, FsControlCode,
+                                 InputBuffer, InputBufferLength,
+                                 OutputBuffer, OutputBufferLength);
+}
 
-    std::wstring srcRed = srcNt.empty() ? srcNt : ApplyFsRedirect(srcNt);
-    std::wstring dstRed = dstNt.empty() ? dstNt : ApplyFsRedirect(dstNt);
+// ---- NtReadFile -- handle-based, pass-through + log ----
+static NTSTATUS NTAPI Hook_NtReadFile(
+    HANDLE              FileHandle,
+    HANDLE              Event,
+    VL_PIO_APC_ROUTINE  ApcRoutine,
+    PVOID               ApcContext,
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID               Buffer,
+    ULONG               Length,
+    PLARGE_INTEGER      ByteOffset,
+    PULONG              Key)
+{
+    VL_DBG(L"Hook_NtReadFile: handle=%p len=%u offset=%I64d",
+           FileHandle, Length,
+           ByteOffset ? ByteOffset->QuadPart : (LONGLONG)-1);
+    return Real_NtReadFile(FileHandle, Event, ApcRoutine, ApcContext,
+                            IoStatusBlock, Buffer, Length, ByteOffset, Key);
+}
 
-    // Convert back to Win32 (strip \??\ prefix)
-    auto toWin32 = [](const std::wstring& nt) -> std::wstring {
-        if (nt.size() > 4 && nt[0]==L'\\' && nt[1]==L'?' &&
-            nt[2]==L'?' && nt[3]==L'\\')
-            return nt.substr(4);
-        return nt;
-    };
-
-    bool srcChanged = (!srcNt.empty() && srcRed != srcNt);
-    bool dstChanged = (!dstNt.empty() && dstRed != dstNt);
-
-    if (!srcChanged && !dstChanged) {
-        return Real_MoveFileExW(lpExistingFileName, lpNewFileName, dwFlags);
-    }
-
-    std::wstring newSrc = srcChanged ? toWin32(srcRed) : lpExistingFileName;
-    std::wstring newDst = dstChanged ? toWin32(dstRed) : (lpNewFileName ? lpNewFileName : L"");
-
-    VL_DBG(L"Hook_MoveFileExW: redir src=%s dst=%s", newSrc.c_str(), newDst.c_str());
-
-    SetReentrant(true);
-    BOOL result = Real_MoveFileExW(newSrc.c_str(),
-                                    lpNewFileName ? newDst.c_str() : NULL,
-                                    dwFlags);
-    SetReentrant(false);
-    return result;
+// ---- NtWriteFile -- handle-based, pass-through + log ----
+static NTSTATUS NTAPI Hook_NtWriteFile(
+    HANDLE              FileHandle,
+    HANDLE              Event,
+    VL_PIO_APC_ROUTINE  ApcRoutine,
+    PVOID               ApcContext,
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID               Buffer,
+    ULONG               Length,
+    PLARGE_INTEGER      ByteOffset,
+    PULONG              Key)
+{
+    VL_DBG(L"Hook_NtWriteFile: handle=%p len=%u offset=%I64d",
+           FileHandle, Length,
+           ByteOffset ? ByteOffset->QuadPart : (LONGLONG)-1);
+    return Real_NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext,
+                             IoStatusBlock, Buffer, Length, ByteOffset, Key);
 }
 
 // ============================================================
@@ -1640,6 +2111,8 @@ static BOOL WINAPI Hook_MoveFileExW(
 static bool InjectIntoProcess(HANDLE hProcess) {
     if (!g_DllPathA[0]) return false;
     const char* dlls[] = { g_DllPathA };
+    VL_DBG(L"InjectIntoProcess: injecting %S into child process %p",
+           g_DllPathA, hProcess);
     return DetourUpdateProcessWithDll(hProcess, dlls, 1) != FALSE;
 }
 
@@ -1655,6 +2128,10 @@ static BOOL WINAPI Hook_CreateProcessW(
     LPSTARTUPINFOW        lpStartupInfo,
     LPPROCESS_INFORMATION lpProcessInformation)
 {
+    VL_DBG(L"Hook_CreateProcessW: app=%s cmd=%s",
+           lpApplicationName ? lpApplicationName : L"(null)",
+           lpCommandLine     ? lpCommandLine     : L"(null)");
+
     DWORD flags = dwCreationFlags | CREATE_SUSPENDED;
     BOOL ok = Real_CreateProcessW(lpApplicationName, lpCommandLine,
                                    lpProcessAttributes, lpThreadAttributes,
@@ -1681,6 +2158,10 @@ static BOOL WINAPI Hook_CreateProcessA(
     LPSTARTUPINFOA        lpStartupInfo,
     LPPROCESS_INFORMATION lpProcessInformation)
 {
+    VL_DBG(L"Hook_CreateProcessA: app=%S cmd=%S",
+           lpApplicationName ? lpApplicationName : "(null)",
+           lpCommandLine     ? lpCommandLine     : "(null)");
+
     DWORD flags = dwCreationFlags | CREATE_SUSPENDED;
     BOOL ok = Real_CreateProcessA(lpApplicationName, lpCommandLine,
                                    lpProcessAttributes, lpThreadAttributes,
@@ -1713,79 +2194,86 @@ static void InstallHooks() {
     HMODULE k32   = GetModuleHandleA("kernel32.dll");
     if (!ntdll || !k32) return;
 
-    // Resolve NT functions via GetProcAddress
+    // Always needed
     VL_GETPROC(ntdll, NtClose);
-    VL_GETPROC(ntdll, NtQueryObject);  // for robust handle path resolution
+    VL_GETPROC(ntdll, NtQueryObject);
     VL_GETPROC(k32,   CreateProcessW);
     VL_GETPROC(k32,   CreateProcessA);
 
+    // Registry hooks
     if (g_RegEnabled) {
         VL_GETPROC(ntdll, NtOpenKey);
         VL_GETPROC(ntdll, NtOpenKeyEx);
+        VL_GETPROC(ntdll, NtOpenKeyTransacted);
+        VL_GETPROC(ntdll, NtOpenKeyTransactedEx);
         VL_GETPROC(ntdll, NtCreateKey);
+        VL_GETPROC(ntdll, NtCreateKeyTransacted);
+        VL_GETPROC(ntdll, NtDeleteKey);
+        VL_GETPROC(ntdll, NtDeleteValueKey);
         VL_GETPROC(ntdll, NtEnumerateKey);
         VL_GETPROC(ntdll, NtEnumerateValueKey);
         VL_GETPROC(ntdll, NtQueryKey);
         VL_GETPROC(ntdll, NtQueryValueKey);
+        VL_GETPROC(ntdll, NtQueryMultipleValueKey);
         VL_GETPROC(ntdll, NtSetValueKey);
-        VL_GETPROC(ntdll, NtDeleteKey);
-        VL_GETPROC(ntdll, NtDeleteValueKey);
+        VL_GETPROC(ntdll, NtRenameKey);
+        VL_GETPROC(ntdll, NtReplaceKey);
+        VL_GETPROC(ntdll, NtSaveKey);
+        VL_GETPROC(ntdll, NtSaveKeyEx);
+        VL_GETPROC(ntdll, NtLoadKey);
+        VL_GETPROC(ntdll, NtLoadKey2);
+        VL_GETPROC(ntdll, NtLoadKeyEx);
         VL_GETPROC(ntdll, NtNotifyChangeKey);
+        VL_GETPROC(ntdll, NtNotifyChangeMultipleKeys);
+
+        VL_DBG(L"InstallHooks REG: NtOpenKey=%p NtCreateKey=%p NtLoadKeyEx=%p"
+               L" NtNotifyChangeMultipleKeys=%p",
+               (void*)Real_NtOpenKey, (void*)Real_NtCreateKey,
+               (void*)Real_NtLoadKeyEx, (void*)Real_NtNotifyChangeMultipleKeys);
     }
+
+    // File hooks
     if (g_FsEnabled) {
         VL_GETPROC(ntdll, NtCreateFile);
         VL_GETPROC(ntdll, NtOpenFile);
+        VL_GETPROC(ntdll, NtCreateDirectoryObject);
+        VL_GETPROC(ntdll, NtOpenDirectoryObject);
+        VL_GETPROC(ntdll, NtCreateMailslotFile);
+        VL_GETPROC(ntdll, NtCreateNamedPipeFile);
+        VL_GETPROC(ntdll, NtDeleteFile);
+        VL_GETPROC(ntdll, NtQueryAttributesFile);
         VL_GETPROC(ntdll, NtQueryFullAttributesFile);
+        VL_GETPROC(ntdll, NtQueryInformationByName);   // Win8+ may be NULL on XP
+        VL_GETPROC(ntdll, NtQueryInformationFile);
+        VL_GETPROC(ntdll, NtQueryVolumeInformationFile);
+        VL_GETPROC(ntdll, NtQueryDirectoryFile);
+        VL_GETPROC(ntdll, NtQueryDirectoryFileEx);     // Win10+ may be NULL
         VL_GETPROC(ntdll, NtSetInformationFile);
-        VL_GETPROC(k32,   MoveFileExW);
-        // MoveFileExW may live in KernelBase on Win8+; fall back if needed
-        if (!Real_MoveFileExW) {
-            HMODULE kb = GetModuleHandleA("KernelBase.dll");
-            if (kb) Real_MoveFileExW = (PfnMoveFileExW)GetProcAddress(kb, "MoveFileExW");
-        }
-        VL_GETPROC(k32,   GetFileAttributesW);
-        if (!Real_GetFileAttributesW) {
-            HMODULE kb = GetModuleHandleA("KernelBase.dll");
-            if (kb) Real_GetFileAttributesW = (PfnGetFileAttributesW)GetProcAddress(kb, "GetFileAttributesW");
-        }
-        VL_GETPROC(k32,   GetFileAttributesExW);
-        if (!Real_GetFileAttributesExW) {
-            HMODULE kb = GetModuleHandleA("KernelBase.dll");
-            if (kb) Real_GetFileAttributesExW = (PfnGetFileAttributesExW)GetProcAddress(kb, "GetFileAttributesExW");
-        }
-        VL_GETPROC(k32,   FindFirstFileExW);
-        if (!Real_FindFirstFileExW) {
-            HMODULE kb = GetModuleHandleA("KernelBase.dll");
-            if (kb) Real_FindFirstFileExW = (PfnFindFirstFileExW)GetProcAddress(kb, "FindFirstFileExW");
-        }
-        VL_DBG(L"InstallHooks FS ptrs: NtCreateFile=%p NtOpenFile=%p NtSetInfoFile=%p MoveFileExW=%p GetFileAttrW=%p",
-               (void*)Real_NtCreateFile, (void*)Real_NtOpenFile,
-               (void*)Real_NtSetInformationFile, (void*)Real_MoveFileExW,
-               (void*)Real_GetFileAttributesW);
+        VL_GETPROC(ntdll, NtDeviceIoControlFile);
+        VL_GETPROC(ntdll, NtFsControlFile);
+        VL_GETPROC(ntdll, NtReadFile);
+        VL_GETPROC(ntdll, NtWriteFile);
+
+        VL_DBG(L"InstallHooks FS: NtCreateFile=%p NtOpenFile=%p NtDeleteFile=%p"
+               L" NtQueryDirFile=%p NtQueryDirFileEx=%p NtReadFile=%p NtWriteFile=%p",
+               (void*)Real_NtCreateFile,  (void*)Real_NtOpenFile,
+               (void*)Real_NtDeleteFile,  (void*)Real_NtQueryDirectoryFile,
+               (void*)Real_NtQueryDirectoryFileEx,
+               (void*)Real_NtReadFile,    (void*)Real_NtWriteFile);
     }
 
     // ---------------------------------------------------------------
-    // CRITICAL: Create the VirtApp root key and all ancestor components
+    // Pre-create the virtual root key and all ancestor components
     // BEFORE installing hooks, using raw (unhooked) function pointers.
-    //
-    // EnsureVirtualPath only creates components *below* g_VirtNtBase.
-    // If g_VirtNtBase itself doesn't exist, every NtCreateKey that calls
-    // EnsureVirtualPath will silently fail and fall through to the real
-    // location.  We fix this here, once, at startup.
     // ---------------------------------------------------------------
     if (g_RegEnabled && Real_NtCreateKey && Real_NtClose) {
-        // Walk every component of g_VirtNtBase and create it if missing.
-        // e.g. for "\Registry\User\SID\VirtApp" we create:
-        //   \Registry\User              (already exists, REG_OPENED_EXISTING)
-        //   \Registry\User\SID          (already exists)
-        //   \Registry\User\SID\VirtApp  (may be new)
         std::wstring path;
         const std::wstring& base = g_VirtNtBase;
-        size_t start = 1; // skip the leading '\'
+        size_t start = 1;
         while (start < base.size()) {
             size_t slash = base.find(L'\\', start);
             if (slash == std::wstring::npos) slash = base.size();
-            path = base.substr(0, slash);
+            path  = base.substr(0, slash);
             start = slash + 1;
 
             VL_UNICODE_STRING us; MakeUStr(&us, path);
@@ -1794,48 +2282,75 @@ static void InstallHooks() {
             NTSTATUS st = Real_NtCreateKey(&h, KEY_ALL_ACCESS, &oa,
                                             0, NULL, 0, &disp);
             if (NT_SUCCESS(st) && h) {
-                VL_DBG(L"EnsureVirtRoot: created/opened %s (disp=%u)",
-                       path.c_str(), disp);
+                VL_DBG(L"EnsureVirtRoot: created/opened %s (disp=%u)", path.c_str(), disp);
                 Real_NtClose(h);
             } else {
-                VL_DBG(L"EnsureVirtRoot: FAILED to create %s st=0x%08X",
-                       path.c_str(), (ULONG)st);
+                VL_DBG(L"EnsureVirtRoot: FAILED %s st=0x%08X", path.c_str(), (ULONG)st);
             }
         }
     }
 
+    // ---------------------------------------------------------------
+    // Attach all hooks in one transaction
+    // ---------------------------------------------------------------
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
 
-    // Always hook NtClose (to handle tracked registry handles)
-    // and child process spawns
+    // Always
     VL_ATTACH(NtClose);
     VL_ATTACH(CreateProcessW);
     VL_ATTACH(CreateProcessA);
 
+    // Registry
     if (g_RegEnabled) {
         VL_ATTACH(NtOpenKey);
-        if (Real_NtOpenKeyEx)      VL_ATTACH(NtOpenKeyEx);
+        if (Real_NtOpenKeyEx)           VL_ATTACH(NtOpenKeyEx);
+        if (Real_NtOpenKeyTransacted)    VL_ATTACH(NtOpenKeyTransacted);
+        if (Real_NtOpenKeyTransactedEx)  VL_ATTACH(NtOpenKeyTransactedEx);
         VL_ATTACH(NtCreateKey);
+        if (Real_NtCreateKeyTransacted)  VL_ATTACH(NtCreateKeyTransacted);
+        VL_ATTACH(NtDeleteKey);
+        VL_ATTACH(NtDeleteValueKey);
         VL_ATTACH(NtEnumerateKey);
         VL_ATTACH(NtEnumerateValueKey);
         VL_ATTACH(NtQueryKey);
         VL_ATTACH(NtQueryValueKey);
+        if (Real_NtQueryMultipleValueKey) VL_ATTACH(NtQueryMultipleValueKey);
         VL_ATTACH(NtSetValueKey);
-        VL_ATTACH(NtDeleteKey);
-        VL_ATTACH(NtDeleteValueKey);
+        if (Real_NtRenameKey)            VL_ATTACH(NtRenameKey);
+        if (Real_NtReplaceKey)           VL_ATTACH(NtReplaceKey);
+        if (Real_NtSaveKey)              VL_ATTACH(NtSaveKey);
+        if (Real_NtSaveKeyEx)            VL_ATTACH(NtSaveKeyEx);
+        if (Real_NtLoadKey)              VL_ATTACH(NtLoadKey);
+        if (Real_NtLoadKey2)             VL_ATTACH(NtLoadKey2);
+        if (Real_NtLoadKeyEx)            VL_ATTACH(NtLoadKeyEx);
         VL_ATTACH(NtNotifyChangeKey);
+        if (Real_NtNotifyChangeMultipleKeys) VL_ATTACH(NtNotifyChangeMultipleKeys);
     }
+
+    // Files
     if (g_FsEnabled) {
         VL_ATTACH(NtCreateFile);
         VL_ATTACH(NtOpenFile);
+        if (Real_NtCreateDirectoryObject) VL_ATTACH(NtCreateDirectoryObject);
+        if (Real_NtOpenDirectoryObject)   VL_ATTACH(NtOpenDirectoryObject);
+        if (Real_NtCreateMailslotFile)    VL_ATTACH(NtCreateMailslotFile);
+        if (Real_NtCreateNamedPipeFile)   VL_ATTACH(NtCreateNamedPipeFile);
+        if (Real_NtDeleteFile)            VL_ATTACH(NtDeleteFile);
+        if (Real_NtQueryAttributesFile)   VL_ATTACH(NtQueryAttributesFile);
         if (Real_NtQueryFullAttributesFile) VL_ATTACH(NtQueryFullAttributesFile);
-        if (Real_NtSetInformationFile) VL_ATTACH(NtSetInformationFile);
-        if (Real_MoveFileExW)          VL_ATTACH(MoveFileExW);
-        if (Real_GetFileAttributesW)   VL_ATTACH(GetFileAttributesW);
-        if (Real_GetFileAttributesExW) VL_ATTACH(GetFileAttributesExW);
-        if (Real_FindFirstFileExW)     VL_ATTACH(FindFirstFileExW);
+        if (Real_NtQueryInformationByName)  VL_ATTACH(NtQueryInformationByName);
+        if (Real_NtQueryInformationFile)    VL_ATTACH(NtQueryInformationFile);
+        if (Real_NtQueryVolumeInformationFile) VL_ATTACH(NtQueryVolumeInformationFile);
+        if (Real_NtQueryDirectoryFile)    VL_ATTACH(NtQueryDirectoryFile);
+        if (Real_NtQueryDirectoryFileEx)  VL_ATTACH(NtQueryDirectoryFileEx);
+        if (Real_NtSetInformationFile)    VL_ATTACH(NtSetInformationFile);
+        if (Real_NtDeviceIoControlFile)   VL_ATTACH(NtDeviceIoControlFile);
+        if (Real_NtFsControlFile)         VL_ATTACH(NtFsControlFile);
+        if (Real_NtReadFile)              VL_ATTACH(NtReadFile);
+        if (Real_NtWriteFile)             VL_ATTACH(NtWriteFile);
     }
+
     LONG commitResult = DetourTransactionCommit();
     VL_DBG(L"InstallHooks: DetourTransactionCommit = %d (0=OK)", commitResult);
 }
@@ -1850,26 +2365,50 @@ static void UninstallHooks() {
 
     if (g_RegEnabled) {
         VL_DETACH(NtOpenKey);
-        if (Real_NtOpenKeyEx) VL_DETACH(NtOpenKeyEx);
+        if (Real_NtOpenKeyEx)           VL_DETACH(NtOpenKeyEx);
+        if (Real_NtOpenKeyTransacted)    VL_DETACH(NtOpenKeyTransacted);
+        if (Real_NtOpenKeyTransactedEx)  VL_DETACH(NtOpenKeyTransactedEx);
         VL_DETACH(NtCreateKey);
+        if (Real_NtCreateKeyTransacted)  VL_DETACH(NtCreateKeyTransacted);
+        VL_DETACH(NtDeleteKey);
+        VL_DETACH(NtDeleteValueKey);
         VL_DETACH(NtEnumerateKey);
         VL_DETACH(NtEnumerateValueKey);
         VL_DETACH(NtQueryKey);
         VL_DETACH(NtQueryValueKey);
+        if (Real_NtQueryMultipleValueKey) VL_DETACH(NtQueryMultipleValueKey);
         VL_DETACH(NtSetValueKey);
-        VL_DETACH(NtDeleteKey);
-        VL_DETACH(NtDeleteValueKey);
+        if (Real_NtRenameKey)            VL_DETACH(NtRenameKey);
+        if (Real_NtReplaceKey)           VL_DETACH(NtReplaceKey);
+        if (Real_NtSaveKey)              VL_DETACH(NtSaveKey);
+        if (Real_NtSaveKeyEx)            VL_DETACH(NtSaveKeyEx);
+        if (Real_NtLoadKey)              VL_DETACH(NtLoadKey);
+        if (Real_NtLoadKey2)             VL_DETACH(NtLoadKey2);
+        if (Real_NtLoadKeyEx)            VL_DETACH(NtLoadKeyEx);
         VL_DETACH(NtNotifyChangeKey);
+        if (Real_NtNotifyChangeMultipleKeys) VL_DETACH(NtNotifyChangeMultipleKeys);
     }
+
     if (g_FsEnabled) {
         VL_DETACH(NtCreateFile);
         VL_DETACH(NtOpenFile);
+        if (Real_NtCreateDirectoryObject) VL_DETACH(NtCreateDirectoryObject);
+        if (Real_NtOpenDirectoryObject)   VL_DETACH(NtOpenDirectoryObject);
+        if (Real_NtCreateMailslotFile)    VL_DETACH(NtCreateMailslotFile);
+        if (Real_NtCreateNamedPipeFile)   VL_DETACH(NtCreateNamedPipeFile);
+        if (Real_NtDeleteFile)            VL_DETACH(NtDeleteFile);
+        if (Real_NtQueryAttributesFile)   VL_DETACH(NtQueryAttributesFile);
         if (Real_NtQueryFullAttributesFile) VL_DETACH(NtQueryFullAttributesFile);
-        if (Real_NtSetInformationFile) VL_DETACH(NtSetInformationFile);
-        if (Real_MoveFileExW)          VL_DETACH(MoveFileExW);
-        if (Real_GetFileAttributesW)   VL_DETACH(GetFileAttributesW);
-        if (Real_GetFileAttributesExW) VL_DETACH(GetFileAttributesExW);
-        if (Real_FindFirstFileExW)     VL_DETACH(FindFirstFileExW);
+        if (Real_NtQueryInformationByName)  VL_DETACH(NtQueryInformationByName);
+        if (Real_NtQueryInformationFile)    VL_DETACH(NtQueryInformationFile);
+        if (Real_NtQueryVolumeInformationFile) VL_DETACH(NtQueryVolumeInformationFile);
+        if (Real_NtQueryDirectoryFile)    VL_DETACH(NtQueryDirectoryFile);
+        if (Real_NtQueryDirectoryFileEx)  VL_DETACH(NtQueryDirectoryFileEx);
+        if (Real_NtSetInformationFile)    VL_DETACH(NtSetInformationFile);
+        if (Real_NtDeviceIoControlFile)   VL_DETACH(NtDeviceIoControlFile);
+        if (Real_NtFsControlFile)         VL_DETACH(NtFsControlFile);
+        if (Real_NtReadFile)              VL_DETACH(NtReadFile);
+        if (Real_NtWriteFile)             VL_DETACH(NtWriteFile);
     }
 
     DetourTransactionCommit();
@@ -1881,26 +2420,18 @@ static void UninstallHooks() {
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
 
-    // Detours helper process check (required by Detours)
     if (DetourIsHelperProcess()) return TRUE;
 
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
-
-        // REQUIRED by Detours when loaded via DetourCreateProcessWithDlls
-        // Restores the original import table that Detours modified during injection
         DetourRestoreAfterWith();
 
-        // Initialise TLS reentrancy guard FIRST
         g_TlsIdx = TlsAlloc();
         InitializeCriticalSectionAndSpinCount(&g_KeyMapLock, 4000);
 
-        VL_DBG(L"DllMain: DLL_PROCESS_ATTACH -- VirtHook loading");
+        VL_DBG(L"DllMain: DLL_PROCESS_ATTACH -- VirtHook loading (v8 pure ntdll)");
 
-        // Read config from environment variables
         LoadConfig();
-
-        // Install API hooks
         InstallHooks();
 
         VL_DBG(L"DllMain: hooks installed OK");
@@ -1908,7 +2439,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
     else if (reason == DLL_PROCESS_DETACH) {
         UninstallHooks();
 
-        // Close any still-tracked handles
         EnterCriticalSection(&g_KeyMapLock);
         for (std::map<HANDLE,VirtKeyEntry>::iterator it = g_KeyMap.begin();
              it != g_KeyMap.end(); ++it)
