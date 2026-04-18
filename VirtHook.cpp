@@ -37,6 +37,18 @@
 #include <windows.h>
 #include <detours.h>
 
+// =============================================================
+// MANDATORY DETOURS EXPORT
+// DetourCreateProcessWithDllsW spawns a helper thread in the
+// target process that calls DetourFinishHelperProcess from our
+// DLL.  Without this export the target crashes with 0xC000007B.
+// detours.lib already contains the implementation; we just
+// re-export it here so the linker puts it in the DLL's export
+// table.
+// =============================================================
+extern "C" __declspec(dllexport)
+void CALLBACK DetourFinishHelperProcess(HWND, HINSTANCE, LPSTR, int);
+
 #include <string>
 #include <vector>
 #include <map>
