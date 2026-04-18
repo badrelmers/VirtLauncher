@@ -2140,78 +2140,28 @@ static NTSTATUS NTAPI Hook_NtWriteFile(
 // CHILD PROCESS PROPAGATION
 // ============================================================
 //
-// Strategy:
-//   Same-arch child (32->32 or 64->64):
-//     Real_CreateProcessW/A(CREATE_SUSPENDED) + DetourUpdateProcessWithDll + resume.
-//     DetourUpdateProcessWithDll is always reliable for same-arch -- no helper process,
-//     no WOW64 path issues.  DetourCreateProcessWithDllsW with pfCreateProcessW=trampoline
-//     has an observed failure in WOW64 contexts; avoid it for same-arch.
+// We always use DetourCreateProcessWithDlls[W|A] for child injection.
+// Detours handles same-arch and cross-arch transparently via its helper-
+// process mechanism (spawns a matching-arch rundll32 for cross-arch).
 //
-//   Cross-arch child (32->64 or 64->32):
-//     DetourCreateProcessWithDllsW/A with one DLL path (own arch).
-//     Detours auto-swaps "32"<->"64" in the filename and spawns a matching-arch
-//     rundll32 helper to patch the child's import table.
-//     32->64 extra step: disable WOW64 FS redirection so GetSystemDirectory() inside
-//     Detours returns the real System32 (64-bit rundll32), not SysWOW64 (32-bit rundll32).
+// CRITICAL WOW64 FIX: From a 32-bit WOW64 process, GetSystemDirectory()
+// returns SysWOW64 (32-bit rundll32).  Detours uses GetSystemDirectory()
+// internally to find its helper process.  If the child is 64-bit, the
+// 32-bit helper can't patch the 64-bit import table and injection silently
+// fails.  Fix: always disable WOW64 FS redirection around the Detours call
+// so GetSystemDirectory() returns the real System32 (64-bit rundll32).
+// This is a no-op in the 64-bit DLL build (#ifdef _WIN64 makes the
+// Wow64Disable/Revert functions empty stubs).
+//
+// We pass Real_CreateProcessW/A as pfCreateProcessW to avoid re-entering
+// our own hook when Detours internally spawns the helper process.
+// Real_CreateProcessW is the Detours trampoline that bypasses our hook and
+// calls the original CreateProcessW directly.
+//
+// The DLL path must end in "32" or "64" (e.g. VirtHook32.dll / VirtHook64.dll).
+// Detours auto-swaps the suffix when the target arch differs from the caller.
 
-// Read the Machine field from a PE file. Returns IMAGE_FILE_MACHINE_* or 0 on failure.
-static WORD ReadPeMachine(const wchar_t* path) {
-    if (!path || !path[0]) return 0;
-    HANDLE hf = CreateFileW(path, GENERIC_READ,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                             NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hf == INVALID_HANDLE_VALUE) return 0;
-    IMAGE_DOS_HEADER dos = {}; DWORD rd = 0;
-    ReadFile(hf, &dos, sizeof(dos), &rd, NULL);
-    if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0) {
-        CloseHandle(hf); return 0;
-    }
-    SetFilePointer(hf, dos.e_lfanew, NULL, FILE_BEGIN);
-    DWORD sig = 0; ReadFile(hf, &sig, 4, &rd, NULL);
-    if (sig != IMAGE_NT_SIGNATURE) { CloseHandle(hf); return 0; }
-    IMAGE_FILE_HEADER fh = {}; ReadFile(hf, &fh, sizeof(fh), &rd, NULL);
-    CloseHandle(hf);
-    return fh.Machine;
-}
-
-// Extract the EXE path from CreateProcess arguments (lpApplicationName takes priority;
-// otherwise parse the first token -- quoted or unquoted -- from lpCommandLine).
-static std::wstring ExtractExePath(LPCWSTR lpApp, LPCWSTR lpCmd) {
-    if (lpApp && lpApp[0]) return lpApp;
-    if (!lpCmd || !lpCmd[0]) return L"";
-    const wchar_t* p = lpCmd;
-    while (*p == L' ') ++p;
-    std::wstring tok;
-    if (*p == L'"') {
-        ++p;
-        while (*p && *p != L'"') tok += *p++;
-    } else {
-        while (*p && *p != L' ' && *p != L'\t') tok += *p++;
-    }
-    return tok;
-}
-
-// Return true if the EXE at path (or resolvable via SearchPath) is a 64-bit image.
-// defaultIs64 is returned when the arch cannot be determined.
-static bool ExeIs64(LPCWSTR lpApp, LPCWSTR lpCmd, bool defaultIs64) {
-    std::wstring path = ExtractExePath(lpApp, lpCmd);
-    if (path.empty()) return defaultIs64;
-
-    WORD m = ReadPeMachine(path.c_str());
-    if (m == 0) {
-        // Try with SearchPath (handles relative paths, no extension, PATH lookup)
-        wchar_t found[MAX_PATH] = {};
-        if (SearchPathW(NULL, path.c_str(), L".exe", MAX_PATH, found, NULL))
-            m = ReadPeMachine(found);
-    }
-
-    if (m == IMAGE_FILE_MACHINE_AMD64) return true;
-    if (m == IMAGE_FILE_MACHINE_I386) return false;
-    return defaultIs64;  // unknown: assume same as self
-}
-
-// The DLL path matching our own arch.
-// Detours auto-swaps "32"<->"64" when it detects a cross-arch child.
+// The DLL path matching our own arch (used as the "base" for Detours suffix swap).
 static const char* PickDllPath() {
 #ifdef _WIN64
     return g_DllPathA64[0] ? g_DllPathA64 : g_DllPathA;
@@ -2220,54 +2170,14 @@ static const char* PickDllPath() {
 #endif
 }
 
-// Same-arch injection: create child suspended, patch import table, resume.
-static BOOL SameArchInjectW(
-    LPCWSTR lpApp, LPWSTR lpCmd,
-    LPSECURITY_ATTRIBUTES pa, LPSECURITY_ATTRIBUTES ta,
-    BOOL inh, DWORD flags, LPVOID env, LPCWSTR dir,
-    LPSTARTUPINFOW si, LPPROCESS_INFORMATION pi,
-    const char* dllPath)
-{
-    BOOL ok = Real_CreateProcessW(lpApp, lpCmd, pa, ta, inh,
-                                   flags | CREATE_SUSPENDED, env, dir, si, pi);
-    if (ok && pi) {
-        const char* dlls[1] = { dllPath };
-        BOOL injOk = DetourUpdateProcessWithDll(pi->hProcess, dlls, 1);
-        VL_DBG(L"SameArchInjectW: DetourUpdateProcessWithDll=%d err=%u",
-               (int)injOk, injOk ? 0 : GetLastError());
-        // Always resume so the child runs even if injection fails
-        if (!(flags & CREATE_SUSPENDED)) ResumeThread(pi->hThread);
-    }
-    return ok;
-}
-
-static BOOL SameArchInjectA(
-    LPCSTR lpApp, LPSTR lpCmd,
-    LPSECURITY_ATTRIBUTES pa, LPSECURITY_ATTRIBUTES ta,
-    BOOL inh, DWORD flags, LPVOID env, LPCSTR dir,
-    LPSTARTUPINFOA si, LPPROCESS_INFORMATION pi,
-    const char* dllPath)
-{
-    BOOL ok = Real_CreateProcessA(lpApp, lpCmd, pa, ta, inh,
-                                   flags | CREATE_SUSPENDED, env, dir, si, pi);
-    if (ok && pi) {
-        const char* dlls[1] = { dllPath };
-        BOOL injOk = DetourUpdateProcessWithDll(pi->hProcess, dlls, 1);
-        VL_DBG(L"SameArchInjectA: DetourUpdateProcessWithDll=%d err=%u",
-               (int)injOk, injOk ? 0 : GetLastError());
-        if (!(flags & CREATE_SUSPENDED)) ResumeThread(pi->hThread);
-    }
-    return ok;
-}
-
-// Disable WOW64 FS redirection (no-op on 64-bit builds or non-WOW64 systems).
-// Returns the old redirection value in *pOld; caller must pass it to RestoreWow64Redir.
+// Disable WOW64 FS redirection.  No-op in 64-bit builds.
+// Returns true if redirection was actually disabled; caller must restore.
 static bool DisableWow64Redir(PVOID* pOld) {
 #ifndef _WIN64
-    typedef BOOL (WINAPI *PfnDisable)(PVOID*);
-    static PfnDisable s_pfn = (PfnDisable)GetProcAddress(
+    typedef BOOL (WINAPI *Pfn)(PVOID*);
+    static Pfn s_fn = (Pfn)GetProcAddress(
         GetModuleHandleA("kernel32.dll"), "Wow64DisableWow64FsRedirection");
-    if (s_pfn) return s_pfn(pOld) != FALSE;
+    if (s_fn) return s_fn(pOld) != FALSE;
 #else
     (void)pOld;
 #endif
@@ -2277,10 +2187,10 @@ static bool DisableWow64Redir(PVOID* pOld) {
 static void RestoreWow64Redir(bool wasDisabled, PVOID old) {
 #ifndef _WIN64
     if (!wasDisabled) return;
-    typedef BOOL (WINAPI *PfnRevert)(PVOID);
-    static PfnRevert s_pfn = (PfnRevert)GetProcAddress(
+    typedef BOOL (WINAPI *Pfn)(PVOID);
+    static Pfn s_fn = (Pfn)GetProcAddress(
         GetModuleHandleA("kernel32.dll"), "Wow64RevertWow64FsRedirection");
-    if (s_pfn) s_pfn(old);
+    if (s_fn) s_fn(old);
 #else
     (void)wasDisabled; (void)old;
 #endif
@@ -2304,35 +2214,20 @@ static BOOL WINAPI Hook_CreateProcessW(
 
     const char* dllPath = PickDllPath();
     if (!dllPath || !dllPath[0]) {
-        VL_DBG(L"Hook_CreateProcessW: no DLL path, pass-through");
+        VL_DBG(L"Hook_CreateProcessW: no DLL path configured, pass-through");
         return Real_CreateProcessW(lpApplicationName, lpCommandLine,
                                    lpProcessAttributes, lpThreadAttributes,
                                    bInheritHandles, dwCreationFlags, lpEnvironment,
                                    lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     }
 
-    bool selfIs64  = (sizeof(void*) == 8);
-    bool childIs64 = ExeIs64(lpApplicationName, lpCommandLine, selfIs64);
-    bool sameArch  = (childIs64 == selfIs64);
+    VL_DBG(L"Hook_CreateProcessW: injecting dll=%S", dllPath);
 
-    VL_DBG(L"Hook_CreateProcessW: selfIs64=%d childIs64=%d sameArch=%d dll=%S",
-           (int)selfIs64, (int)childIs64, (int)sameArch, dllPath);
-
-    if (sameArch) {
-        // Same arch: DetourUpdateProcessWithDll -- always reliable
-        return SameArchInjectW(lpApplicationName, lpCommandLine,
-                                lpProcessAttributes, lpThreadAttributes,
-                                bInheritHandles, dwCreationFlags, lpEnvironment,
-                                lpCurrentDirectory, lpStartupInfo, lpProcessInformation,
-                                dllPath);
-    }
-
-    // Cross arch: DetourCreateProcessWithDllsW (auto-swaps DLL suffix, uses helper process).
-    // For 32-bit hook -> 64-bit child: disable WOW64 FS redirection so Detours
-    // finds System32\rundll32.exe (64-bit helper), not SysWOW64\rundll32.exe (32-bit).
+    // Disable WOW64 FS redirection so Detours finds the correct (same-bitness)
+    // rundll32.exe in System32 when it needs a cross-arch helper process.
+    // Safe no-op in the 64-bit build.
     PVOID wow64Old = NULL;
-    bool  wow64Off = !selfIs64 && childIs64 && DisableWow64Redir(&wow64Old);
-    VL_DBG(L"Hook_CreateProcessW: cross-arch wow64RedirDisabled=%d", (int)wow64Off);
+    bool  wow64Off = DisableWow64Redir(&wow64Old);
 
     const char* dlls[1] = { dllPath };
     BOOL ok = DetourCreateProcessWithDllsW(
@@ -2340,13 +2235,15 @@ static BOOL WINAPI Hook_CreateProcessW(
         lpProcessAttributes, lpThreadAttributes,
         bInheritHandles, dwCreationFlags, lpEnvironment,
         lpCurrentDirectory, lpStartupInfo, lpProcessInformation,
-        1, dlls, Real_CreateProcessW);
+        1, dlls,
+        Real_CreateProcessW);  // bypass our hook; avoids re-entrancy
 
     RestoreWow64Redir(wow64Off, wow64Old);
 
     if (!ok) {
-        VL_DBG(L"Hook_CreateProcessW: cross-arch DetourCreateProcessWithDllsW failed err=%u"
-               L" -- creating without injection", GetLastError());
+        VL_DBG(L"Hook_CreateProcessW: DetourCreateProcessWithDllsW FAILED err=%u"
+               L" -- falling back to unhooked launch", GetLastError());
+        // Fall back: create without injection so the child at least runs.
         ok = Real_CreateProcessW(lpApplicationName, lpCommandLine,
                                   lpProcessAttributes, lpThreadAttributes,
                                   bInheritHandles, dwCreationFlags, lpEnvironment,
@@ -2373,37 +2270,17 @@ static BOOL WINAPI Hook_CreateProcessA(
 
     const char* dllPath = PickDllPath();
     if (!dllPath || !dllPath[0]) {
-        VL_DBG(L"Hook_CreateProcessA: no DLL path, pass-through");
+        VL_DBG(L"Hook_CreateProcessA: no DLL path configured, pass-through");
         return Real_CreateProcessA(lpApplicationName, lpCommandLine,
                                    lpProcessAttributes, lpThreadAttributes,
                                    bInheritHandles, dwCreationFlags, lpEnvironment,
                                    lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     }
 
-    // Convert ANSI names to wide for arch detection
-    wchar_t appW[MAX_PATH] = {}, cmdW[4096] = {};
-    if (lpApplicationName) MultiByteToWideChar(CP_ACP, 0, lpApplicationName, -1, appW, MAX_PATH);
-    if (lpCommandLine)     MultiByteToWideChar(CP_ACP, 0, lpCommandLine,     -1, cmdW, 4096);
+    VL_DBG(L"Hook_CreateProcessA: injecting dll=%S", dllPath);
 
-    bool selfIs64  = (sizeof(void*) == 8);
-    bool childIs64 = ExeIs64(appW[0] ? appW : NULL, cmdW, selfIs64);
-    bool sameArch  = (childIs64 == selfIs64);
-
-    VL_DBG(L"Hook_CreateProcessA: selfIs64=%d childIs64=%d sameArch=%d dll=%S",
-           (int)selfIs64, (int)childIs64, (int)sameArch, dllPath);
-
-    if (sameArch) {
-        return SameArchInjectA(lpApplicationName, lpCommandLine,
-                                lpProcessAttributes, lpThreadAttributes,
-                                bInheritHandles, dwCreationFlags, lpEnvironment,
-                                lpCurrentDirectory, lpStartupInfo, lpProcessInformation,
-                                dllPath);
-    }
-
-    // Cross arch: use DetourCreateProcessWithDllsA
     PVOID wow64Old = NULL;
-    bool  wow64Off = !selfIs64 && childIs64 && DisableWow64Redir(&wow64Old);
-    VL_DBG(L"Hook_CreateProcessA: cross-arch wow64RedirDisabled=%d", (int)wow64Off);
+    bool  wow64Off = DisableWow64Redir(&wow64Old);
 
     const char* dlls[1] = { dllPath };
     BOOL ok = DetourCreateProcessWithDllsA(
@@ -2411,13 +2288,14 @@ static BOOL WINAPI Hook_CreateProcessA(
         lpProcessAttributes, lpThreadAttributes,
         bInheritHandles, dwCreationFlags, lpEnvironment,
         lpCurrentDirectory, lpStartupInfo, lpProcessInformation,
-        1, dlls, Real_CreateProcessA);
+        1, dlls,
+        Real_CreateProcessA);  // bypass our hook; avoids re-entrancy
 
     RestoreWow64Redir(wow64Off, wow64Old);
 
     if (!ok) {
-        VL_DBG(L"Hook_CreateProcessA: cross-arch DetourCreateProcessWithDllsA failed err=%u"
-               L" -- creating without injection", GetLastError());
+        VL_DBG(L"Hook_CreateProcessA: DetourCreateProcessWithDllsA FAILED err=%u"
+               L" -- falling back to unhooked launch", GetLastError());
         ok = Real_CreateProcessA(lpApplicationName, lpCommandLine,
                                   lpProcessAttributes, lpThreadAttributes,
                                   bInheritHandles, dwCreationFlags, lpEnvironment,

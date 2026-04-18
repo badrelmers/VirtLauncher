@@ -388,8 +388,25 @@ int wmain(int argc, wchar_t* argv[]) {
     wprintf(L"               (Detours swaps 32<->64 automatically for cross-arch)\n");
 
     // --------------------------------------------------------
-    // Launch target with DLL injection via Detours
+    // Launch target with DLL injection via Detours.
+    //
+    // CRITICAL for 32-bit launcher: disable WOW64 FS redirection so that:
+    //   1. SearchPathW finds cmd.exe / target.exe from real System32 (64-bit),
+    //      not SysWOW64 (32-bit) when the user types an unqualified name.
+    //   2. Inside DetourCreateProcessWithDllsW, when it needs to spawn a
+    //      cross-arch helper, GetSystemDirectory() returns the real System32
+    //      with the 64-bit rundll32.exe, not the 32-bit one from SysWOW64.
+    // This is a no-op in the 64-bit launcher build.
     // --------------------------------------------------------
+    PVOID wow64Old = NULL;
+    BOOL  wow64Off = FALSE;
+    {
+        typedef BOOL (WINAPI *PfnDisable)(PVOID*);
+        PfnDisable pfn = (PfnDisable)GetProcAddress(
+            GetModuleHandleW(L"kernel32.dll"), "Wow64DisableWow64FsRedirection");
+        if (pfn) wow64Off = pfn(&wow64Old);
+    }
+
     STARTUPINFOW si = {};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {};
@@ -407,8 +424,16 @@ int wmain(int argc, wchar_t* argv[]) {
         &pi,
         1,                        // nDlls (one path; Detours swaps 32<->64 suffix as needed)
         dlls,                     // rlpDlls
-        NULL                      // pfCreateProcessW (NULL = standard CreateProcessW)
+        NULL                      // pfCreateProcessW (NULL = real CreateProcessW, no re-entry risk)
     );
+
+    // Restore WOW64 FS redirection immediately after process creation.
+    if (wow64Off) {
+        typedef BOOL (WINAPI *PfnRevert)(PVOID);
+        PfnRevert pfn = (PfnRevert)GetProcAddress(
+            GetModuleHandleW(L"kernel32.dll"), "Wow64RevertWow64FsRedirection");
+        if (pfn) pfn(wow64Old);
+    }
 
     if (!ok) {
         DWORD err = GetLastError();
