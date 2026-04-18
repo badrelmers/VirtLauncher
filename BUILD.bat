@@ -33,32 +33,35 @@ echo  SrcDir  : %SRCDIR%
 echo ============================================================
 
 :: ============================================================
-:: X86 -- fresh cmd, then CD back after vcvarsall (it moves CWD)
+:: X86
+:: NOTE: cd back to SRCDIR after vcvarsall (it changes CWD).
+::       Use bare filenames only - no drive paths in /Fe or /OUT
+::       to avoid the ":C:\..." misparse bug.
 :: ============================================================
 echo.
 echo [x86] Compiling VirtHook32.dll and VirtLauncher32.exe ...
 
-cmd /S /c "call "%VCVARS%" x86 && cd /D "%SRCDIR%" && cl /nologo /EHsc /O2 /MD /W3 /LD "%SRCDIR%VirtHook.cpp" /Fe:"%SRCDIR%VirtHook32.dll" /I"%DETOURS_PATH%\include" /link "%DETOURS_PATH%\lib.X86\detours.lib" && cl /nologo /EHsc /O2 /MD /W3 "%SRCDIR%VirtLauncher.cpp" /Fe:"%SRCDIR%VirtLauncher32.exe" /I"%DETOURS_PATH%\include" /link /SUBSYSTEM:CONSOLE "%DETOURS_PATH%\lib.X86\detours.lib" shlwapi.lib advapi32.lib"
+cmd /S /c "call "%VCVARS%" x86 && cd /D "%SRCDIR%" && cl /nologo /EHsc /O2 /MD /W3 /LD VirtHook.cpp /Fe:VirtHook32.dll /I"%DETOURS_PATH%\include" /link /OUT:VirtHook32.dll "%DETOURS_PATH%\lib.X86\detours.lib" && cl /nologo /EHsc /O2 /MD /W3 VirtLauncher.cpp /Fe:VirtLauncher32.exe /I"%DETOURS_PATH%\include" /link /SUBSYSTEM:CONSOLE /OUT:VirtLauncher32.exe "%DETOURS_PATH%\lib.X86\detours.lib" shlwapi.lib advapi32.lib"
 
 if errorlevel 1 ( echo. & echo FAILED: x86 build. & goto :err )
 echo   OK: VirtHook32.dll + VirtLauncher32.exe
 
 :: ============================================================
-:: X64 -- same trick
+:: X64
 :: ============================================================
 echo.
 echo [x64] Compiling VirtHook64.dll and VirtLauncher64.exe ...
 
-cmd /S /c "call "%VCVARS%" x64 && cd /D "%SRCDIR%" && cl /nologo /EHsc /O2 /MD /W3 /LD "%SRCDIR%VirtHook.cpp" /Fe:"%SRCDIR%VirtHook64.dll" /I"%DETOURS_PATH%\include" /link "%DETOURS_PATH%\lib.X64\detours.lib" && cl /nologo /EHsc /O2 /MD /W3 "%SRCDIR%VirtLauncher.cpp" /Fe:"%SRCDIR%VirtLauncher64.exe" /I"%DETOURS_PATH%\include" /link /SUBSYSTEM:CONSOLE "%DETOURS_PATH%\lib.X64\detours.lib" shlwapi.lib advapi32.lib"
+cmd /S /c "call "%VCVARS%" x64 && cd /D "%SRCDIR%" && cl /nologo /EHsc /O2 /MD /W3 /LD VirtHook.cpp /Fe:VirtHook64.dll /I"%DETOURS_PATH%\include" /link /OUT:VirtHook64.dll "%DETOURS_PATH%\lib.X64\detours.lib" && cl /nologo /EHsc /O2 /MD /W3 VirtLauncher.cpp /Fe:VirtLauncher64.exe /I"%DETOURS_PATH%\include" /link /SUBSYSTEM:CONSOLE /OUT:VirtLauncher64.exe "%DETOURS_PATH%\lib.X64\detours.lib" shlwapi.lib advapi32.lib"
 
 if errorlevel 1 ( echo. & echo FAILED: x64 build. & goto :err )
 echo   OK: VirtHook64.dll + VirtLauncher64.exe
 
-del /Q "%SRCDIR%*.obj" 2>nul
+del /Q *.obj 2>nul
 
 echo.
 echo ============================================================
-echo  Build complete!  All files are in: %SRCDIR%
+echo  Build complete!  Files are in: %SRCDIR%
 echo    VirtLauncher32.exe + VirtHook32.dll  (for 32-bit apps)
 echo    VirtLauncher64.exe + VirtHook64.dll  (for 64-bit apps)
 echo ============================================================
@@ -67,7 +70,8 @@ pause
 exit /b 0
 
 :err
-del /Q "%SRCDIR%*.obj" 2>nul
+del /Q *.obj 2>nul
+echo.
 echo BUILD FAILED.
 pause
 exit /b 1
