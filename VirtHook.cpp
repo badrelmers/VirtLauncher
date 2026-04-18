@@ -742,8 +742,6 @@ static NTSTATUS NTAPI Hook_NtOpenKeyEx(
     PVL_OBJECT_ATTRIBUTES ObjectAttributes,
     ULONG                 OpenOptions)
 {
-    // Delegate to NtOpenKey hook logic by re-using it
-    // (OpenOptions is mostly for transactions -- ignore for virtualisation)
     if (!g_RegEnabled || IsReentrant() || !ObjectAttributes)
         return Real_NtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
 
@@ -763,27 +761,57 @@ static NTSTATUS NTAPI Hook_NtOpenKeyEx(
 
     HANDLE hVirt = NULL;
     NTSTATUS stV = Real_NtOpenKeyEx(&hVirt, DesiredAccess, &voa, OpenOptions);
-    HANDLE hReal = NULL;
-    NTSTATUS stR = Real_NtOpenKeyEx(&hReal, DesiredAccess, ObjectAttributes, OpenOptions);
 
-    NTSTATUS ret;
+    // Also open real key for merge reads
+    HANDLE hReal = NULL;
+    Real_NtOpenKeyEx(&hReal, KEY_READ, ObjectAttributes, OpenOptions);
+
     if (NT_SUCCESS(stV)) {
+        // Virtual key exists -- use it
         *KeyHandle = hVirt;
-        TrackHandle(hVirt, hVirt, NT_SUCCESS(stR) ? hReal : NULL, fullPath);
-        if (!NT_SUCCESS(stR) && hReal) { Real_NtClose(hReal); hReal = NULL; }
-        ret = VL_STATUS_SUCCESS;
-    } else if (NT_SUCCESS(stR)) {
-        if (hVirt) Real_NtClose(hVirt);
-        *KeyHandle = hReal;
-        ret = VL_STATUS_SUCCESS;
-    } else {
-        if (hVirt) Real_NtClose(hVirt);
-        if (hReal) Real_NtClose(hReal);
-        ret = stR;
+        TrackHandle(hVirt, hVirt, hReal, fullPath);
+        VL_DBG(L"Hook_NtOpenKeyEx: opened virtual hVirt=%p hReal=%p", hVirt, hReal);
+        SetReentrant(false);
+        return VL_STATUS_SUCCESS;
     }
 
+    // Virtual key doesn't exist yet -- CoW: create it so all future writes go virtual.
+    HANDLE hVirtNew = NULL;
+    ULONG disp = 0;
+    EnsureVirtualPath(virtPath);
+
+    VL_UNICODE_STRING vus2; MakeUStr(&vus2, virtPath);
+    VL_OBJECT_ATTRIBUTES voa2; MakeOA(&voa2, &vus2,
+        ObjectAttributes->Attributes | OBJ_CASE_INSENSITIVE);
+    NTSTATUS stC = Real_NtCreateKey(&hVirtNew, DesiredAccess | KEY_READ,
+                                     &voa2, 0, NULL, 0, &disp);
+
+    if (NT_SUCCESS(stC)) {
+        *KeyHandle = hVirtNew;
+        TrackHandle(hVirtNew, hVirtNew, hReal, fullPath);
+        VL_DBG(L"Hook_NtOpenKeyEx: CoW created virtual hVirt=%p hReal=%p disp=%u",
+               hVirtNew, hReal, disp);
+        SetReentrant(false);
+        return VL_STATUS_SUCCESS;
+    }
+
+    // CoW failed -- fall back to real but warn
+    VL_DBG(L"Hook_NtOpenKeyEx: virtual CoW FAILED st=0x%08X -- using real handle (untracked)", (ULONG)stC);
+    if (hVirtNew) Real_NtClose(hVirtNew);
+
+    if (hReal) {
+        *KeyHandle = hReal;
+        SetReentrant(false);
+        return VL_STATUS_SUCCESS;
+    }
+
+    // Re-open real with full access for the caller
+    HANDLE hRealWrite = NULL;
+    NTSTATUS stR = Real_NtOpenKeyEx(&hRealWrite, DesiredAccess, ObjectAttributes, OpenOptions);
     SetReentrant(false);
-    return ret;
+    if (NT_SUCCESS(stR)) { *KeyHandle = hRealWrite; return VL_STATUS_SUCCESS; }
+    if (hRealWrite) Real_NtClose(hRealWrite);
+    return stR;
 }
 
 // ---- NtCreateKey -- always creates in virtual store ----
