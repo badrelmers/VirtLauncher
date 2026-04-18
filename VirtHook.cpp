@@ -451,8 +451,12 @@ static CRITICAL_SECTION g_KeyMapLock;
 // TLS index for reentrancy guard
 static DWORD g_TlsIdx = TLS_OUT_OF_INDEXES;
 
-// DLL path (ANSI) for child process injection
-static char g_DllPathA[MAX_PATH];
+// DLL paths (ANSI) for child process injection.
+// Both are read from env vars so the hook can inject the right DLL even when
+// the child process has a different bitness from the current process.
+static char g_DllPathA[MAX_PATH];    // Launcher's primary target-arch DLL (fallback)
+static char g_DllPathA32[MAX_PATH];  // VirtHook32.dll absolute path
+static char g_DllPathA64[MAX_PATH];  // VirtHook64.dll absolute path
 
 // ============================================================
 // Inline helpers
@@ -595,24 +599,45 @@ static std::wstring GetFullNtPath(PVL_OBJECT_ATTRIBUTES oa) {
 }
 
 // Compute virtual NT path from logical path.
+//
+// CRITICAL: StartsWithI is a pure prefix check. We must also verify the
+// match ends on a path separator, otherwise the _Classes shadow hive
+// (\Registry\User\S-1-5-21-...-1000_Classes) would match a g_RealNtBase
+// of (\Registry\User\S-1-5-21-...-1000) and every HKCR / COM access would
+// be intercepted, redirected to garbage virtual paths, and crash the app.
 static bool LogicalToVirtual(const std::wstring& logical,
                                std::wstring& virt)
 {
     if (!g_RegEnabled) return false;
+
     if (!StartsWithI(logical, g_RealNtBase)) {
         VL_DBG(L"LogicalToVirtual: SKIP (not under RealNtBase) path=%s base=%s",
                logical.c_str(), g_RealNtBase.c_str());
         return false;
     }
+
+    // Path-boundary guard: the char immediately after g_RealNtBase must be
+    // '\' (sub-key) or end-of-string (hive root itself). Anything else (like
+    // '_', letters) means this is a *different* hive that just shares the
+    // same SID prefix (e.g. \Registry\User\<SID>_Classes).
+    size_t baseLen = g_RealNtBase.size();
+    if (logical.size() > baseLen && logical[baseLen] != L'\\') {
+        VL_DBG(L"LogicalToVirtual: SKIP (boundary mismatch, sibling hive?) path=%s",
+               logical.c_str());
+        return false;
+    }
+
     if (StartsWithI(logical, g_VirtNtBase)) {
         VL_DBG(L"LogicalToVirtual: SKIP (already under VirtNtBase) %s", logical.c_str());
         return false;
     }
-    std::wstring sub = logical.substr(g_RealNtBase.size());
+
+    std::wstring sub = logical.substr(baseLen);
     if (sub.empty()) {
         VL_DBG(L"LogicalToVirtual: SKIP (hive root itself)");
         return false;
     }
+
     virt = g_VirtNtBase + sub;
     VL_DBG(L"LogicalToVirtual: REDIRECT %s -> %s", logical.c_str(), virt.c_str());
     return true;
@@ -768,7 +793,14 @@ static void LoadConfig() {
             g_FsEnabled = true;
     }
 
-    GetEnvironmentVariableA("VIRTLAUNCHER_DLL", g_DllPathA, MAX_PATH);
+    GetEnvironmentVariableA("VIRTLAUNCHER_DLL",   g_DllPathA,   MAX_PATH);
+    GetEnvironmentVariableA("VIRTLAUNCHER_DLL32", g_DllPathA32, MAX_PATH);
+    GetEnvironmentVariableA("VIRTLAUNCHER_DLL64", g_DllPathA64, MAX_PATH);
+    // If arch-specific paths not set, default both to the primary path
+    if (!g_DllPathA32[0] && g_DllPathA[0])
+        strncpy(g_DllPathA32, g_DllPathA, MAX_PATH - 1);
+    if (!g_DllPathA64[0] && g_DllPathA[0])
+        strncpy(g_DllPathA64, g_DllPathA, MAX_PATH - 1);
 
     VL_DBG(L"LoadConfig: RegEnabled=%d  VirtNtBase=%s",
            (int)g_RegEnabled, g_VirtNtBase.c_str());
@@ -2108,11 +2140,53 @@ static NTSTATUS NTAPI Hook_NtWriteFile(
 // CHILD PROCESS PROPAGATION
 // ============================================================
 
+// Detect whether hProcess is a native 64-bit process.
+// On 32-bit Windows, all processes are 32-bit.
+// On 64-bit Windows, IsWow64Process returns TRUE for 32-bit (WOW64) processes;
+// native 64-bit processes return FALSE.
+static bool IsProcess64(HANDLE hProcess) {
+#ifdef _WIN64
+    // We are 64-bit. A child that is NOT WOW64 is native 64-bit.
+    BOOL isWow64 = FALSE;
+    typedef BOOL (WINAPI *PfnIsWow64Process)(HANDLE, PBOOL);
+    PfnIsWow64Process pFn = (PfnIsWow64Process)
+        GetProcAddress(GetModuleHandleA("kernel32.dll"), "IsWow64Process");
+    if (pFn && pFn(hProcess, &isWow64))
+        return !isWow64;
+    return true; // assume 64-bit if we can't detect (we're already 64-bit)
+#else
+    // We are 32-bit. Check if we're running under WOW64 ourselves.
+    typedef BOOL (WINAPI *PfnIsWow64Process)(HANDLE, PBOOL);
+    PfnIsWow64Process pFn = (PfnIsWow64Process)
+        GetProcAddress(GetModuleHandleA("kernel32.dll"), "IsWow64Process");
+    if (pFn) {
+        BOOL selfWow64 = FALSE;
+        if (pFn(GetCurrentProcess(), &selfWow64) && selfWow64) {
+            // We are a 32-bit process on 64-bit OS. Check child.
+            BOOL childWow64 = FALSE;
+            if (pFn(hProcess, &childWow64))
+                return !childWow64; // child not WOW64 = native 64-bit
+        }
+    }
+    return false; // 32-bit OS, or can't detect
+#endif
+}
+
 static bool InjectIntoProcess(HANDLE hProcess) {
-    if (!g_DllPathA[0]) return false;
-    const char* dlls[] = { g_DllPathA };
-    VL_DBG(L"InjectIntoProcess: injecting %S into child process %p",
-           g_DllPathA, hProcess);
+    bool target64  = IsProcess64(hProcess);
+    // Pick arch-specific DLL; fall back to the launcher's primary DLL path
+    const char* dllPath = target64
+        ? (g_DllPathA64[0] ? g_DllPathA64 : g_DllPathA)
+        : (g_DllPathA32[0] ? g_DllPathA32 : g_DllPathA);
+
+    if (!dllPath || !dllPath[0]) {
+        VL_DBG(L"InjectIntoProcess: no DLL path available for target64=%d", (int)target64);
+        return false;
+    }
+
+    VL_DBG(L"InjectIntoProcess: target64=%d dll=%S process=%p",
+           (int)target64, dllPath, hProcess);
+    const char* dlls[] = { dllPath };
     return DetourUpdateProcessWithDll(hProcess, dlls, 1) != FALSE;
 }
 
