@@ -365,35 +365,27 @@ int wmain(int argc, wchar_t* argv[]) {
     wprintf(L"[VirtLauncher] Command  : %s\n\n", cmdLine.c_str());
 
     // --------------------------------------------------------
-    // Convert DLL paths to ANSI and build the DLL list.
-    // Pass BOTH VirtHook32.dll and VirtHook64.dll.
-    // DetourCreateProcessWithDllsW picks the right one automatically:
-    //   - Same arch -> injects directly.
-    //   - Different arch -> uses rundll32 helper + DetourFinishHelperProcess.
+    // Prepare DLL path for Detours injection.
+    //
+    // Pass ONE DLL whose name ends in "32" or "64".
+    // DetourCreateProcessWithDllsW auto-swaps the suffix when the target
+    // process bitness differs from ours, then uses a rundll32 helper of the
+    // matching arch to patch the import table.
+    // DO NOT pass both 32 and 64 paths -- Detours would inject BOTH, and the
+    // wrong-arch one crashes the process with 0xC000007B.
     // --------------------------------------------------------
-    char dll32A[MAX_PATH] = {}, dll64A[MAX_PATH] = {};
+    // Always use the launcher's own arch DLL as the "base" path; Detours
+    // will swap "32"<->"64" if the target is a different bitness.
+    char dllPathA[MAX_PATH] = {};
     {
-        wchar_t dll32W[MAX_PATH] = {}, dll64W[MAX_PATH] = {};
-        BuildHookDllPath(dll32W, MAX_PATH, false);
-        BuildHookDllPath(dll64W, MAX_PATH, true);
-        WideCharToMultiByte(CP_ACP, 0, dll32W, -1, dll32A, MAX_PATH, NULL, NULL);
-        WideCharToMultiByte(CP_ACP, 0, dll64W, -1, dll64A, MAX_PATH, NULL, NULL);
+        wchar_t ownDll[MAX_PATH] = {};
+        BuildHookDllPath(ownDll, MAX_PATH, self64);   // our own arch
+        WideCharToMultiByte(CP_ACP, 0, ownDll, -1, dllPathA, MAX_PATH, NULL, NULL);
     }
+    const char* dlls[1] = { dllPathA };
 
-    // Build the array: include a path only if the file actually exists.
-    const char* dlls[2]; DWORD nDlls = 0;
-    if (GetFileAttributesA(dll32A) != INVALID_FILE_ATTRIBUTES) dlls[nDlls++] = dll32A;
-    if (GetFileAttributesA(dll64A) != INVALID_FILE_ATTRIBUTES) dlls[nDlls++] = dll64A;
-    if (nDlls == 0) {
-        // Absolute fallback: just the originally-selected DLL
-        static char primaryA[MAX_PATH];
-        WideCharToMultiByte(CP_ACP, 0, dllPath, -1, primaryA, MAX_PATH, NULL, NULL);
-        dlls[nDlls++] = primaryA;
-    }
-
-    wprintf(L"[VirtLauncher] DLL list (%u):\n", nDlls);
-    for (DWORD i = 0; i < nDlls; ++i)
-        wprintf(L"               [%u] %S\n", i, dlls[i]);
+    wprintf(L"[VirtLauncher] Injecting : %S\n", dllPathA);
+    wprintf(L"               (Detours swaps 32<->64 automatically for cross-arch)\n");
 
     // --------------------------------------------------------
     // Launch target with DLL injection via Detours
@@ -413,8 +405,8 @@ int wmain(int argc, wchar_t* argv[]) {
         NULL,                     // lpCurrentDirectory
         &si,
         &pi,
-        nDlls,                    // nDlls
-        dlls,                     // rlpDlls  (ANSI paths, both 32+64)
+        1,                        // nDlls (one path; Detours swaps 32<->64 suffix as needed)
+        dlls,                     // rlpDlls
         NULL                      // pfCreateProcessW (NULL = standard CreateProcessW)
     );
 
