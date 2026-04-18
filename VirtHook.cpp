@@ -702,7 +702,9 @@ static NTSTATUS NTAPI Hook_NtOpenKey(
         return Real_NtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
     }
 
-    // Try virtual key
+    VL_DBG(L"Hook_NtOpenKey: fullPath=%s", fullPath.c_str());
+
+    // Try virtual key first
     VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
     VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
         ObjectAttributes->Attributes | OBJ_CASE_INSENSITIVE);
@@ -710,29 +712,65 @@ static NTSTATUS NTAPI Hook_NtOpenKey(
     HANDLE hVirt = NULL;
     NTSTATUS stV = Real_NtOpenKey(&hVirt, DesiredAccess, &voa);
 
-    // Try real key
+    // Also open real key (for merge reads)
     HANDLE hReal = NULL;
-    NTSTATUS stR = Real_NtOpenKey(&hReal, DesiredAccess, ObjectAttributes);
+    Real_NtOpenKey(&hReal, KEY_READ, ObjectAttributes);
 
-    NTSTATUS ret;
     if (NT_SUCCESS(stV)) {
+        // Virtual key exists -- use it
         *KeyHandle = hVirt;
-        TrackHandle(hVirt, hVirt, NT_SUCCESS(stR) ? hReal : NULL, fullPath);
-        if (!NT_SUCCESS(stR) && hReal) { Real_NtClose(hReal); hReal = NULL; }
-        ret = VL_STATUS_SUCCESS;
-    } else if (NT_SUCCESS(stR)) {
-        // Only real exists -- pass through without tracking
-        if (hVirt) Real_NtClose(hVirt);
-        *KeyHandle = hReal;
-        ret = VL_STATUS_SUCCESS;
-    } else {
-        if (hVirt) Real_NtClose(hVirt);
-        if (hReal) Real_NtClose(hReal);
-        ret = stR; // Return real failure
+        TrackHandle(hVirt, hVirt, hReal, fullPath);
+        VL_DBG(L"Hook_NtOpenKey: opened virtual hVirt=%p hReal=%p", hVirt, hReal);
+        SetReentrant(false);
+        return VL_STATUS_SUCCESS;
     }
 
+    // COPY-ON-WRITE: only if the real key exists.
+    // If neither virtual nor real exists, return NOT_FOUND so callers probing
+    // for unique names (e.g. regedit's "New Key #N" loop) don't get false hits.
+    if (!hReal) {
+        if (hVirt) Real_NtClose(hVirt);
+        VL_DBG(L"Hook_NtOpenKey: neither virtual nor real exists, returning NOT_FOUND");
+        SetReentrant(false);
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
+    HANDLE hVirtNew = NULL;
+    ULONG disp = 0;
+    EnsureVirtualPath(virtPath);
+
+    VL_UNICODE_STRING vus2; MakeUStr(&vus2, virtPath);
+    VL_OBJECT_ATTRIBUTES voa2; MakeOA(&voa2, &vus2,
+        ObjectAttributes->Attributes | OBJ_CASE_INSENSITIVE);
+    NTSTATUS stC = Real_NtCreateKey(&hVirtNew, DesiredAccess | KEY_READ,
+                                     &voa2, 0, NULL, 0, &disp);
+
+    if (NT_SUCCESS(stC)) {
+        *KeyHandle = hVirtNew;
+        TrackHandle(hVirtNew, hVirtNew, hReal, fullPath);
+        VL_DBG(L"Hook_NtOpenKey: CoW created virtual hVirt=%p hReal=%p disp=%u",
+               hVirtNew, hReal, disp);
+        SetReentrant(false);
+        return VL_STATUS_SUCCESS;
+    }
+
+    // Virtual creation failed -- use real handle untracked (unusual path)
+    VL_DBG(L"Hook_NtOpenKey: virtual CoW FAILED st=0x%08X -- using real handle (untracked)", (ULONG)stC);
+    if (hVirtNew) Real_NtClose(hVirtNew);
+
+    HANDLE hRealWrite = NULL;
+    NTSTATUS stR = Real_NtOpenKey(&hRealWrite, DesiredAccess, ObjectAttributes);
+    if (hReal && hReal != hRealWrite) Real_NtClose(hReal);
+
+    if (NT_SUCCESS(stR)) {
+        *KeyHandle = hRealWrite;
+        SetReentrant(false);
+        return VL_STATUS_SUCCESS;
+    }
+
+    if (hRealWrite) Real_NtClose(hRealWrite);
     SetReentrant(false);
-    return ret;
+    return stR;
 }
 
 // ---- NtOpenKeyEx (Vista+) ----
@@ -775,7 +813,16 @@ static NTSTATUS NTAPI Hook_NtOpenKeyEx(
         return VL_STATUS_SUCCESS;
     }
 
-    // Virtual key doesn't exist yet -- CoW: create it so all future writes go virtual.
+    // CoW only if the real key exists.
+    // If neither exists return NOT_FOUND so name-probing loops (e.g. regedit's
+    // "New Key #N") get the correct status and don't loop forever.
+    if (!hReal) {
+        if (hVirt) Real_NtClose(hVirt);
+        VL_DBG(L"Hook_NtOpenKeyEx: neither virtual nor real exists, returning NOT_FOUND");
+        SetReentrant(false);
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
     HANDLE hVirtNew = NULL;
     ULONG disp = 0;
     EnsureVirtualPath(virtPath);
@@ -805,7 +852,6 @@ static NTSTATUS NTAPI Hook_NtOpenKeyEx(
         return VL_STATUS_SUCCESS;
     }
 
-    // Re-open real with full access for the caller
     HANDLE hRealWrite = NULL;
     NTSTATUS stR = Real_NtOpenKeyEx(&hRealWrite, DesiredAccess, ObjectAttributes, OpenOptions);
     SetReentrant(false);
