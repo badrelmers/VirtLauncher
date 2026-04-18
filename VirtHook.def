@@ -1,0 +1,9 @@
+; VirtHook.def
+; Detours requires DetourFinishHelperProcess exported as ORDINAL 1.
+; This is called by rundll32.exe when injecting into a cross-arch process.
+; A .def file is the only reliable way to assign a specific export ordinal.
+
+LIBRARY VirtHook
+
+EXPORTS
+    DetourFinishHelperProcess   @1

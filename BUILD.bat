@@ -41,7 +41,7 @@ echo ============================================================
     echo call "%VCVARS%" x86
     echo cd /D "%SRCDIR%"
     echo echo --- cl x86: VirtHook32.dll ---
-    echo cl /nologo /EHsc /O2 /MT /W3 /LD VirtHook.cpp /Fe:VirtHook32.dll /I"%DETOURS_PATH%\include" /link /OUT:VirtHook32.dll "%DETOURS_PATH%\lib.X86\detours.lib"
+    echo cl /nologo /EHsc /O2 /MT /W3 /LD VirtHook.cpp /Fe:VirtHook32.dll /I"%DETOURS_PATH%\include" /link /OUT:VirtHook32.dll /DEF:VirtHook.def "%DETOURS_PATH%\lib.X86\detours.lib"
     echo if errorlevel 1 exit /b 1
     echo echo --- cl x86: VirtLauncher32.exe ---
     echo cl /nologo /EHsc /O2 /MD /W3 VirtLauncher.cpp /Fe:VirtLauncher32.exe /I"%DETOURS_PATH%\include" /link /SUBSYSTEM:CONSOLE /OUT:VirtLauncher32.exe "%DETOURS_PATH%\lib.X86\detours.lib" shlwapi.lib advapi32.lib
@@ -56,7 +56,7 @@ echo ============================================================
     echo call "%VCVARS%" x64
     echo cd /D "%SRCDIR%"
     echo echo --- cl x64: VirtHook64.dll ---
-    echo cl /nologo /EHsc /O2 /MT /W3 /LD VirtHook.cpp /Fe:VirtHook64.dll /I"%DETOURS_PATH%\include" /link /OUT:VirtHook64.dll "%DETOURS_PATH%\lib.X64\detours.lib"
+    echo cl /nologo /EHsc /O2 /MT /W3 /LD VirtHook.cpp /Fe:VirtHook64.dll /I"%DETOURS_PATH%\include" /link /OUT:VirtHook64.dll /DEF:VirtHook.def "%DETOURS_PATH%\lib.X64\detours.lib"
     echo if errorlevel 1 exit /b 1
     echo echo --- cl x64: VirtLauncher64.exe ---
     echo cl /nologo /EHsc /O2 /MD /W3 VirtLauncher.cpp /Fe:VirtLauncher64.exe /I"%DETOURS_PATH%\include" /link /SUBSYSTEM:CONSOLE /OUT:VirtLauncher64.exe "%DETOURS_PATH%\lib.X64\detours.lib" shlwapi.lib advapi32.lib
@@ -90,9 +90,11 @@ echo.
 echo ============================================================
 echo  Architecture verification  (14C=x86  8664=x64)
 echo ============================================================
-@rem cmd
 "D:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\bin\amd64\dumpbin.exe" /headers VirtHook32.dll 2>nul | findstr /i "machine"
 "D:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\bin\amd64\dumpbin.exe" /headers VirtHook64.dll 2>nul | findstr /i "machine"
+echo --- Ordinal 1 export check (must show DetourFinishHelperProcess) ---
+"D:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\bin\amd64\dumpbin.exe" /exports VirtHook32.dll 2>nul | findstr /i "DetourFinish"
+"D:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\bin\amd64\dumpbin.exe" /exports VirtHook64.dll 2>nul | findstr /i "DetourFinish"
 echo ============================================================
 
 echo.

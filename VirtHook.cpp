@@ -37,15 +37,8 @@
 #include <windows.h>
 #include <detours.h>
 
-// =============================================================
-// MANDATORY DETOURS EXPORT
-// DetourCreateProcessWithDllsW spawns a helper thread in the
-// target process that calls DetourFinishHelperProcess from our
-// DLL export table.  detours.lib has the implementation; this
-// pragma forces the linker to export it without redeclaring it
-// (detours.h already declares it -- redeclaring causes C2375).
-// =============================================================
-#pragma comment(linker, "/export:DetourFinishHelperProcess")
+// DetourFinishHelperProcess is exported as ordinal 1 via VirtHook.def
+// DetourRestoreAfterWith() is called in DllMain DLL_PROCESS_ATTACH below
 
 #include <string>
 #include <vector>
@@ -1312,6 +1305,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
 
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
+
+        // REQUIRED by Detours when loaded via DetourCreateProcessWithDlls
+        // Restores the original import table that Detours modified during injection
+        DetourRestoreAfterWith();
 
         // Initialise TLS reentrancy guard FIRST
         g_TlsIdx = TlsAlloc();
