@@ -230,6 +230,9 @@ typedef NTSTATUS (NTAPI *PfnNtCreateFile)
 typedef NTSTATUS (NTAPI *PfnNtOpenFile)
     (PHANDLE, ULONG, PVL_OBJECT_ATTRIBUTES, PVL_IO_STATUS_BLOCK, ULONG, ULONG);
 
+typedef NTSTATUS (NTAPI *PfnNtSetInformationFile)
+    (HANDLE, PVL_IO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+
 typedef BOOL (WINAPI *PfnCreateProcessW)
     (LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES,
      BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
@@ -258,6 +261,7 @@ static PfnNtClose              Real_NtClose;
 static PfnNtQueryObject        Real_NtQueryObject;
 static PfnNtCreateFile         Real_NtCreateFile;
 static PfnNtOpenFile           Real_NtOpenFile;
+static PfnNtSetInformationFile Real_NtSetInformationFile;
 static PfnCreateProcessW       Real_CreateProcessW;
 static PfnCreateProcessA       Real_CreateProcessA;
 
@@ -730,9 +734,11 @@ static NTSTATUS NTAPI Hook_NtOpenKey(
         return VL_STATUS_SUCCESS;
     }
 
-    // COPY-ON-WRITE: only if the real key exists.
-    // If neither virtual nor real exists, return NOT_FOUND so callers probing
-    // for unique names (e.g. regedit's "New Key #N" loop) don't get false hits.
+    // Virtual key doesn't exist yet.
+    // COPY-ON-WRITE: only if the real key exists -- if neither exists we must
+    // return failure so callers probing for unique names (e.g. regedit's
+    // "New Key #N" loop) get the correct NOT_FOUND status instead of
+    // accidentally creating phantom virtual keys.
     if (!hReal) {
         if (hVirt) Real_NtClose(hVirt);
         VL_DBG(L"Hook_NtOpenKey: neither virtual nor real exists, returning NOT_FOUND");
@@ -785,6 +791,8 @@ static NTSTATUS NTAPI Hook_NtOpenKeyEx(
     PVL_OBJECT_ATTRIBUTES ObjectAttributes,
     ULONG                 OpenOptions)
 {
+    // Delegate to NtOpenKey hook logic by re-using it
+    // (OpenOptions is mostly for transactions -- ignore for virtualisation)
     if (!g_RegEnabled || IsReentrant() || !ObjectAttributes)
         return Real_NtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
 
@@ -818,9 +826,9 @@ static NTSTATUS NTAPI Hook_NtOpenKeyEx(
         return VL_STATUS_SUCCESS;
     }
 
-    // CoW only if the real key exists.
-    // If neither exists return NOT_FOUND so name-probing loops (e.g. regedit's
-    // "New Key #N") get the correct status and don't loop forever.
+    // Virtual key doesn't exist yet -- CoW only if the real key exists.
+    // If neither exists return failure so name-probing loops (e.g. regedit's
+    // "New Key #N") get the correct NOT_FOUND and don't loop forever.
     if (!hReal) {
         if (hVirt) Real_NtClose(hVirt);
         VL_DBG(L"Hook_NtOpenKeyEx: neither virtual nor real exists, returning NOT_FOUND");
@@ -857,6 +865,7 @@ static NTSTATUS NTAPI Hook_NtOpenKeyEx(
         return VL_STATUS_SUCCESS;
     }
 
+    // Re-open real with full access for the caller
     HANDLE hRealWrite = NULL;
     NTSTATUS stR = Real_NtOpenKeyEx(&hRealWrite, DesiredAccess, ObjectAttributes, OpenOptions);
     SetReentrant(false);
@@ -1299,6 +1308,100 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
                             IoStatusBlock, ShareAccess, OpenOptions);
 }
 
+// ---- NtSetInformationFile -- intercept FileRenameInformation ----
+//
+// When an app renames a file the kernel path of the NEW name is embedded
+// inside a FILE_RENAME_INFORMATION / FILE_RENAME_INFORMATION_EX structure
+// passed here.  We patch that target path through ApplyFsRedirect so that
+// both ends of the rename land in the virtual store.
+//
+// FILE_RENAME_INFORMATION layout (matches both 32-bit and 64-bit):
+//   BOOLEAN  ReplaceIfExists   (ULONG in EX variant)
+//   BOOLEAN  pad[3]
+//   HANDLE   RootDirectory
+//   ULONG    FileNameLength    (bytes, not chars)
+//   WCHAR    FileName[1]
+
+#define FileRenameInformation   10
+#define FileRenameInformationEx 65   // Windows 10 RS1+
+
+static NTSTATUS NTAPI Hook_NtSetInformationFile(
+    HANDLE              FileHandle,
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID               FileInformation,
+    ULONG               Length,
+    ULONG               FileInformationClass)
+{
+    if (!g_FsEnabled || IsReentrant() ||
+        (FileInformationClass != FileRenameInformation &&
+         FileInformationClass != FileRenameInformationEx) ||
+        !FileInformation || Length < (ULONG)(sizeof(ULONG)*2 + sizeof(HANDLE) + sizeof(ULONG)))
+    {
+        return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
+                                          FileInformation, Length,
+                                          FileInformationClass);
+    }
+
+    // Both variants share the same layout for our purposes:
+    //   offset 0 : flags   (ULONG)
+    //   offset 4 : pad     (ULONG)  -- aligns HANDLE on 64-bit; same on 32
+    //   offset 4/8: RootDirectory (HANDLE -- 4 or 8 bytes)
+    //   after handle: FileNameLength (ULONG)
+    //   after that  : FileName (WCHAR[])
+    //
+    // We use byte arithmetic to stay layout-independent.
+    BYTE*  p              = (BYTE*)FileInformation;
+    ULONG  flagsSize      = sizeof(ULONG);          // ReplaceIfExists/Flags
+    ULONG  handleOffset   = flagsSize + sizeof(ULONG); // pad to align HANDLE
+    // On 32-bit the HANDLE is 4 bytes; on 64-bit it is 8.
+    ULONG  handleSize     = sizeof(HANDLE);
+    ULONG  nameLenOffset  = handleOffset + handleSize;
+    ULONG  nameOffset     = nameLenOffset + sizeof(ULONG);
+
+    if (Length < nameOffset) {
+        return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
+                                          FileInformation, Length,
+                                          FileInformationClass);
+    }
+
+    ULONG  nameByteLen = *(ULONG*)(p + nameLenOffset);
+    if (Length < nameOffset + nameByteLen || nameByteLen == 0) {
+        return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
+                                          FileInformation, Length,
+                                          FileInformationClass);
+    }
+
+    // Extract the target filename as a wstring (may be relative or absolute NT)
+    std::wstring origName((WCHAR*)(p + nameOffset), nameByteLen / sizeof(WCHAR));
+    std::wstring redName = ApplyFsRedirect(origName);
+
+    VL_DBG(L"Hook_NtSetInformationFile: rename target orig=%s", origName.c_str());
+
+    if (redName == origName) {
+        // No redirect needed
+        return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
+                                          FileInformation, Length,
+                                          FileInformationClass);
+    }
+
+    VL_DBG(L"Hook_NtSetInformationFile: rename target redir=%s", redName.c_str());
+
+    // Build a new buffer with the redirected filename
+    ULONG  newNameBytes = (ULONG)(redName.size() * sizeof(WCHAR));
+    ULONG  newLength    = nameOffset + newNameBytes;
+    std::vector<BYTE> buf(newLength, 0);
+    // Copy flags, pad, RootDirectory, FileNameLength fields verbatim
+    memcpy(buf.data(), p, nameOffset);
+    // Overwrite FileNameLength with new length
+    *(ULONG*)(buf.data() + nameLenOffset) = newNameBytes;
+    // Copy redirected filename
+    memcpy(buf.data() + nameOffset, redName.c_str(), newNameBytes);
+
+    return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
+                                      buf.data(), newLength,
+                                      FileInformationClass);
+}
+
 // ============================================================
 // CHILD PROCESS PROPAGATION
 // ============================================================
@@ -1401,6 +1504,7 @@ static void InstallHooks() {
     if (g_FsEnabled) {
         VL_GETPROC(ntdll, NtCreateFile);
         VL_GETPROC(ntdll, NtOpenFile);
+        VL_GETPROC(ntdll, NtSetInformationFile);
     }
 
     // ---------------------------------------------------------------
@@ -1468,6 +1572,7 @@ static void InstallHooks() {
     if (g_FsEnabled) {
         VL_ATTACH(NtCreateFile);
         VL_ATTACH(NtOpenFile);
+        if (Real_NtSetInformationFile) VL_ATTACH(NtSetInformationFile);
     }
 
     LONG commitResult = DetourTransactionCommit();
@@ -1498,6 +1603,7 @@ static void UninstallHooks() {
     if (g_FsEnabled) {
         VL_DETACH(NtCreateFile);
         VL_DETACH(NtOpenFile);
+        if (Real_NtSetInformationFile) VL_DETACH(NtSetInformationFile);
     }
 
     DetourTransactionCommit();
