@@ -41,13 +41,11 @@
 // MANDATORY DETOURS EXPORT
 // DetourCreateProcessWithDllsW spawns a helper thread in the
 // target process that calls DetourFinishHelperProcess from our
-// DLL.  Without this export the target crashes with 0xC000007B.
-// detours.lib already contains the implementation; we just
-// re-export it here so the linker puts it in the DLL's export
-// table.
+// DLL export table.  detours.lib has the implementation; this
+// pragma forces the linker to export it without redeclaring it
+// (detours.h already declares it -- redeclaring causes C2375).
 // =============================================================
-extern "C" __declspec(dllexport)
-void CALLBACK DetourFinishHelperProcess(HWND, HINSTANCE, LPSTR, int);
+#pragma comment(linker, "/export:DetourFinishHelperProcess")
 
 #include <string>
 #include <vector>
