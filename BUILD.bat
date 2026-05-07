@@ -2,6 +2,7 @@
 CD /D "%~dp0"
 
 del /Q *.exe *.dll *.obj _build_x86.bat _build_x64.bat 2>nul
+del /Q build\*.exe build\*.dll 2>nul
 
 set "DETOURS_PATH=%~dp0detours"
 set "SRCDIR=%~dp0"
@@ -96,6 +97,13 @@ echo --- Ordinal 1 export check (must show DetourFinishHelperProcess) ---
 "D:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\bin\amd64\dumpbin.exe" /exports VirtHook32.dll 2>nul | findstr /i "DetourFinish"
 "D:\Program Files (x86)\Microsoft Visual Studio 10.0\VC\bin\amd64\dumpbin.exe" /exports VirtHook64.dll 2>nul | findstr /i "DetourFinish"
 echo ============================================================
+
+if not exist build mkdir build
+move /y VirtLauncher32.exe build
+move /y VirtHook32.dll build
+move /y VirtLauncher64.exe build
+move /y VirtHook64.dll build
+copy /y redirects.ini build
 
 echo.
 echo  Build complete!  Files in: %SRCDIR%
