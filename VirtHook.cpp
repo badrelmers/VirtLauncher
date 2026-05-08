@@ -1,5 +1,5 @@
 // ============================================================
-// VirtHook.cpp  - VirtLauncher Hook DLL  (v8 - pure ntdll hooks)
+// VirtHook.cpp  - VirtLauncher Hook DLL  (v9 - pure ntdll hooks)
 // Injected into target process by VirtLauncher.exe via Detours
 //
 // Virtualizes:
@@ -14,8 +14,12 @@
 //     NtRenameKey
 //     NtReplaceKey
 //     NtSaveKey,  NtSaveKeyEx
-//     NtLoadKey,  NtLoadKey2, NtLoadKeyEx
+//     NtLoadKey,  NtLoadKey2, NtLoadKeyEx, NtLoadKey3 (Win10 RS5+)
 //     NtNotifyChangeKey, NtNotifyChangeMultipleKeys
+//     NtFlushKey         (redirects tracked handle to virtual hive)
+//     NtRestoreKey       (redirects tracked handle to virtual hive)
+//     NtSetInformationKey (redirects tracked handle to virtual hive)
+//     NtUnloadKey        (redirects OA target path to virtual hive)
 //     NtClose  (filtered: only for tracked virtual handles)
 //
 //   FILES (all pure ntdll):
@@ -25,17 +29,16 @@
 //     NtDeleteFile
 //     NtQueryAttributesFile, NtQueryFullAttributesFile
 //     NtQueryInformationByName
-//     NtQueryInformationFile    (handle-based, pass-through + log)
-//     NtQueryVolumeInformationFile (handle-based, pass-through + log)
-//     NtQueryDirectoryFile      (handle-based, pass-through + log)
-//     NtQueryDirectoryFileEx    (handle-based, pass-through + log, Win10+)
 //     NtSetInformationFile      (intercepts FileRenameInformation)
-//     NtDeviceIoControlFile     (handle-based, pass-through + log)
-//     NtFsControlFile           (handle-based, pass-through + log)
-//     NtReadFile                (handle-based, pass-through + log)
-//     NtWriteFile               (handle-based, pass-through + log)
 //
 //   CHILDREN: CreateProcessW/A (propagate injection)
+//
+// NOTE: NtQueryInformationFile, NtQueryVolumeInformationFile,
+//       NtQueryDirectoryFile, NtQueryDirectoryFileEx,
+//       NtDeviceIoControlFile, NtFsControlFile, NtReadFile, NtWriteFile
+//       are NOT hooked. All are handle-based and the handle was already
+//       redirected at NtCreateFile/NtOpenFile time, so hooking them adds
+//       overhead with zero virtualization benefit.
 //
 // NOTE: Win32 wrappers (GetFileAttributesW, FindFirstFileExW,
 //       MoveFileExW, etc.) are intentionally NOT hooked.
@@ -290,6 +293,27 @@ typedef NTSTATUS (NTAPI *PfnNtNotifyChangeMultipleKeys)
     (HANDLE, ULONG, PVL_OBJECT_ATTRIBUTES, HANDLE, VL_PIO_APC_ROUTINE,
      PVOID, PVL_IO_STATUS_BLOCK, ULONG, BOOLEAN, PVOID, ULONG, BOOLEAN);
 
+// NtFlushKey: flush a key's dirty pages to disk
+typedef NTSTATUS (NTAPI *PfnNtFlushKey)
+    (HANDLE);
+
+// NtRestoreKey: load a hive file onto an existing key
+typedef NTSTATUS (NTAPI *PfnNtRestoreKey)
+    (HANDLE, HANDLE, ULONG);
+
+// NtSetInformationKey: set key metadata (e.g. last-write time virtualization flag)
+typedef NTSTATUS (NTAPI *PfnNtSetInformationKey)
+    (HANDLE, ULONG, PVOID, ULONG);
+
+// NtUnloadKey: unmount a hive loaded by NtLoadKey* (OA-based, like NtLoadKey)
+typedef NTSTATUS (NTAPI *PfnNtUnloadKey)
+    (PVL_OBJECT_ATTRIBUTES);
+
+// NtLoadKey3: extended load (Win10 RS5 / 1809+), supersedes NtLoadKeyEx in newer code
+typedef NTSTATUS (NTAPI *PfnNtLoadKey3)
+    (PVL_OBJECT_ATTRIBUTES, PVL_OBJECT_ATTRIBUTES, ULONG,
+     PVOID, ULONG, ULONG, HANDLE, PVOID);
+
 typedef NTSTATUS (NTAPI *PfnNtClose)(HANDLE);
 
 typedef NTSTATUS (NTAPI *PfnNtQueryObject)(HANDLE, ULONG, PVOID, ULONG, PULONG);
@@ -328,38 +352,8 @@ typedef NTSTATUS (NTAPI *PfnNtQueryFullAttributesFile)
 typedef NTSTATUS (NTAPI *PfnNtQueryInformationByName)
     (PVL_OBJECT_ATTRIBUTES, PVL_IO_STATUS_BLOCK, PVOID, ULONG, ULONG);
 
-typedef NTSTATUS (NTAPI *PfnNtQueryInformationFile)
-    (HANDLE, PVL_IO_STATUS_BLOCK, PVOID, ULONG, ULONG);
-
-typedef NTSTATUS (NTAPI *PfnNtQueryVolumeInformationFile)
-    (HANDLE, PVL_IO_STATUS_BLOCK, PVOID, ULONG, ULONG);
-
-typedef NTSTATUS (NTAPI *PfnNtQueryDirectoryFile)
-    (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
-     PVOID, ULONG, ULONG, BOOLEAN, PVL_UNICODE_STRING, BOOLEAN);
-
-typedef NTSTATUS (NTAPI *PfnNtQueryDirectoryFileEx)
-    (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
-     PVOID, ULONG, ULONG, ULONG, PVL_UNICODE_STRING);
-
 typedef NTSTATUS (NTAPI *PfnNtSetInformationFile)
     (HANDLE, PVL_IO_STATUS_BLOCK, PVOID, ULONG, ULONG);
-
-typedef NTSTATUS (NTAPI *PfnNtDeviceIoControlFile)
-    (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
-     ULONG, PVOID, ULONG, PVOID, ULONG);
-
-typedef NTSTATUS (NTAPI *PfnNtFsControlFile)
-    (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
-     ULONG, PVOID, ULONG, PVOID, ULONG);
-
-typedef NTSTATUS (NTAPI *PfnNtReadFile)
-    (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
-     PVOID, ULONG, PLARGE_INTEGER, PULONG);
-
-typedef NTSTATUS (NTAPI *PfnNtWriteFile)
-    (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
-     PVOID, ULONG, PLARGE_INTEGER, PULONG);
 
 // ---- Child process ----
 typedef BOOL (WINAPI *PfnCreateProcessW)
@@ -398,6 +392,11 @@ static PfnNtLoadKey2              Real_NtLoadKey2;
 static PfnNtLoadKeyEx             Real_NtLoadKeyEx;
 static PfnNtNotifyChangeKey       Real_NtNotifyChangeKey;
 static PfnNtNotifyChangeMultipleKeys Real_NtNotifyChangeMultipleKeys;
+static PfnNtFlushKey              Real_NtFlushKey;
+static PfnNtRestoreKey            Real_NtRestoreKey;
+static PfnNtSetInformationKey     Real_NtSetInformationKey;
+static PfnNtUnloadKey             Real_NtUnloadKey;
+static PfnNtLoadKey3              Real_NtLoadKey3;
 static PfnNtClose                 Real_NtClose;
 static PfnNtQueryObject           Real_NtQueryObject;
 
@@ -412,15 +411,7 @@ static PfnNtDeleteFile              Real_NtDeleteFile;
 static PfnNtQueryAttributesFile     Real_NtQueryAttributesFile;
 static PfnNtQueryFullAttributesFile Real_NtQueryFullAttributesFile;
 static PfnNtQueryInformationByName  Real_NtQueryInformationByName;
-static PfnNtQueryInformationFile    Real_NtQueryInformationFile;
-static PfnNtQueryVolumeInformationFile Real_NtQueryVolumeInformationFile;
-static PfnNtQueryDirectoryFile      Real_NtQueryDirectoryFile;
-static PfnNtQueryDirectoryFileEx    Real_NtQueryDirectoryFileEx;    // Win10+, may be NULL
 static PfnNtSetInformationFile      Real_NtSetInformationFile;
-static PfnNtDeviceIoControlFile     Real_NtDeviceIoControlFile;
-static PfnNtFsControlFile           Real_NtFsControlFile;
-static PfnNtReadFile                Real_NtReadFile;
-static PfnNtWriteFile               Real_NtWriteFile;
 
 // ----- Children -----
 static PfnCreateProcessW  Real_CreateProcessW;
@@ -1616,6 +1607,117 @@ static NTSTATUS NTAPI Hook_NtNotifyChangeMultipleKeys(
                                             Asynchronous);
 }
 
+// ---- NtFlushKey -- redirect tracked handle to virtual hive ----
+// Without this hook an app that calls NtFlushKey with a handle obtained
+// outside our open/create path could flush a real hive key, exposing the
+// app's registry footprint in the global hive.
+static NTSTATUS NTAPI Hook_NtFlushKey(HANDLE KeyHandle) {
+    VirtKeyEntry e;
+    HANDLE useH = KeyHandle;
+    if (g_RegEnabled && GetEntry(KeyHandle, e))
+        useH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : KeyHandle);
+
+    VL_DBG(L"Hook_NtFlushKey: handle=%p useH=%p", KeyHandle, useH);
+
+    return Real_NtFlushKey(useH);
+}
+
+// ---- NtRestoreKey -- redirect tracked handle to virtual hive ----
+// NtRestoreKey loads a hive file onto an existing key.  Redirecting to
+// hVirt ensures the restore lands in the virtual store, not the real hive.
+static NTSTATUS NTAPI Hook_NtRestoreKey(
+    HANDLE KeyHandle,
+    HANDLE FileHandle,
+    ULONG  Flags)
+{
+    VirtKeyEntry e;
+    HANDLE useH = KeyHandle;
+    if (g_RegEnabled && GetEntry(KeyHandle, e))
+        useH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : KeyHandle);
+
+    VL_DBG(L"Hook_NtRestoreKey: handle=%p useH=%p fileH=%p flags=0x%X",
+           KeyHandle, useH, FileHandle, Flags);
+
+    return Real_NtRestoreKey(useH, FileHandle, Flags);
+}
+
+// ---- NtSetInformationKey -- redirect tracked handle to virtual hive ----
+// Prevents key metadata changes (e.g. virtualization flags, last-write time
+// via KeyWriteTimeInformation) from leaking to the real hive.
+static NTSTATUS NTAPI Hook_NtSetInformationKey(
+    HANDLE KeyHandle,
+    ULONG  KeySetInformationClass,
+    PVOID  KeySetInformation,
+    ULONG  KeySetInformationLength)
+{
+    VirtKeyEntry e;
+    HANDLE useH = KeyHandle;
+    if (g_RegEnabled && GetEntry(KeyHandle, e))
+        useH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : KeyHandle);
+
+    VL_DBG(L"Hook_NtSetInformationKey: handle=%p useH=%p class=%u len=%u",
+           KeyHandle, useH, KeySetInformationClass, KeySetInformationLength);
+
+    return Real_NtSetInformationKey(useH, KeySetInformationClass,
+                                     KeySetInformation, KeySetInformationLength);
+}
+
+// ---- NtUnloadKey -- redirect OA target to virtual path ----
+// NtUnloadKey takes an OBJECT_ATTRIBUTES (absolute path), NOT a handle.
+// Without this hook an app (or a library it loads) can unload a real hive
+// subtree by absolute path regardless of our open/create redirections.
+static NTSTATUS NTAPI Hook_NtUnloadKey(PVL_OBJECT_ATTRIBUTES TargetKey) {
+    std::wstring fullPath = GetFullNtPath(TargetKey);
+    VL_DBG(L"Hook_NtUnloadKey: target=%s", fullPath.c_str());
+
+    std::wstring virtPath;
+    if (!g_RegEnabled || !LogicalToVirtual(fullPath, virtPath))
+        return Real_NtUnloadKey(TargetKey);
+
+    VL_DBG(L"Hook_NtUnloadKey: REDIRECT target -> %s", virtPath.c_str());
+    VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
+    VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
+        TargetKey->Attributes | OBJ_CASE_INSENSITIVE);
+
+    return Real_NtUnloadKey(&voa);
+}
+
+// ---- NtLoadKey3 (Win10 RS5 / 1809+) -- redirect TargetKey to virtual path ----
+// NtLoadKey3 is the newest load variant; semantically identical to NtLoadKeyEx
+// for our purposes.  Without this hook a newly compiled app can load a hive
+// into the real registry even though NtLoadKey/NtLoadKey2/NtLoadKeyEx are all
+// redirected.
+static NTSTATUS NTAPI Hook_NtLoadKey3(
+    PVL_OBJECT_ATTRIBUTES TargetKey,
+    PVL_OBJECT_ATTRIBUTES SourceFile,
+    ULONG                 Flags,
+    PVOID                 ExtendedParameters,
+    ULONG                 ExtendedParameterCount,
+    ULONG                 DesiredAccess,
+    HANDLE                RootHandle,
+    PVOID                 Reserved)
+{
+    std::wstring fullPath = GetFullNtPath(TargetKey);
+    VL_DBG(L"Hook_NtLoadKey3: flags=0x%X extParamCount=%u target=%s",
+           Flags, ExtendedParameterCount, fullPath.c_str());
+
+    std::wstring virtPath;
+    if (!g_RegEnabled || !LogicalToVirtual(fullPath, virtPath))
+        return Real_NtLoadKey3(TargetKey, SourceFile, Flags,
+                                ExtendedParameters, ExtendedParameterCount,
+                                DesiredAccess, RootHandle, Reserved);
+
+    VL_DBG(L"Hook_NtLoadKey3: REDIRECT target -> %s", virtPath.c_str());
+    EnsureVirtualPath(virtPath);
+    VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
+    VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
+        TargetKey->Attributes | OBJ_CASE_INSENSITIVE);
+
+    return Real_NtLoadKey3(&voa, SourceFile, Flags,
+                            ExtendedParameters, ExtendedParameterCount,
+                            DesiredAccess, RootHandle, Reserved);
+}
+
 // ---- NtClose -- CRITICAL: only special-case tracked handles ----
 static NTSTATUS NTAPI Hook_NtClose(HANDLE Handle) {
     VirtKeyEntry e;
@@ -1978,164 +2080,6 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
                                       FileInformationClass);
 }
 
-// ---- NtQueryInformationFile -- handle-based, pass-through + log ----
-// The handle was already redirected at NtCreateFile/NtOpenFile time.
-static NTSTATUS NTAPI Hook_NtQueryInformationFile(
-    HANDLE              FileHandle,
-    PVL_IO_STATUS_BLOCK IoStatusBlock,
-    PVOID               FileInformation,
-    ULONG               Length,
-    ULONG               FileInformationClass)
-{
-    VL_DBG(L"Hook_NtQueryInformationFile: handle=%p class=%u len=%u",
-           FileHandle, FileInformationClass, Length);
-    return Real_NtQueryInformationFile(FileHandle, IoStatusBlock,
-                                        FileInformation, Length,
-                                        FileInformationClass);
-}
-
-// ---- NtQueryVolumeInformationFile -- handle-based, pass-through + log ----
-static NTSTATUS NTAPI Hook_NtQueryVolumeInformationFile(
-    HANDLE              FileHandle,
-    PVL_IO_STATUS_BLOCK IoStatusBlock,
-    PVOID               FsInformation,
-    ULONG               Length,
-    ULONG               FsInformationClass)
-{
-    VL_DBG(L"Hook_NtQueryVolumeInformationFile: handle=%p class=%u len=%u",
-           FileHandle, FsInformationClass, Length);
-    return Real_NtQueryVolumeInformationFile(FileHandle, IoStatusBlock,
-                                              FsInformation, Length,
-                                              FsInformationClass);
-}
-
-// ---- NtQueryDirectoryFile -- handle-based, pass-through + log ----
-// The directory handle already points to the virtual location (redirected at
-// NtOpenFile time), so no path substitution is needed here.
-static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
-    HANDLE              FileHandle,
-    HANDLE              Event,
-    VL_PIO_APC_ROUTINE  ApcRoutine,
-    PVOID               ApcContext,
-    PVL_IO_STATUS_BLOCK IoStatusBlock,
-    PVOID               FileInformation,
-    ULONG               Length,
-    ULONG               FileInformationClass,
-    BOOLEAN             ReturnSingleEntry,
-    PVL_UNICODE_STRING  FileName,
-    BOOLEAN             RestartScan)
-{
-    VL_DBG(L"Hook_NtQueryDirectoryFile: handle=%p class=%u filter=%s restart=%d",
-           FileHandle, FileInformationClass,
-           FileName ? FromUStr(FileName).c_str() : L"*",
-           (int)RestartScan);
-    return Real_NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
-                                      IoStatusBlock, FileInformation, Length,
-                                      FileInformationClass, ReturnSingleEntry,
-                                      FileName, RestartScan);
-}
-
-// ---- NtQueryDirectoryFileEx (Win10+) -- handle-based, pass-through + log ----
-static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
-    HANDLE              FileHandle,
-    HANDLE              Event,
-    VL_PIO_APC_ROUTINE  ApcRoutine,
-    PVOID               ApcContext,
-    PVL_IO_STATUS_BLOCK IoStatusBlock,
-    PVOID               FileInformation,
-    ULONG               Length,
-    ULONG               FileInformationClass,
-    ULONG               QueryFlags,
-    PVL_UNICODE_STRING  FileName)
-{
-    VL_DBG(L"Hook_NtQueryDirectoryFileEx: handle=%p class=%u flags=0x%X filter=%s",
-           FileHandle, FileInformationClass, QueryFlags,
-           FileName ? FromUStr(FileName).c_str() : L"*");
-    return Real_NtQueryDirectoryFileEx(FileHandle, Event, ApcRoutine, ApcContext,
-                                        IoStatusBlock, FileInformation, Length,
-                                        FileInformationClass, QueryFlags, FileName);
-}
-
-// ---- NtDeviceIoControlFile -- handle-based, pass-through + log ----
-static NTSTATUS NTAPI Hook_NtDeviceIoControlFile(
-    HANDLE              FileHandle,
-    HANDLE              Event,
-    VL_PIO_APC_ROUTINE  ApcRoutine,
-    PVOID               ApcContext,
-    PVL_IO_STATUS_BLOCK IoStatusBlock,
-    ULONG               IoControlCode,
-    PVOID               InputBuffer,
-    ULONG               InputBufferLength,
-    PVOID               OutputBuffer,
-    ULONG               OutputBufferLength)
-{
-    VL_DBG(L"Hook_NtDeviceIoControlFile: handle=%p ioctl=0x%08X inLen=%u outLen=%u",
-           FileHandle, IoControlCode, InputBufferLength, OutputBufferLength);
-    return Real_NtDeviceIoControlFile(FileHandle, Event, ApcRoutine, ApcContext,
-                                       IoStatusBlock, IoControlCode,
-                                       InputBuffer, InputBufferLength,
-                                       OutputBuffer, OutputBufferLength);
-}
-
-// ---- NtFsControlFile -- handle-based, pass-through + log ----
-static NTSTATUS NTAPI Hook_NtFsControlFile(
-    HANDLE              FileHandle,
-    HANDLE              Event,
-    VL_PIO_APC_ROUTINE  ApcRoutine,
-    PVOID               ApcContext,
-    PVL_IO_STATUS_BLOCK IoStatusBlock,
-    ULONG               FsControlCode,
-    PVOID               InputBuffer,
-    ULONG               InputBufferLength,
-    PVOID               OutputBuffer,
-    ULONG               OutputBufferLength)
-{
-    VL_DBG(L"Hook_NtFsControlFile: handle=%p fsctl=0x%08X inLen=%u outLen=%u",
-           FileHandle, FsControlCode, InputBufferLength, OutputBufferLength);
-    return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
-                                 IoStatusBlock, FsControlCode,
-                                 InputBuffer, InputBufferLength,
-                                 OutputBuffer, OutputBufferLength);
-}
-
-// ---- NtReadFile -- handle-based, pass-through + log ----
-static NTSTATUS NTAPI Hook_NtReadFile(
-    HANDLE              FileHandle,
-    HANDLE              Event,
-    VL_PIO_APC_ROUTINE  ApcRoutine,
-    PVOID               ApcContext,
-    PVL_IO_STATUS_BLOCK IoStatusBlock,
-    PVOID               Buffer,
-    ULONG               Length,
-    PLARGE_INTEGER      ByteOffset,
-    PULONG              Key)
-{
-    VL_DBG(L"Hook_NtReadFile: handle=%p len=%u offset=%I64d",
-           FileHandle, Length,
-           ByteOffset ? ByteOffset->QuadPart : (LONGLONG)-1);
-    return Real_NtReadFile(FileHandle, Event, ApcRoutine, ApcContext,
-                            IoStatusBlock, Buffer, Length, ByteOffset, Key);
-}
-
-// ---- NtWriteFile -- handle-based, pass-through + log ----
-static NTSTATUS NTAPI Hook_NtWriteFile(
-    HANDLE              FileHandle,
-    HANDLE              Event,
-    VL_PIO_APC_ROUTINE  ApcRoutine,
-    PVOID               ApcContext,
-    PVL_IO_STATUS_BLOCK IoStatusBlock,
-    PVOID               Buffer,
-    ULONG               Length,
-    PLARGE_INTEGER      ByteOffset,
-    PULONG              Key)
-{
-    VL_DBG(L"Hook_NtWriteFile: handle=%p len=%u offset=%I64d",
-           FileHandle, Length,
-           ByteOffset ? ByteOffset->QuadPart : (LONGLONG)-1);
-    return Real_NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext,
-                             IoStatusBlock, Buffer, Length, ByteOffset, Key);
-}
-
 // ============================================================
 // CHILD PROCESS PROPAGATION
 // ============================================================
@@ -2351,13 +2295,19 @@ static void InstallHooks() {
         VL_GETPROC(ntdll, NtLoadKey);
         VL_GETPROC(ntdll, NtLoadKey2);
         VL_GETPROC(ntdll, NtLoadKeyEx);
+        VL_GETPROC(ntdll, NtLoadKey3);          // Win10 RS5+, may be NULL
         VL_GETPROC(ntdll, NtNotifyChangeKey);
         VL_GETPROC(ntdll, NtNotifyChangeMultipleKeys);
+        VL_GETPROC(ntdll, NtFlushKey);
+        VL_GETPROC(ntdll, NtRestoreKey);
+        VL_GETPROC(ntdll, NtSetInformationKey);
+        VL_GETPROC(ntdll, NtUnloadKey);
 
         VL_DBG(L"InstallHooks REG: NtOpenKey=%p NtCreateKey=%p NtLoadKeyEx=%p"
-               L" NtNotifyChangeMultipleKeys=%p",
+               L" NtLoadKey3=%p NtFlushKey=%p NtUnloadKey=%p",
                (void*)Real_NtOpenKey, (void*)Real_NtCreateKey,
-               (void*)Real_NtLoadKeyEx, (void*)Real_NtNotifyChangeMultipleKeys);
+               (void*)Real_NtLoadKeyEx, (void*)Real_NtLoadKey3,
+               (void*)Real_NtFlushKey, (void*)Real_NtUnloadKey);
     }
 
     // File hooks
@@ -2372,22 +2322,12 @@ static void InstallHooks() {
         VL_GETPROC(ntdll, NtQueryAttributesFile);
         VL_GETPROC(ntdll, NtQueryFullAttributesFile);
         VL_GETPROC(ntdll, NtQueryInformationByName);   // Win8+ may be NULL on XP
-        VL_GETPROC(ntdll, NtQueryInformationFile);
-        VL_GETPROC(ntdll, NtQueryVolumeInformationFile);
-        VL_GETPROC(ntdll, NtQueryDirectoryFile);
-        VL_GETPROC(ntdll, NtQueryDirectoryFileEx);     // Win10+ may be NULL
         VL_GETPROC(ntdll, NtSetInformationFile);
-        VL_GETPROC(ntdll, NtDeviceIoControlFile);
-        VL_GETPROC(ntdll, NtFsControlFile);
-        VL_GETPROC(ntdll, NtReadFile);
-        VL_GETPROC(ntdll, NtWriteFile);
 
         VL_DBG(L"InstallHooks FS: NtCreateFile=%p NtOpenFile=%p NtDeleteFile=%p"
-               L" NtQueryDirFile=%p NtQueryDirFileEx=%p NtReadFile=%p NtWriteFile=%p",
-               (void*)Real_NtCreateFile,  (void*)Real_NtOpenFile,
-               (void*)Real_NtDeleteFile,  (void*)Real_NtQueryDirectoryFile,
-               (void*)Real_NtQueryDirectoryFileEx,
-               (void*)Real_NtReadFile,    (void*)Real_NtWriteFile);
+               L" NtSetInformationFile=%p",
+               (void*)Real_NtCreateFile, (void*)Real_NtOpenFile,
+               (void*)Real_NtDeleteFile, (void*)Real_NtSetInformationFile);
     }
 
     // ---------------------------------------------------------------
@@ -2452,8 +2392,13 @@ static void InstallHooks() {
         if (Real_NtLoadKey)              VL_ATTACH(NtLoadKey);
         if (Real_NtLoadKey2)             VL_ATTACH(NtLoadKey2);
         if (Real_NtLoadKeyEx)            VL_ATTACH(NtLoadKeyEx);
+        if (Real_NtLoadKey3)             VL_ATTACH(NtLoadKey3);
         VL_ATTACH(NtNotifyChangeKey);
         if (Real_NtNotifyChangeMultipleKeys) VL_ATTACH(NtNotifyChangeMultipleKeys);
+        if (Real_NtFlushKey)             VL_ATTACH(NtFlushKey);
+        if (Real_NtRestoreKey)           VL_ATTACH(NtRestoreKey);
+        if (Real_NtSetInformationKey)    VL_ATTACH(NtSetInformationKey);
+        if (Real_NtUnloadKey)            VL_ATTACH(NtUnloadKey);
     }
 
     // Files
@@ -2468,15 +2413,7 @@ static void InstallHooks() {
         if (Real_NtQueryAttributesFile)   VL_ATTACH(NtQueryAttributesFile);
         if (Real_NtQueryFullAttributesFile) VL_ATTACH(NtQueryFullAttributesFile);
         if (Real_NtQueryInformationByName)  VL_ATTACH(NtQueryInformationByName);
-        if (Real_NtQueryInformationFile)    VL_ATTACH(NtQueryInformationFile);
-        if (Real_NtQueryVolumeInformationFile) VL_ATTACH(NtQueryVolumeInformationFile);
-        if (Real_NtQueryDirectoryFile)    VL_ATTACH(NtQueryDirectoryFile);
-        if (Real_NtQueryDirectoryFileEx)  VL_ATTACH(NtQueryDirectoryFileEx);
         if (Real_NtSetInformationFile)    VL_ATTACH(NtSetInformationFile);
-        if (Real_NtDeviceIoControlFile)   VL_ATTACH(NtDeviceIoControlFile);
-        if (Real_NtFsControlFile)         VL_ATTACH(NtFsControlFile);
-        if (Real_NtReadFile)              VL_ATTACH(NtReadFile);
-        if (Real_NtWriteFile)             VL_ATTACH(NtWriteFile);
     }
 
     LONG commitResult = DetourTransactionCommit();
@@ -2513,8 +2450,13 @@ static void UninstallHooks() {
         if (Real_NtLoadKey)              VL_DETACH(NtLoadKey);
         if (Real_NtLoadKey2)             VL_DETACH(NtLoadKey2);
         if (Real_NtLoadKeyEx)            VL_DETACH(NtLoadKeyEx);
+        if (Real_NtLoadKey3)             VL_DETACH(NtLoadKey3);
         VL_DETACH(NtNotifyChangeKey);
         if (Real_NtNotifyChangeMultipleKeys) VL_DETACH(NtNotifyChangeMultipleKeys);
+        if (Real_NtFlushKey)             VL_DETACH(NtFlushKey);
+        if (Real_NtRestoreKey)           VL_DETACH(NtRestoreKey);
+        if (Real_NtSetInformationKey)    VL_DETACH(NtSetInformationKey);
+        if (Real_NtUnloadKey)            VL_DETACH(NtUnloadKey);
     }
 
     if (g_FsEnabled) {
@@ -2528,15 +2470,7 @@ static void UninstallHooks() {
         if (Real_NtQueryAttributesFile)   VL_DETACH(NtQueryAttributesFile);
         if (Real_NtQueryFullAttributesFile) VL_DETACH(NtQueryFullAttributesFile);
         if (Real_NtQueryInformationByName)  VL_DETACH(NtQueryInformationByName);
-        if (Real_NtQueryInformationFile)    VL_DETACH(NtQueryInformationFile);
-        if (Real_NtQueryVolumeInformationFile) VL_DETACH(NtQueryVolumeInformationFile);
-        if (Real_NtQueryDirectoryFile)    VL_DETACH(NtQueryDirectoryFile);
-        if (Real_NtQueryDirectoryFileEx)  VL_DETACH(NtQueryDirectoryFileEx);
         if (Real_NtSetInformationFile)    VL_DETACH(NtSetInformationFile);
-        if (Real_NtDeviceIoControlFile)   VL_DETACH(NtDeviceIoControlFile);
-        if (Real_NtFsControlFile)         VL_DETACH(NtFsControlFile);
-        if (Real_NtReadFile)              VL_DETACH(NtReadFile);
-        if (Real_NtWriteFile)             VL_DETACH(NtWriteFile);
     }
 
     DetourTransactionCommit();
@@ -2557,7 +2491,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
         g_TlsIdx = TlsAlloc();
         InitializeCriticalSectionAndSpinCount(&g_KeyMapLock, 4000);
 
-        VL_DBG(L"DllMain: DLL_PROCESS_ATTACH -- VirtHook loading (v8 pure ntdll)");
+        VL_DBG(L"DllMain: DLL_PROCESS_ATTACH -- VirtHook loading (v9 pure ntdll)");
 
         LoadConfig();
         InstallHooks();
