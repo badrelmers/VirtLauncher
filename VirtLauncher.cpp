@@ -26,7 +26,8 @@
 //
 // ============================================================
 // Usage:
-//   VirtLauncher.exe [options] <app.exe> [args...]
+//   VirtLauncher.exe [options] --exec <app.exe> [args...]
+//   VirtLauncher.exe [options] <app.exe> [args...]   (legacy, see note below)
 //
 // Options:
 //   --verbose, -v          Print informational messages to stdout.
@@ -35,13 +36,25 @@
 //   --debug, -d            Enable debug logging to DebugView (OutputDebugString).
 //                          Env: VLAUNCHER_DEBUG=1
 //
+//   --exec <app.exe> [args...], -e <app.exe> [args...]
+//                          Explicitly marks the start of the target command.
+//                          Everything after --exec is the application and its
+//                          arguments. Use this when the app name or its args
+//                          could be mistaken for option values (e.g. when using
+//                          -r or -f without a hive/folder and the app name does
+//                          not start with '-').
+//
 //   --registry [HivePath], -r [HivePath]
 //                          Enable registry virtualisation.
-//                          Default hive: HKCU\VirtLauncher
+//                          HivePath is consumed only if it looks like a hive
+//                          (starts with HKCU, HKLM, HKEY_, HKU, HKCR, or
+//                          \Registry\).  Default hive: HKCU\VirtLauncher
 //
 //   --filesystem [Folder], -f [Folder]
 //                          Enable filesystem virtualisation using Folder as the
-//                          virtual store root. Default: .\VIRTL
+//                          virtual store root.  Folder is consumed only if it
+//                          looks like a path (drive letter, UNC \\, or .\...).
+//                          Default: .\VIRTL
 //
 //   --config <config.ini>, -c <config.ini>
 //                          Load explicit FS redirect rules from an INI file.
@@ -241,6 +254,47 @@ static std::wstring RegWin32ToNt(const std::wstring& win32) {
 }
 
 // ============================================================
+// Optional-argument peek heuristics
+// ============================================================
+//
+// --registry and --filesystem both take an *optional* value.  The parser
+// peeks at the next token and uses these helpers to decide whether it is
+// the flag's value or the start of the target command.  If the token is
+// ambiguous the caller should use --exec to mark the command boundary
+// explicitly.
+
+// Returns true if 's' looks like a registry hive path that could be the
+// value of --registry / -r.  Accepted prefixes (case-insensitive):
+//   HKCU, HKLM, HKEY_, HKU, HKCR, \Registry\ .
+static bool LooksLikeRegPath(const wchar_t* s) {
+    if (!s || !s[0]) return false;
+    static const wchar_t* kPfx[] = {
+        L"HKCU", L"HKLM", L"HKEY_", L"HKU", L"HKCR", L"\\Registry\\"
+    };
+    for (size_t i = 0; i < sizeof(kPfx)/sizeof(kPfx[0]); ++i) {
+        size_t n = wcslen(kPfx[i]);
+        if (_wcsnicmp(s, kPfx[i], n) == 0) return true;
+    }
+    return false;
+}
+
+// Returns true if 's' looks like a filesystem path that could be the
+// value of --filesystem / -f.  Accepted forms:
+//   X:         drive-letter paths  (C:\foo, D:, etc.)
+//   \\         UNC paths           (\\server\share)
+//   .\  ..\    relative dot-paths
+static bool LooksLikeFsPath(const wchar_t* s) {
+    if (!s || !s[0]) return false;
+    // Drive-letter path: X: or X:\... .
+    if (s[1] == L':' && iswalpha(s[0])) return true;
+    // UNC or \\?\ long-path
+    if (s[0] == L'\\' && s[1] == L'\\') return true;
+    // Explicit relative: .\ or ..\ .
+    if (s[0] == L'.' && (s[1] == L'\\' || (s[1] == L'.' && s[2] == L'\\'))) return true;
+    return false;
+}
+
+// ============================================================
 // Print Help
 // ============================================================
 
@@ -249,7 +303,8 @@ static void PrintUsage(const wchar_t* self) {
     wprintf(L"Requires VirtHook32.dll / VirtHook64.dll alongside the EXE.\n\n");
 
     wprintf(L"Usage:\n");
-    wprintf(L"  %s [options] <app.exe> [app args...]\n\n", self);
+    wprintf(L"  %s [options] --exec <app.exe> [app args...]\n", self);
+    wprintf(L"  %s [options] <app.exe> [app args...]   (see Ambiguity note)\n\n", self);
 
     wprintf(L"Options:\n");
     wprintf(L"  --verbose, -v\n");
@@ -261,17 +316,29 @@ static void PrintUsage(const wchar_t* self) {
     wprintf(L"      Run DebugView as Administrator before launching.\n");
     wprintf(L"      Set VLAUNCHER_DEBUG=1 as an alternative.\n\n");
 
+    wprintf(L"  --exec <app.exe> [args...], -e <app.exe> [args...]\n");
+    wprintf(L"      Explicitly marks where the target command begins. Everything after\n");
+    wprintf(L"      this flag is the application and its arguments. Use this whenever\n");
+    wprintf(L"      -r or -f are used without an explicit hive/folder value, because\n");
+    wprintf(L"      the parser cannot otherwise distinguish the app name from a flag\n");
+    wprintf(L"      value.\n\n");
+
     wprintf(L"  --registry [HivePath], -r [HivePath]\n");
     wprintf(L"      Enable registry virtualisation. All writes from the target app go\n");
     wprintf(L"      to HivePath; reads show a merged view (virtual shadowing real).\n");
-    wprintf(L"      HivePath is optional; default: HKCU\\VirtLauncher\n");
-    wprintf(L"      Supported hive prefixes: HKCU, HKLM, HKU, HKCR, HKEY_*\n\n");
+    wprintf(L"      HivePath is OPTIONAL. It is only consumed if the next token looks\n");
+    wprintf(L"      like a hive path (starts with HKCU, HKLM, HKEY_*, HKU, HKCR, or\n");
+    wprintf(L"      \\Registry\\). Default hive: HKCU\\VirtLauncher\n");
+    wprintf(L"      When in doubt use --exec to mark the command boundary.\n\n");
 
     wprintf(L"  --filesystem [Folder], -f [Folder]\n");
     wprintf(L"      Enable filesystem virtualisation. All file writes from the target\n");
     wprintf(L"      app are redirected into Folder (organised by drive letter).\n");
     wprintf(L"      Reads check Folder first, then fall back to the real path.\n");
-    wprintf(L"      Folder is optional; default: .\\VIRTL  (created if absent)\n\n");
+    wprintf(L"      Folder is OPTIONAL. It is only consumed if the next token looks\n");
+    wprintf(L"      like a path (drive letter, UNC \\\\..., or relative .\\...).\n");
+    wprintf(L"      Default: .\\VIRTL  (created if absent).\n");
+    wprintf(L"      When in doubt use --exec to mark the command boundary.\n\n");
 
     wprintf(L"  --config <config.ini>, -c <config.ini>\n");
     wprintf(L"      Load explicit source=destination path redirect rules from an INI\n");
@@ -280,6 +347,16 @@ static void PrintUsage(const wchar_t* self) {
 
     wprintf(L"  --help, -h, /?\n");
     wprintf(L"      Show this help.\n\n");
+
+    wprintf(L"Ambiguity note (-r and -f with optional values):\n");
+    wprintf(L"  -r and -f accept an optional value.  The parser uses heuristics to\n");
+    wprintf(L"  decide if the next token is the value or the start of the command:\n");
+    wprintf(L"    -r: consumes the next token only if it starts with a known hive prefix.\n");
+    wprintf(L"    -f: consumes the next token only if it starts with a drive letter,\n");
+    wprintf(L"        \\\\ (UNC), or .\\ / ..\\ (relative dot-path).\n");
+    wprintf(L"  Bare names (e.g. 'cmd', 'notepad') are never consumed as values.\n");
+    wprintf(L"  For complete safety use --exec:\n");
+    wprintf(L"    %s -r -f --exec cmd /c echo hello\n\n", self);
 
     wprintf(L"FS Config file format  (--config):\n");
     wprintf(L"  # Lines starting with # or ; are comments\n");
@@ -301,27 +378,32 @@ static void PrintUsage(const wchar_t* self) {
     wprintf(L"  VLAUNCHER_DEBUG=1     Same effect as --debug\n\n");
 
     wprintf(L"Examples:\n");
-    wprintf(L"  # Capture all registry writes from notepad.exe into HKCU\\VirtApp\n");
-    wprintf(L"  VirtLauncher64.exe --registry HKCU\\VirtApp notepad.exe\n\n");
+    wprintf(L"  # Registry virtualisation with explicit hive\n");
+    wprintf(L"  VirtLauncher64.exe -r HKCU\\VirtApp notepad.exe\n\n");
 
-    wprintf(L"  # Capture all file writes into the default .\\VIRTL folder\n");
-    wprintf(L"  VirtLauncher64.exe --filesystem notepad.exe\n\n");
+    wprintf(L"  # Registry virtualisation with default hive -- use --exec to avoid\n");
+    wprintf(L"  # ambiguity between the hive and the app name\n");
+    wprintf(L"  VirtLauncher64.exe -r --exec notepad.exe\n");
+    wprintf(L"  VirtLauncher64.exe -r --exec cmd /c echo hello\n\n");
 
-    wprintf(L"  # Use a custom virtual store folder\n");
-    wprintf(L"  VirtLauncher64.exe --filesystem D:\\MySandbox notepad.exe\n\n");
+    wprintf(L"  # Filesystem virtualisation with default folder -- same pattern\n");
+    wprintf(L"  VirtLauncher64.exe -f --exec notepad.exe\n");
+    wprintf(L"  VirtLauncher64.exe -f --exec cmd /c echo hello\n\n");
+
+    wprintf(L"  # Filesystem virtualisation with explicit folder (path heuristic works)\n");
+    wprintf(L"  VirtLauncher64.exe -f D:\\MySandbox notepad.exe\n\n");
+
+    wprintf(L"  # Both -r and -f with defaults, explicit command boundary\n");
+    wprintf(L"  VirtLauncher64.exe -r -f --exec cmd /c echo hello\n\n");
 
     wprintf(L"  # Redirect specific paths via INI config only\n");
     wprintf(L"  VirtLauncher64.exe --config redir.ini notepad.exe\n\n");
 
     wprintf(L"  # INI config for specific paths + catch-all virtual folder for everything else\n");
-    wprintf(L"  VirtLauncher64.exe --config redir.ini --filesystem D:\\Sandbox notepad.exe\n\n");
+    wprintf(L"  VirtLauncher64.exe --config redir.ini -f D:\\Sandbox notepad.exe\n\n");
 
     wprintf(L"  # Full virtualisation: registry + filesystem + verbose output\n");
-    wprintf(L"  VirtLauncher64.exe --verbose --registry HKCU\\VirtApp\n");
-    wprintf(L"                     --filesystem D:\\Sandbox installer.exe /SILENT\n\n");
-
-    wprintf(L"  # Registry default hive, filesystem default folder, with debug logging\n");
-    wprintf(L"  VirtLauncher64.exe --debug --registry --filesystem notepad.exe\n\n");
+    wprintf(L"  VirtLauncher64.exe -v -r HKCU\\VirtApp -f D:\\Sandbox --exec installer.exe /SILENT\n\n");
 
     wprintf(L"Notes:\n");
     wprintf(L"  - VIRTLAUNCHER_REG, VIRTLAUNCHER_FS, VIRTLAUNCHER_FSDIR, VIRTLAUNCHER_DLL\n");
@@ -342,13 +424,23 @@ int wmain(int argc, wchar_t* argv[]) {
     // --- Parse arguments ---
     std::wstring regPath;
     bool         regEnabled   = false;
-    std::wstring fsConfig;        // --config  INI file (replaces old -fs)
+    std::wstring fsConfig;        // --config  INI file
     std::wstring fsFolder;        // --filesystem  virtual store folder
     bool         fsDirEnabled = false;
+    bool         execSeen     = false;   // --exec / -e encountered
     int appIdx = 1;
 
     while (appIdx < argc) {
         const wchar_t* arg = argv[appIdx];
+
+        // --exec / -e : everything that follows is the target command.
+        // Advance past the flag itself and break immediately so appIdx
+        // points at the executable.
+        if (_wcsicmp(arg, L"--exec") == 0 || _wcsicmp(arg, L"-e") == 0) {
+            execSeen = true;
+            ++appIdx;
+            break;
+        }
 
         if (_wcsicmp(arg, L"--verbose") == 0 || _wcsicmp(arg, L"-v") == 0) {
             g_Verbose = true;
@@ -358,8 +450,10 @@ int wmain(int argc, wchar_t* argv[]) {
         }
         else if (_wcsicmp(arg, L"--registry") == 0 || _wcsicmp(arg, L"-r") == 0) {
             regEnabled = true;
-            // Next non-dash arg is the optional hive path
-            if (appIdx + 1 < argc && argv[appIdx + 1][0] != L'-') {
+            // Consume the next token as the hive path ONLY if it looks like
+            // a registry path.  A bare name like "cmd" or "notepad" is not a
+            // hive and must not be stolen from the command.
+            if (appIdx + 1 < argc && LooksLikeRegPath(argv[appIdx + 1])) {
                 regPath = argv[++appIdx];
             } else {
                 regPath = L"HKCU\\VirtLauncher";
@@ -375,8 +469,10 @@ int wmain(int argc, wchar_t* argv[]) {
         }
         else if (_wcsicmp(arg, L"--filesystem") == 0 || _wcsicmp(arg, L"-f") == 0) {
             fsDirEnabled = true;
-            // Next non-dash arg is the optional folder
-            if (appIdx + 1 < argc && argv[appIdx + 1][0] != L'-') {
+            // Consume the next token as the folder ONLY if it looks like a
+            // filesystem path (drive letter, UNC, or relative dot-path).
+            // A bare name like "cmd" is not a path and must not be stolen.
+            if (appIdx + 1 < argc && LooksLikeFsPath(argv[appIdx + 1])) {
                 fsFolder = argv[++appIdx];
             }
             // else resolved to default (.\VIRTL) below
@@ -388,13 +484,16 @@ int wmain(int argc, wchar_t* argv[]) {
             return 0;
         }
         else {
-            break; // start of app exe + args
+            break; // start of app exe + args (no --exec, legacy style)
         }
         ++appIdx;
     }
 
     if (appIdx >= argc) {
-        PrintUsage(argv[0]);
+        if (execSeen)
+            wprintf(L"Error: --exec requires an application path.\n");
+        else
+            PrintUsage(argv[0]);
         return 1;
     }
 
