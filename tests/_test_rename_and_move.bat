@@ -20,6 +20,31 @@ call :prepare
 VirtLauncher64.exe -fs redirectstest.ini cmd /c "move c:\ccc\zzzV c:\ccc\zzzV2"
 call :check
 
+echo ___test hard link__________________________
+call :prepare
+VirtLauncher64.exe -fs redirectstest.ini cmd /c "mklink /H c:\ccc\zzzV2 c:\ccc\zzzV"
+call :check
+@rem pause
+
+echo ___test symlink__________________________
+call :prepare
+VirtLauncher64.exe -fs redirectstest.ini cmd /c "mklink c:\ccc\zzzV2 c:\ccc\zzzV"
+call :check
+@rem pause
+
+echo ___test symlink dir__________________________
+call :preparedir
+VirtLauncher64.exe -fs redirectstest.ini cmd /c "mklink /D c:\ccc\dirV2 c:\ccc\dirV"
+call :checkdir
+@rem pause
+
+echo ___test Junction__________________________
+call :preparedir
+VirtLauncher64.exe -fs redirectstest.ini cmd /c "mklink /J c:\ccc\dirV2 c:\ccc\dirV"
+call :checkdir
+
+
+
 @rem VirtLauncher64.exe  -reg HKEY_CURRENT_USER\VirtLauncher "F:\_bin\_code\_kickstart\____shortcuts\_appz\_Registry editors\RegistryFinder+++++++++\RegistryFinder64\RegistryFinder.exe"
 @rem VirtLauncher64.exe  -reg HKEY_CURRENT_USER\VirtLauncher D:\Windows\regedit.exe
 
@@ -31,6 +56,11 @@ exit /b
     rmdir /Q /S d:\vvv
     mkdir d:\vvv
     echo ddd>d:\vvv\zzzV
+exit /b
+
+:preparedir
+    rmdir /Q /S d:\vvv
+    mkdir d:\vvv\dirV
 exit /b
 
 :check
@@ -50,4 +80,19 @@ exit /b
     )
 exit /b
 
-
+:checkdir
+    if exist d:\vvv\dirV2 (
+        echo.
+        echo =========
+        echo   GOOD 
+        echo =========
+        echo.
+    ) else (
+        color 4F
+        echo.
+        echo =========
+        echo    BAD!!!!!!!!!!
+        echo =========
+        echo.
+    )
+exit /b

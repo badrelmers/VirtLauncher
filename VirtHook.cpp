@@ -1751,6 +1751,15 @@ static NTSTATUS NTAPI Hook_NtClose(HANDLE Handle) {
 // FILE SYSTEM HOOKS
 // ============================================================
 
+// FILE_OPEN_BY_FILE_ID: when set in CreateOptions/OpenOptions, ObjectName
+// contains a raw binary file ID (8 bytes NTFS, 16 bytes ReFS), NOT a path.
+// Path-based redirection cannot apply to such opens; we skip RedirectFileOA
+// entirely and pass through directly.  (Without this guard FromUStr would
+// silently interpret the binary ID as garbage wchar_t characters.)
+#ifndef FILE_OPEN_BY_FILE_ID
+#  define FILE_OPEN_BY_FILE_ID 0x00002000
+#endif
+
 // ---- NtCreateFile ----
 static NTSTATUS NTAPI Hook_NtCreateFile(
     PHANDLE               FileHandle,
@@ -1765,6 +1774,16 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
     PVOID                 EaBuffer,
     ULONG                 EaLength)
 {
+    // When FILE_OPEN_BY_FILE_ID is set the ObjectName field contains a
+    // binary file ID, not a string.  Pass through without touching it.
+    if (CreateOptions & FILE_OPEN_BY_FILE_ID) {
+        VL_DBG(L"Hook_NtCreateFile: FILE_OPEN_BY_FILE_ID - pass through");
+        return Real_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
+                                  IoStatusBlock, AllocationSize, FileAttributes,
+                                  ShareAccess, CreateDisposition, CreateOptions,
+                                  EaBuffer, EaLength);
+    }
+
     std::wstring ntPath, redPath;
     VL_UNICODE_STRING newName; VL_OBJECT_ATTRIBUTES newOa;
     bool redirected = RedirectFileOA(ObjectAttributes, newName, newOa, ntPath, redPath);
@@ -1794,6 +1813,13 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
     ULONG                 ShareAccess,
     ULONG                 OpenOptions)
 {
+    // Same FILE_OPEN_BY_FILE_ID guard as NtCreateFile.
+    if (OpenOptions & FILE_OPEN_BY_FILE_ID) {
+        VL_DBG(L"Hook_NtOpenFile: FILE_OPEN_BY_FILE_ID - pass through");
+        return Real_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
+                                IoStatusBlock, ShareAccess, OpenOptions);
+    }
+
     std::wstring ntPath, redPath;
     VL_UNICODE_STRING newName; VL_OBJECT_ATTRIBUTES newOa;
     bool redirected = RedirectFileOA(ObjectAttributes, newName, newOa, ntPath, redPath);
@@ -2003,17 +2029,29 @@ static NTSTATUS NTAPI Hook_NtQueryInformationByName(
                                           FileInformationClass);
 }
 
-// ---- NtSetInformationFile -- intercepts rename (FileRenameInformation) ----
+// ---- NtSetInformationFile -- intercepts rename and hardlink creation ----
 //
-// When an app renames a file, the new path is embedded inside a
-// FILE_RENAME_INFORMATION structure passed here. We redirect that target path
-// through ApplyFsRedirect so both ends of the rename land in the virtual store.
+// Both FILE_RENAME_INFORMATION and FILE_LINK_INFORMATION embed a target
+// path string in their payload.  The structures are IDENTICAL in memory
+// layout -- same field ordering and same arch-dependent offsets -- so the
+// same translation code handles all four classes.
+//
+//   FileRenameInformation   (10): rename target path must stay in virt store
+//   FileLinkInformation     (11): hardlink target path must stay in virt store
+//   FileRenameInformationEx (65): Windows 10 RS1+ extended rename
+//   FileLinkInformationEx   (72): Windows 10 RS1+ extended hardlink
+//
+// Without handling FileLinkInformation a sandboxed app can call
+// NtSetInformationFile(..., FileLinkInformation, ...) with a real host path
+// and create a hardlink that escapes the virtual file store entirely.
 //
 //   32-bit layout: offset 0 BOOLEAN, +4 HANDLE, +8 ULONG NameLen, +12 WCHAR Name[]
 //   64-bit layout: offset 0 BOOLEAN, +8 HANDLE, +16 ULONG NameLen, +20 WCHAR Name[]
 //
 #define FileRenameInformation   10
+#define FileLinkInformation     11
 #define FileRenameInformationEx 65   // Windows 10 RS1+
+#define FileLinkInformationEx   72   // Windows 10 RS1+
 
 #ifdef _WIN64
 #  define RENAME_INFO_HANDLE_OFFSET   8
@@ -2039,7 +2077,9 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
 
     if (!g_FsEnabled || IsReentrant() ||
         (FileInformationClass != FileRenameInformation &&
-         FileInformationClass != FileRenameInformationEx) ||
+         FileInformationClass != FileRenameInformationEx &&
+         FileInformationClass != FileLinkInformation    &&
+         FileInformationClass != FileLinkInformationEx) ||
         !FileInformation || Length < RENAME_INFO_MIN_SIZE)
     {
         return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
@@ -2057,17 +2097,23 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
 
     std::wstring origName((WCHAR*)(p + RENAME_INFO_NAME_OFFSET),
                            nameByteLen / sizeof(WCHAR));
-    VL_DBG(L"Hook_NtSetInformationFile: rename dest orig=%s", origName.c_str());
+
+    const bool isLink = (FileInformationClass == FileLinkInformation ||
+                         FileInformationClass == FileLinkInformationEx);
+    VL_DBG(L"Hook_NtSetInformationFile: %s dest orig=%s",
+           isLink ? L"hardlink" : L"rename", origName.c_str());
 
     std::wstring redName = ApplyFsRedirect(origName);
     if (redName == origName) {
-        VL_DBG(L"Hook_NtSetInformationFile: no redirect for rename dest");
+        VL_DBG(L"Hook_NtSetInformationFile: no redirect for %s dest",
+               isLink ? L"hardlink" : L"rename");
         return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
                                           FileInformation, Length,
                                           FileInformationClass);
     }
 
-    VL_DBG(L"Hook_NtSetInformationFile: rename dest -> %s", redName.c_str());
+    VL_DBG(L"Hook_NtSetInformationFile: %s dest -> %s",
+           isLink ? L"hardlink" : L"rename", redName.c_str());
     ULONG newNameBytes = (ULONG)(redName.size() * sizeof(WCHAR));
     ULONG newLength    = RENAME_INFO_NAME_OFFSET + newNameBytes;
     std::vector<BYTE> buf(newLength, 0);
