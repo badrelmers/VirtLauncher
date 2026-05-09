@@ -5,6 +5,13 @@ CD /D "%~dp0"
 cd ..\build
 echo C:\ccc=D:\vvv> redirectstest.ini
 
+echo ___test Junction__________________________
+call :preparedir
+VirtLauncher64.exe -fs redirectstest.ini cmd /c "mklink /J c:\ccc\dirV2 c:\ccc\dirV"
+call :checkdir
+
+pause
+
 echo ___test cygwin mv__________________________
 call :prepare
 VirtLauncher64.exe -fs redirectstest.ini "F:\_inst_\cygwin\bin\mv.exe" /cygdrive/c/ccc/zzzV /cygdrive/c/ccc/zzzV2

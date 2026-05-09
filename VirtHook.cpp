@@ -355,6 +355,10 @@ typedef NTSTATUS (NTAPI *PfnNtQueryInformationByName)
 typedef NTSTATUS (NTAPI *PfnNtSetInformationFile)
     (HANDLE, PVL_IO_STATUS_BLOCK, PVOID, ULONG, ULONG);
 
+typedef NTSTATUS (NTAPI *PfnNtFsControlFile)
+    (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
+     ULONG, PVOID, ULONG, PVOID, ULONG);
+
 // ---- Child process ----
 typedef BOOL (WINAPI *PfnCreateProcessW)
     (LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES,
@@ -412,6 +416,7 @@ static PfnNtQueryAttributesFile     Real_NtQueryAttributesFile;
 static PfnNtQueryFullAttributesFile Real_NtQueryFullAttributesFile;
 static PfnNtQueryInformationByName  Real_NtQueryInformationByName;
 static PfnNtSetInformationFile      Real_NtSetInformationFile;
+static PfnNtFsControlFile           Real_NtFsControlFile;
 
 // ----- Children -----
 static PfnCreateProcessW  Real_CreateProcessW;
@@ -1748,6 +1753,74 @@ static NTSTATUS NTAPI Hook_NtClose(HANDLE Handle) {
 }
 
 // ============================================================
+// Reparse Point Constants and Structures
+// (for NtFsControlFile FSCTL_SET_REPARSE_POINT interception)
+// ============================================================
+
+#define VL_FSCTL_SET_REPARSE_POINT  0x000900A4UL
+#define VL_IO_REPARSE_TAG_MOUNT_POINT 0xA0000003UL
+#define VL_IO_REPARSE_TAG_SYMLINK     0xA000000CUL
+#define VL_SYMLINK_FLAG_RELATIVE      0x00000001UL
+
+// REPARSE_DATA_BUFFER header size (ReparseTag+ReparseDataLength+Reserved)
+#define VL_REPARSE_HDR_SIZE       8
+// Fixed fields before PathBuffer for each tag type (bytes):
+//   SymLink:     SubstOff(2)+SubstLen(2)+PrtOff(2)+PrtLen(2)+Flags(4) = 12
+//   MountPoint:  SubstOff(2)+SubstLen(2)+PrtOff(2)+PrtLen(2)          =  8
+#define VL_SYMLINK_FIELDS_SIZE    12
+#define VL_MOUNTPOINT_FIELDS_SIZE  8
+
+// Mirrors REPARSE_DATA_BUFFER from ntifs.h.
+// No #pragma pack needed: all natural alignment works out.
+struct VL_REPARSE_DATA_BUFFER {
+    ULONG  ReparseTag;
+    USHORT ReparseDataLength; // byte count of the union below (not including the 8-byte header)
+    USHORT Reserved;
+    union {
+        struct {                        // IO_REPARSE_TAG_SYMLINK
+            USHORT SubstituteNameOffset;  // byte offset into PathBuffer
+            USHORT SubstituteNameLength;  // byte length
+            USHORT PrintNameOffset;
+            USHORT PrintNameLength;
+            ULONG  Flags;               // VL_SYMLINK_FLAG_RELATIVE if relative
+            WCHAR  PathBuffer[1];       // SubstituteName then PrintName (not null-terminated)
+        } SymLink;
+        struct {                        // IO_REPARSE_TAG_MOUNT_POINT (junctions)
+            USHORT SubstituteNameOffset;
+            USHORT SubstituteNameLength;
+            USHORT PrintNameOffset;
+            USHORT PrintNameLength;
+            WCHAR  PathBuffer[1];
+        } MountPoint;
+    };
+};
+
+// Redirect a path that may be:
+//   - NT form:    \??\C:\ccc\file  (redirect directly)
+//   - Win32 form: C:\ccc\file       (convert to NT, redirect, strip \??\ back)
+// Returns the input unchanged if no redirect matches.
+static std::wstring RedirectSymlinkPath(const std::wstring& path) {
+    if (path.empty()) return path;
+
+    // Try as-is (covers \??\ and \Device\ prefixed NT paths)
+    std::wstring red = ApplyFsRedirect(path);
+    if (red != path) return red;
+
+    // Try as a Win32-style path (e.g. C:\ccc\...)
+    std::wstring nt = Win32ToNtPath(path);
+    if (nt != path) {
+        red = ApplyFsRedirect(nt);
+        if (red != nt) {
+            // Strip the \??\ we prepended if the original didn't have it
+            if (StartsWithI(red, L"\\??\\") && !StartsWithI(path, L"\\??\\"))
+                return red.substr(4);
+            return red;
+        }
+    }
+    return path;
+}
+
+// ============================================================
 // FILE SYSTEM HOOKS
 // ============================================================
 
@@ -2027,6 +2100,171 @@ static NTSTATUS NTAPI Hook_NtQueryInformationByName(
     return Real_NtQueryInformationByName(&newOa, IoStatusBlock,
                                           FileInformation, Length,
                                           FileInformationClass);
+}
+
+// ---- NtFsControlFile -- intercepts FSCTL_SET_REPARSE_POINT ----
+//
+// Symbolic links and junctions store their target path inside NTFS reparse
+// point data that is written by NtFsControlFile(FSCTL_SET_REPARSE_POINT).
+// The NT kernel resolves these reparse paths *in kernel mode*, completely
+// bypassing user-mode hooks.  Therefore, if the embedded target path still
+// refers to the original (non-virtualized) location (e.g. \??\C:\ccc\file)
+// the kernel will fail to follow the link because C:\ccc doesn't exist on
+// real disk.
+//
+// This hook intercepts the FSCTL call, extracts the SubstituteName (used by
+// the kernel for resolution) and the PrintName (display only) from the
+// REPARSE_DATA_BUFFER, applies the same FS redirections that NtCreateFile
+// uses, rebuilds the buffer with the redirected paths, and forwards it.
+//
+// Covered reparse tags:
+//   IO_REPARSE_TAG_SYMLINK (0xA000000C): mklink / CreateSymbolicLinkW
+//   IO_REPARSE_TAG_MOUNT_POINT (0xA0000003): mklink /J (junction points)
+//
+// Relative symlinks (SYMLINK_FLAG_RELATIVE) are skipped -- their target is
+// relative to the link's own parent directory and requires no prefix redirect.
+static NTSTATUS NTAPI Hook_NtFsControlFile(
+    HANDLE              FileHandle,
+    HANDLE              Event,
+    VL_PIO_APC_ROUTINE  ApcRoutine,
+    PVOID               ApcContext,
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    ULONG               FsControlCode,
+    PVOID               InputBuffer,
+    ULONG               InputBufferLength,
+    PVOID               OutputBuffer,
+    ULONG               OutputBufferLength)
+{
+    // Only intercept FSCTL_SET_REPARSE_POINT when FS virtualisation is active
+    if (!g_FsEnabled ||
+        FsControlCode != VL_FSCTL_SET_REPARSE_POINT ||
+        !InputBuffer ||
+        InputBufferLength < VL_REPARSE_HDR_SIZE)
+    {
+        return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                     IoStatusBlock, FsControlCode,
+                                     InputBuffer, InputBufferLength,
+                                     OutputBuffer, OutputBufferLength);
+    }
+
+    VL_REPARSE_DATA_BUFFER* rdb = (VL_REPARSE_DATA_BUFFER*)InputBuffer;
+
+    // ---- Symbolic link ----
+    if (rdb->ReparseTag == VL_IO_REPARSE_TAG_SYMLINK) {
+
+        // Relative symlinks use a path relative to the link's own directory;
+        // prefix-based redirection doesn't apply to them.
+        if (rdb->SymLink.Flags & VL_SYMLINK_FLAG_RELATIVE) {
+            VL_DBG(L"Hook_NtFsControlFile SYMLINK: relative -- pass through");
+            return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                         IoStatusBlock, FsControlCode,
+                                         InputBuffer, InputBufferLength,
+                                         OutputBuffer, OutputBufferLength);
+        }
+
+        WCHAR* pathBuf = rdb->SymLink.PathBuffer;
+        std::wstring subst(pathBuf + rdb->SymLink.SubstituteNameOffset / sizeof(WCHAR),
+                            rdb->SymLink.SubstituteNameLength / sizeof(WCHAR));
+        std::wstring print(pathBuf + rdb->SymLink.PrintNameOffset / sizeof(WCHAR),
+                            rdb->SymLink.PrintNameLength / sizeof(WCHAR));
+
+        std::wstring redSubst = RedirectSymlinkPath(subst);
+        std::wstring redPrint = RedirectSymlinkPath(print);
+
+        VL_DBG(L"Hook_NtFsControlFile SYMLINK: subst=%s->%s  print=%s->%s",
+               subst.c_str(), redSubst.c_str(), print.c_str(), redPrint.c_str());
+
+        if (redSubst == subst && redPrint == print) {
+            // Nothing to redirect
+            return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                         IoStatusBlock, FsControlCode,
+                                         InputBuffer, InputBufferLength,
+                                         OutputBuffer, OutputBufferLength);
+        }
+
+        // Rebuild the reparse buffer with redirected paths.
+        // Layout: [8-byte header][12-byte symlink fields][SubstituteName][PrintName]
+        USHORT newSubBytes      = (USHORT)(redSubst.size() * sizeof(WCHAR));
+        USHORT newPrtBytes      = (USHORT)(redPrint.size() * sizeof(WCHAR));
+        USHORT newReparseDataLen = (USHORT)(VL_SYMLINK_FIELDS_SIZE + newSubBytes + newPrtBytes);
+        ULONG  newBufSize       = VL_REPARSE_HDR_SIZE + newReparseDataLen;
+
+        std::vector<BYTE> newBuf(newBufSize, 0);
+        VL_REPARSE_DATA_BUFFER* n = (VL_REPARSE_DATA_BUFFER*)newBuf.data();
+        n->ReparseTag                   = rdb->ReparseTag;
+        n->ReparseDataLength            = newReparseDataLen;
+        n->Reserved                     = 0;
+        n->SymLink.SubstituteNameOffset = 0;
+        n->SymLink.SubstituteNameLength = newSubBytes;
+        n->SymLink.PrintNameOffset      = newSubBytes;   // immediately after SubstituteName
+        n->SymLink.PrintNameLength      = newPrtBytes;
+        n->SymLink.Flags                = rdb->SymLink.Flags;
+        memcpy(n->SymLink.PathBuffer,
+               redSubst.c_str(), newSubBytes);
+        memcpy((BYTE*)n->SymLink.PathBuffer + newSubBytes,
+               redPrint.c_str(), newPrtBytes);
+
+        VL_DBG(L"Hook_NtFsControlFile SYMLINK: rebuilt buffer %u->%u bytes", InputBufferLength, newBufSize);
+        return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                     IoStatusBlock, FsControlCode,
+                                     newBuf.data(), newBufSize,
+                                     OutputBuffer, OutputBufferLength);
+    }
+
+    // ---- Junction / mount point ----
+    if (rdb->ReparseTag == VL_IO_REPARSE_TAG_MOUNT_POINT) {
+
+        WCHAR* pathBuf = rdb->MountPoint.PathBuffer;
+        std::wstring subst(pathBuf + rdb->MountPoint.SubstituteNameOffset / sizeof(WCHAR),
+                            rdb->MountPoint.SubstituteNameLength / sizeof(WCHAR));
+        std::wstring print(pathBuf + rdb->MountPoint.PrintNameOffset / sizeof(WCHAR),
+                            rdb->MountPoint.PrintNameLength / sizeof(WCHAR));
+
+        std::wstring redSubst = RedirectSymlinkPath(subst);
+        std::wstring redPrint = RedirectSymlinkPath(print);
+
+        VL_DBG(L"Hook_NtFsControlFile JUNCTION: subst=%s->%s  print=%s->%s",
+               subst.c_str(), redSubst.c_str(), print.c_str(), redPrint.c_str());
+
+        if (redSubst == subst && redPrint == print) {
+            return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                         IoStatusBlock, FsControlCode,
+                                         InputBuffer, InputBufferLength,
+                                         OutputBuffer, OutputBufferLength);
+        }
+
+        // Rebuild: [8-byte header][8-byte mountpoint fields][SubstituteName][PrintName]
+        USHORT newSubBytes       = (USHORT)(redSubst.size() * sizeof(WCHAR));
+        USHORT newPrtBytes       = (USHORT)(redPrint.size() * sizeof(WCHAR));
+        USHORT newReparseDataLen = (USHORT)(VL_MOUNTPOINT_FIELDS_SIZE + newSubBytes + newPrtBytes);
+        ULONG  newBufSize        = VL_REPARSE_HDR_SIZE + newReparseDataLen;
+
+        std::vector<BYTE> newBuf(newBufSize, 0);
+        VL_REPARSE_DATA_BUFFER* n = (VL_REPARSE_DATA_BUFFER*)newBuf.data();
+        n->ReparseTag                       = rdb->ReparseTag;
+        n->ReparseDataLength                = newReparseDataLen;
+        n->Reserved                         = 0;
+        n->MountPoint.SubstituteNameOffset  = 0;
+        n->MountPoint.SubstituteNameLength  = newSubBytes;
+        n->MountPoint.PrintNameOffset       = newSubBytes;
+        n->MountPoint.PrintNameLength       = newPrtBytes;
+        memcpy(n->MountPoint.PathBuffer,
+               redSubst.c_str(), newSubBytes);
+        memcpy((BYTE*)n->MountPoint.PathBuffer + newSubBytes,
+               redPrint.c_str(), newPrtBytes);
+
+        VL_DBG(L"Hook_NtFsControlFile JUNCTION: rebuilt buffer %u->%u bytes", InputBufferLength, newBufSize);
+        return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                     IoStatusBlock, FsControlCode,
+                                     newBuf.data(), newBufSize,
+                                     OutputBuffer, OutputBufferLength);
+    }
+
+    // Unknown reparse tag -- pass through untouched
+    return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                 IoStatusBlock, FsControlCode,
+                                 InputBuffer, InputBufferLength,
+                                 OutputBuffer, OutputBufferLength);
 }
 
 // ---- NtSetInformationFile -- intercepts rename and hardlink creation ----
@@ -2369,11 +2607,13 @@ static void InstallHooks() {
         VL_GETPROC(ntdll, NtQueryFullAttributesFile);
         VL_GETPROC(ntdll, NtQueryInformationByName);   // Win8+ may be NULL on XP
         VL_GETPROC(ntdll, NtSetInformationFile);
+        VL_GETPROC(ntdll, NtFsControlFile);
 
         VL_DBG(L"InstallHooks FS: NtCreateFile=%p NtOpenFile=%p NtDeleteFile=%p"
-               L" NtSetInformationFile=%p",
+               L" NtSetInformationFile=%p NtFsControlFile=%p",
                (void*)Real_NtCreateFile, (void*)Real_NtOpenFile,
-               (void*)Real_NtDeleteFile, (void*)Real_NtSetInformationFile);
+               (void*)Real_NtDeleteFile, (void*)Real_NtSetInformationFile,
+               (void*)Real_NtFsControlFile);
     }
 
     // ---------------------------------------------------------------
@@ -2460,6 +2700,7 @@ static void InstallHooks() {
         if (Real_NtQueryFullAttributesFile) VL_ATTACH(NtQueryFullAttributesFile);
         if (Real_NtQueryInformationByName)  VL_ATTACH(NtQueryInformationByName);
         if (Real_NtSetInformationFile)    VL_ATTACH(NtSetInformationFile);
+        if (Real_NtFsControlFile)         VL_ATTACH(NtFsControlFile);
     }
 
     LONG commitResult = DetourTransactionCommit();
@@ -2517,6 +2758,7 @@ static void UninstallHooks() {
         if (Real_NtQueryFullAttributesFile) VL_DETACH(NtQueryFullAttributesFile);
         if (Real_NtQueryInformationByName)  VL_DETACH(NtQueryInformationByName);
         if (Real_NtSetInformationFile)    VL_DETACH(NtSetInformationFile);
+        if (Real_NtFsControlFile)         VL_DETACH(NtFsControlFile);
     }
 
     DetourTransactionCommit();
