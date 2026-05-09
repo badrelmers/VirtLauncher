@@ -2,15 +2,13 @@
 SETLOCAL
 CD /D "%~dp0"
 
+REM check admin
+fltmc >nul 2>&1 || ( color 4F & echo. & echo RUNME AS ADMIN & echo. & pause & exit )
+
 cd ..\build
 echo C:\ccc=D:\vvv> redirectstest.ini
 
-echo ___test Junction__________________________
-call :preparedir
-VirtLauncher64.exe -fs redirectstest.ini cmd /c "mklink /J c:\ccc\dirV2 c:\ccc\dirV"
-call :checkdir
 
-pause
 
 echo ___test cygwin mv__________________________
 call :prepare
