@@ -53,9 +53,13 @@
 //       All interception happens at the ntdll layer.
 //
 // Config via environment variables set by VirtLauncher.exe:
-//   VIRTLAUNCHER_REG = NT reg base  e.g. \Registry\User\SID\VirtApp
-//   VIRTLAUNCHER_FS  = path to FS redirect config file
-//   VIRTLAUNCHER_DLL = absolute path to this DLL (for child injection)
+//   VIRTLAUNCHER_REG   = NT reg base  e.g. \Registry\User\SID\VirtApp
+//   VIRTLAUNCHER_FS    = path to FS redirect config file   (--config)
+//   VIRTLAUNCHER_FSDIR = Win32 path to virtual store root  (--filesystem)
+//   VIRTLAUNCHER_DLL   = absolute path to this DLL (for child injection)
+//
+// User-settable flags propagated by VirtLauncher.exe:
+//   VLAUNCHER_DEBUG=1  = enable OutputDebugString logging (--debug)
 //
 // Build x86  (VS2010 x86 command prompt):
 //   cl /nologo /EHsc /O2 /MT /W3 /LD VirtHook.cpp
@@ -89,11 +93,22 @@
 // ============================================================
 // Debug logging -- output visible in Sysinternals DebugView
 // (run DebugView as admin before launching VirtLauncher).
-// Set VL_DEBUG 0 to disable for release builds.
+//
+// Controlled at runtime by the VLAUNCHER_DEBUG env var, which
+// VirtLauncher.exe sets when --debug / -d is passed or when
+// VLAUNCHER_DEBUG=1 is present in the environment.
+//
+// VL_DEBUG=1 compiles the logging code in; g_DebugEnabled guards
+// actual output so there is zero overhead when debugging is off.
 // ============================================================
 #define VL_DEBUG 1
+
+// Initialized to false; set to true by LoadConfig() when VLAUNCHER_DEBUG=1.
+static bool g_DebugEnabled = false;
+
 #if VL_DEBUG
 static void VL_DBG(const wchar_t* fmt, ...) {
+    if (!g_DebugEnabled) return;
     wchar_t buf[1024];
     va_list va;
     va_start(va, fmt);
@@ -440,8 +455,16 @@ static bool g_FsEnabled  = false;
 static std::wstring g_VirtNtBase;
 static std::wstring g_RealNtBase;
 
-// FS redirections: vector of (nt_from_prefix, nt_to_prefix)
+// FS redirections from --config INI: vector of (nt_from_prefix, nt_to_prefix).
+// Checked first; takes precedence over g_FsDirNtBase catch-all below.
 static std::vector< std::pair<std::wstring,std::wstring> > g_FsRedirects;
+
+// FS catch-all virtual store root from --filesystem (VIRTLAUNCHER_FSDIR).
+// NT form of the folder, e.g. \??\D:\sandbox  (no trailing backslash).
+// When set, any drive-letter path not matched by g_FsRedirects AND not
+// already inside g_FsDirNtBase is redirected:
+//   \??\X:\rest  ->  \??\<g_FsDirNtBase>\X\rest
+static std::wstring g_FsDirNtBase;
 
 // Tracked virtual registry handles
 struct VirtKeyEntry {
@@ -694,8 +717,14 @@ static std::wstring Win32ToNtPath(const std::wstring& win32) {
 }
 
 // Apply FS redirections to an NT path.
+// Priority order:
+//   1. Explicit rules from --config INI (g_FsRedirects), checked in order.
+//   2. FSDIR catch-all (g_FsDirNtBase) for any drive-letter path not yet
+//      matched and not already located inside the virtual store itself.
 static std::wstring ApplyFsRedirect(const std::wstring& ntPath) {
     if (!g_FsEnabled) return ntPath;
+
+    // --- 1. Config-based rules (take precedence) ---
     for (size_t i = 0; i < g_FsRedirects.size(); ++i) {
         const std::wstring& from = g_FsRedirects[i].first;
         const std::wstring& to   = g_FsRedirects[i].second;
@@ -703,6 +732,26 @@ static std::wstring ApplyFsRedirect(const std::wstring& ntPath) {
             return to + ntPath.substr(from.size());
         }
     }
+
+    // --- 2. FSDIR catch-all: \??\X:[\rest]  ->  \??\<FsDirNtBase>\X[\rest] ---
+    // Guard: must have an FSDIR configured, path must be a Win32 drive-letter NT
+    // path (\??\X:\ or \??\X:), and the path must NOT already be inside the
+    // virtual store (avoids infinite redirect loops).
+    if (!g_FsDirNtBase.empty() &&
+        ntPath.size() >= 6 &&
+        StartsWithI(ntPath, L"\\??\\") &&
+        iswalpha(ntPath[4]) && ntPath[5] == L':' &&
+        (ntPath.size() == 6 || ntPath[6] == L'\\') &&
+        !StartsWithI(ntPath, g_FsDirNtBase))
+    {
+        // \??\X:\rest  -> \??\<FsDirNtBase>\X\rest
+        //   ntPath[4]      = drive letter (e.g. 'C')
+        //   ntPath.substr(6) = \rest  (includes leading backslash, or empty)
+        wchar_t driveStr[3] = { L'\\', towupper(ntPath[4]), L'\0' };
+        std::wstring rest = (ntPath.size() > 6) ? ntPath.substr(6) : L"";
+        return g_FsDirNtBase + driveStr + rest;
+    }
+
     return ntPath;
 }
 
@@ -711,12 +760,29 @@ static std::wstring ApplyFsRedirect(const std::wstring& ntPath) {
 // reparse point data back out of NTFS so tools see the virtualized path.
 static std::wstring ReverseApplyFsRedirect(const std::wstring& ntPath) {
     if (!g_FsEnabled) return ntPath;
+
+    // --- 1. Reverse config-based rules ---
     for (size_t i = 0; i < g_FsRedirects.size(); ++i) {
         const std::wstring& from = g_FsRedirects[i].first;   // logical (original)
         const std::wstring& to   = g_FsRedirects[i].second;  // physical (store)
         if (StartsWithI(ntPath, to))
             return from + ntPath.substr(to.size());
     }
+
+    // --- 2. Reverse FSDIR catch-all ---
+    // Physical path: \??\<FsDirNtBase>\X\rest
+    //   -> logical: \??\X:\rest
+    if (!g_FsDirNtBase.empty() && StartsWithI(ntPath, g_FsDirNtBase)) {
+        std::wstring tail = ntPath.substr(g_FsDirNtBase.size());
+        // tail should be \X\rest  (backslash + single drive letter + rest)
+        if (tail.size() >= 2 && tail[0] == L'\\' && iswalpha(tail[1])) {
+            wchar_t drive = towupper(tail[1]);
+            // tail.substr(2) is either empty or starts with backslash (\rest)
+            std::wstring rest = (tail.size() > 2) ? tail.substr(2) : L"";
+            return std::wstring(L"\\??\\") + drive + L':' + rest;
+        }
+    }
+
     return ntPath;
 }
 
@@ -833,6 +899,13 @@ static void LoadFsConfig(const std::wstring& path) {
 static void LoadConfig() {
     wchar_t buf[2048] = {};
 
+    // ---- Read the debug flag FIRST so subsequent VL_DBG calls work ----
+    if (GetEnvironmentVariableW(L"VLAUNCHER_DEBUG", buf, 2047) > 0)
+        g_DebugEnabled = (_wcsicmp(buf, L"1")    == 0 ||
+                          _wcsicmp(buf, L"true") == 0 ||
+                          _wcsicmp(buf, L"yes")  == 0);
+
+    // ---- Registry virtualisation (VIRTLAUNCHER_REG) ----
     if (GetEnvironmentVariableW(L"VIRTLAUNCHER_REG", buf, 2047) > 0) {
         g_VirtNtBase = buf;
         size_t sl = g_VirtNtBase.rfind(L'\\');
@@ -842,12 +915,31 @@ static void LoadConfig() {
             g_RegEnabled = true;
     }
 
+    // ---- FS redirect config file (VIRTLAUNCHER_FS, from --config) ----
     if (GetEnvironmentVariableW(L"VIRTLAUNCHER_FS", buf, 2047) > 0) {
         LoadFsConfig(buf);
         if (!g_FsRedirects.empty())
             g_FsEnabled = true;
     }
 
+    // ---- FS virtual store folder (VIRTLAUNCHER_FSDIR, from --filesystem) ----
+    // VirtLauncher.exe sets this to the absolute Win32 path of the virtual store
+    // root.  We convert it to an NT path and use it as a catch-all redirect for
+    // any drive-letter path not already handled by the --config rules.
+    if (GetEnvironmentVariableW(L"VIRTLAUNCHER_FSDIR", buf, 2047) > 0 && buf[0]) {
+        // Convert Win32 path to NT path  e.g.  D:\sandbox  ->  \??\D:\sandbox
+        std::wstring fsdir = buf;
+        if (fsdir.size() >= 2 && iswalpha(fsdir[0]) && fsdir[1] == L':')
+            fsdir = L"\\??\\" + fsdir;
+        // Strip trailing backslash (keep \??\ prefix safe)
+        while (fsdir.size() > 4 && fsdir.back() == L'\\')
+            fsdir.resize(fsdir.size() - 1);
+        g_FsDirNtBase = fsdir;
+        g_FsEnabled   = true;
+        VL_DBG(L"LoadConfig: FsDirNtBase=%s", g_FsDirNtBase.c_str());
+    }
+
+    // ---- DLL paths for child-process injection ----
     GetEnvironmentVariableA("VIRTLAUNCHER_DLL",   g_DllPathA,   MAX_PATH);
     GetEnvironmentVariableA("VIRTLAUNCHER_DLL32", g_DllPathA32, MAX_PATH);
     GetEnvironmentVariableA("VIRTLAUNCHER_DLL64", g_DllPathA64, MAX_PATH);
@@ -857,11 +949,12 @@ static void LoadConfig() {
     if (!g_DllPathA64[0] && g_DllPathA[0])
         strncpy(g_DllPathA64, g_DllPathA, MAX_PATH - 1);
 
+    VL_DBG(L"LoadConfig: DebugEnabled=%d", (int)g_DebugEnabled);
     VL_DBG(L"LoadConfig: RegEnabled=%d  VirtNtBase=%s",
            (int)g_RegEnabled, g_VirtNtBase.c_str());
     VL_DBG(L"LoadConfig:             RealNtBase=%s", g_RealNtBase.c_str());
-    VL_DBG(L"LoadConfig: FsEnabled=%d  redirects=%u",
-           (int)g_FsEnabled, (unsigned)g_FsRedirects.size());
+    VL_DBG(L"LoadConfig: FsEnabled=%d  redirects=%u  FsDirNtBase=%s",
+           (int)g_FsEnabled, (unsigned)g_FsRedirects.size(), g_FsDirNtBase.c_str());
 }
 
 // ============================================================

@@ -5,6 +5,13 @@ CD /D "%~dp0"
 REM check admin
 fltmc >nul 2>&1 || ( color 4F & echo. & echo RUNME AS ADMIN & echo. & pause & exit )
 
+::_______________________________________________
+REM set VLAUNCHER_VERBOSE=true
+REM set VLAUNCHER_DEBUG=true
+
+
+::_______________________________________________
+
 :: ============================================================
 ::  VirtLauncher Comprehensive Redirection Test Suite  (v2)
 ::
@@ -99,7 +106,7 @@ echo ___________________
 echo @echo off>"%TEST_DIR%\pl_s1_write.bat"
 echo echo VirtualContent^>"%SRC_DIR%\write.txt">>"%TEST_DIR%\pl_s1_write.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s1_write.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s1_write.bat"
 
 if exist "%DST_DIR%\write.txt" (
     if not exist "%SRC_DIR%\write.txt" (
@@ -118,7 +125,7 @@ echo @echo off>"%TEST_DIR%\pl_s1_read.bat"
 echo findstr "HiddenContent" "%SRC_DIR%\read.txt" ^>nul>>"%TEST_DIR%\pl_s1_read.bat"
 echo exit /b %%ERRORLEVEL%%>>"%TEST_DIR%\pl_s1_read.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s1_read.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s1_read.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "1.2  FS Read: dst file readable via logical src path"
 ) else (
@@ -131,7 +138,7 @@ echo RenameMe>"%DST_DIR%\ren_orig.txt"
 echo @echo off>"%TEST_DIR%\pl_s1_ren.bat"
 echo rename "%SRC_DIR%\ren_orig.txt" ren_new.txt>>"%TEST_DIR%\pl_s1_ren.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s1_ren.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s1_ren.bat"
 if exist "%DST_DIR%\ren_new.txt" (
     call :Pass "1.3  FS Rename: file renamed inside dst"
 ) else (
@@ -144,7 +151,7 @@ echo DeleteMe>"%DST_DIR%\del.txt"
 echo @echo off>"%TEST_DIR%\pl_s1_del.bat"
 echo del "%SRC_DIR%\del.txt">>"%TEST_DIR%\pl_s1_del.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s1_del.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s1_del.bat"
 if not exist "%DST_DIR%\del.txt" (
     call :Pass "1.4  FS Delete: file deleted from dst"
 ) else (
@@ -168,7 +175,7 @@ echo CopySource>"%DST_DIR%\copy_orig.txt"
 echo @echo off>"%TEST_DIR%\pl_s2_copy.bat"
 echo copy "%SRC_DIR%\copy_orig.txt" "%SRC_DIR%\copy_new.txt" ^>nul>>"%TEST_DIR%\pl_s2_copy.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s2_copy.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s2_copy.bat"
 if exist "%DST_DIR%\copy_new.txt" (
     if not exist "%SRC_DIR%\copy_new.txt" (
         call :Pass "2.1  FS Copy: copied file in dst, not leaked to src"
@@ -186,7 +193,7 @@ echo MoveContent>"%DST_DIR%\move_me.txt"
 echo @echo off>"%TEST_DIR%\pl_s2_move.bat"
 echo move "%SRC_DIR%\move_me.txt" "%SRC_DIR%\subdir\move_me.txt" ^>nul>>"%TEST_DIR%\pl_s2_move.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s2_move.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s2_move.bat"
 if exist "%DST_DIR%\subdir\move_me.txt" (
     if not exist "%DST_DIR%\move_me.txt" (
         call :Pass "2.2  FS Move cross-dir: landed in dst\subdir, removed from dst root"
@@ -202,7 +209,7 @@ echo ___________________
 echo @echo off>"%TEST_DIR%\pl_s2_mkdir.bat"
 echo mkdir "%SRC_DIR%\newsubdir">>"%TEST_DIR%\pl_s2_mkdir.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s2_mkdir.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s2_mkdir.bat"
 if exist "%DST_DIR%\newsubdir\" (
     if not exist "%SRC_DIR%\newsubdir\" (
         call :Pass "2.3  FS Mkdir: directory created in dst, not src"
@@ -219,7 +226,7 @@ echo ExistCheck>"%DST_DIR%\exist_check.txt"
 echo @echo off>"%TEST_DIR%\pl_s2_exist.bat"
 echo if exist "%SRC_DIR%\exist_check.txt" (exit /b 0) else (exit /b 1)>>"%TEST_DIR%\pl_s2_exist.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s2_exist.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s2_exist.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "2.4  FS Exist check: dst file visible via src path (NtQueryAttributesFile)"
 ) else (
@@ -233,7 +240,7 @@ echo @echo off>"%TEST_DIR%\pl_s2_dir.bat"
 echo dir "%SRC_DIR%" /b ^| findstr /i "listed.txt" ^>nul>>"%TEST_DIR%\pl_s2_dir.bat"
 echo exit /b %%ERRORLEVEL%%>>"%TEST_DIR%\pl_s2_dir.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s2_dir.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s2_dir.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "2.5  FS Dir listing: dst contents visible when enumerating src path"
 ) else (
@@ -246,7 +253,7 @@ echo LineOne>"%DST_DIR%\append.txt"
 echo @echo off>"%TEST_DIR%\pl_s2_append.bat"
 echo echo LineTwo^>^>"%SRC_DIR%\append.txt">>"%TEST_DIR%\pl_s2_append.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s2_append.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s2_append.bat"
 findstr "LineTwo" "%DST_DIR%\append.txt" >nul 2>&1
 if !ERRORLEVEL! EQU 0 (
     call :Pass "2.6  FS Append write: appended content in dst file, not src"
@@ -274,7 +281,7 @@ echo AttrTest>"%DST_DIR%\attr_hidden.txt"
 echo @echo off>"%TEST_DIR%\pl_s3_sethidden.bat"
 echo attrib +H "%SRC_DIR%\attr_hidden.txt">>"%TEST_DIR%\pl_s3_sethidden.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s3_sethidden.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s3_sethidden.bat"
 attrib "%DST_DIR%\attr_hidden.txt" | findstr /R "H " >nul 2>&1
 if !ERRORLEVEL! EQU 0 (
     call :Pass "3.1  Set Hidden: H attribute applied to dst file"
@@ -289,7 +296,7 @@ echo @echo off>"%TEST_DIR%\pl_s3_readhidden.bat"
 echo attrib "%SRC_DIR%\attr_hidden.txt" ^| findstr /R "H " ^>nul>>"%TEST_DIR%\pl_s3_readhidden.bat"
 echo exit /b %%ERRORLEVEL%%>>"%TEST_DIR%\pl_s3_readhidden.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s3_readhidden.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s3_readhidden.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "3.2  Read Attributes: H attribute readable via src logical path"
 ) else (
@@ -302,7 +309,7 @@ echo ReadOnlyTest>"%DST_DIR%\attr_ro.txt"
 echo @echo off>"%TEST_DIR%\pl_s3_setro.bat"
 echo attrib +R "%SRC_DIR%\attr_ro.txt">>"%TEST_DIR%\pl_s3_setro.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s3_setro.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s3_setro.bat"
 attrib "%DST_DIR%\attr_ro.txt" | findstr /R "R " >nul 2>&1
 if !ERRORLEVEL! EQU 0 (
     call :Pass "3.3  Set Read-Only: R attribute applied to dst file"
@@ -316,7 +323,7 @@ echo ___________________
 echo @echo off>"%TEST_DIR%\pl_s3_clrattr.bat"
 echo attrib -H "%SRC_DIR%\attr_hidden.txt">>"%TEST_DIR%\pl_s3_clrattr.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s3_clrattr.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s3_clrattr.bat"
 attrib "%DST_DIR%\attr_hidden.txt" | findstr /R "H " >nul 2>&1
 if !ERRORLEVEL! NEQ 0 (
     call :Pass "3.4  Clear Attribute: H attribute removed from dst file via src path"
@@ -338,8 +345,6 @@ if !ERRORLEVEL! NEQ 0 (
 echo.
 echo ============================================================
 echo  [SECTION 4]  Hard Link Tests
-echo  NOTE: Directory hard links are a kernel-level NTFS
-echo        restriction and are always skipped.
 echo ============================================================
 
 :: 4.1  Hard link Write -- app creates hard link via src path; link lands in dst
@@ -348,7 +353,7 @@ echo HardLinkOriginal>"%DST_DIR%\hl_orig.txt"
 echo @echo off>"%TEST_DIR%\pl_s4_hlwrite.bat"
 echo mklink /H "%SRC_DIR%\hl_link.txt" "%SRC_DIR%\hl_orig.txt">>"%TEST_DIR%\pl_s4_hlwrite.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s4_hlwrite.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s4_hlwrite.bat"
 if exist "%DST_DIR%\hl_link.txt" (
     if not exist "%SRC_DIR%\hl_link.txt" (
         call :Pass "4.1  Hard Link File Write: link created in dst, not src"
@@ -367,7 +372,7 @@ if exist "%DST_DIR%\hl_read_link.txt" (
     echo @echo off>"%TEST_DIR%\pl_s4_hlread.bat"
     echo findstr "HardLinkReadContent" "%SRC_DIR%\hl_read_link.txt" ^>nul>>"%TEST_DIR%\pl_s4_hlread.bat"
     echo exit /b %%ERRORLEVEL%%>>"%TEST_DIR%\pl_s4_hlread.bat"
-    %LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s4_hlread.bat"
+    %LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s4_hlread.bat"
     if !ERRORLEVEL! EQU 0 (
         call :Pass "4.2  Hard Link File Read: content readable via src path"
     ) else (
@@ -386,7 +391,7 @@ mklink /H "%DST_DIR%\hl_prop_link.txt" "%DST_DIR%\hl_prop_orig.txt" >nul 2>&1
 echo @echo off>"%TEST_DIR%\pl_s4_hlprop.bat"
 echo echo ModifiedViaLink^>"%SRC_DIR%\hl_prop_link.txt">>"%TEST_DIR%\pl_s4_hlprop.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s4_hlprop.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s4_hlprop.bat"
 findstr "ModifiedViaLink" "%DST_DIR%\hl_prop_orig.txt" >nul 2>&1
 if !ERRORLEVEL! EQU 0 (
     call :Pass "4.3  Hard Link Propagation: write via src link path reflected in dst original"
@@ -428,7 +433,7 @@ echo SymlinkTarget>"%DST_DIR%\sym_tgt.txt"
 echo @echo off>"%TEST_DIR%\pl_s5_symwrite.bat"
 echo mklink "%SRC_DIR%\sym_link.txt" "%SRC_DIR%\sym_tgt.txt">>"%TEST_DIR%\pl_s5_symwrite.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s5_symwrite.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s5_symwrite.bat"
 if exist "%DST_DIR%\sym_link.txt" (
     if not exist "%SRC_DIR%\sym_link.txt" (
         call :Pass "5.1  Symlink File Write: symlink created in dst, not src"
@@ -448,7 +453,7 @@ echo @echo off>"%TEST_DIR%\pl_s5_symread.bat"
 echo findstr "SymReadTarget" "%SRC_DIR%\sym_read_lnk.txt" ^>nul>>"%TEST_DIR%\pl_s5_symread.bat"
 echo exit /b %%ERRORLEVEL%%>>"%TEST_DIR%\pl_s5_symread.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s5_symread.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s5_symread.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "5.2  Symlink File Read: target content readable via src\symlink path"
 ) else (
@@ -464,7 +469,7 @@ echo @echo off>"%TEST_DIR%\pl_s5_symlinkio.bat"
 echo findstr "SymlinkTarget" "%SRC_DIR%\sym_link.txt" ^>nul>>"%TEST_DIR%\pl_s5_symlinkio.bat"
 echo exit /b %%ERRORLEVEL%%>>"%TEST_DIR%\pl_s5_symlinkio.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s5_symlinkio.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s5_symlinkio.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "5.3  Symlink File I/O: read via app-created symlink at src path works"
 ) else (
@@ -485,7 +490,7 @@ set RPARSE_TMP=%TEMP%\vl_rparse_%RANDOM%.txt
 echo @echo off>"%TEST_DIR%\pl_s5_sympath.bat"
 echo dir /AL "%SRC_DIR%" 2^>nul ^| more ^>"%RPARSE_TMP%">>"%TEST_DIR%\pl_s5_sympath.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s5_sympath.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s5_sympath.bat"
 if exist "%RPARSE_TMP%" (
     :: The dir /AL output prints  [target_path]  after the link name.
     :: Look for the src directory token in the output.  We search for the
@@ -515,7 +520,7 @@ mkdir "%DST_DIR%\sym_real_dir"
 echo @echo off>"%TEST_DIR%\pl_s5_symdirwrite.bat"
 echo mklink /D "%SRC_DIR%\sym_link_dir" "%SRC_DIR%\sym_real_dir">>"%TEST_DIR%\pl_s5_symdirwrite.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s5_symdirwrite.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s5_symdirwrite.bat"
 if exist "%DST_DIR%\sym_link_dir" (
     if not exist "%SRC_DIR%\sym_link_dir" (
         call :Pass "5.5  Symlink Dir Write: dir symlink created in dst, not src"
@@ -535,7 +540,7 @@ mklink /D "%DST_DIR%\sym_rd_link_dir" "%DST_DIR%\sym_rd_real_dir" >nul 2>&1
 echo @echo off>"%TEST_DIR%\pl_s5_symdirread.bat"
 echo if exist "%SRC_DIR%\sym_rd_link_dir" (exit /b 0) else (exit /b 1)>>"%TEST_DIR%\pl_s5_symdirread.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s5_symdirread.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s5_symdirread.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "5.6  Symlink Dir Read: dir symlink visible via src path"
 ) else (
@@ -550,7 +555,7 @@ echo @echo off>"%TEST_DIR%\pl_s5_symdirtraverse.bat"
 echo dir "%SRC_DIR%\sym_rd_link_dir" /b ^| findstr /i "content.txt" ^>nul>>"%TEST_DIR%\pl_s5_symdirtraverse.bat"
 echo exit /b %%ERRORLEVEL%%>>"%TEST_DIR%\pl_s5_symdirtraverse.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s5_symdirtraverse.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s5_symdirtraverse.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "5.7  Symlink Dir I/O: file accessible through dir symlink via src path"
 ) else (
@@ -579,7 +584,7 @@ mkdir "%DST_DIR%\junc_real_dir"
 echo @echo off>"%TEST_DIR%\pl_s6_juncwrite.bat"
 echo mklink /J "%SRC_DIR%\junc_link" "%SRC_DIR%\junc_real_dir">>"%TEST_DIR%\pl_s6_juncwrite.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s6_juncwrite.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s6_juncwrite.bat"
 if exist "%DST_DIR%\junc_link" (
     if not exist "%SRC_DIR%\junc_link" (
         call :Pass "6.1  Junction Write: junction created in dst, not src"
@@ -598,7 +603,7 @@ mklink /J "%DST_DIR%\junc_rd_link" "%DST_DIR%\junc_rd_real" >nul 2>&1
 echo @echo off>"%TEST_DIR%\pl_s6_juncread.bat"
 echo if exist "%SRC_DIR%\junc_rd_link" (exit /b 0) else (exit /b 1)>>"%TEST_DIR%\pl_s6_juncread.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s6_juncread.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s6_juncread.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "6.2  Junction Read: junction visible via src logical path"
 ) else (
@@ -611,7 +616,7 @@ echo @echo off>"%TEST_DIR%\pl_s6_juncio.bat"
 echo findstr "JuncContent" "%SRC_DIR%\junc_rd_link\file.txt" ^>nul>>"%TEST_DIR%\pl_s6_juncio.bat"
 echo exit /b %%ERRORLEVEL%%>>"%TEST_DIR%\pl_s6_juncio.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s6_juncio.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s6_juncio.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "6.3  Junction I/O: file readable through junction via src path"
 ) else (
@@ -628,7 +633,7 @@ set JRPARSE_TMP=%TEMP%\vl_jrparse_%RANDOM%.txt
 echo @echo off>"%TEST_DIR%\pl_s6_juncpath.bat"
 echo dir /AL "%SRC_DIR%" 2^>nul ^| more ^>"%JRPARSE_TMP%">>"%TEST_DIR%\pl_s6_juncpath.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s6_juncpath.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s6_juncpath.bat"
 if exist "%JRPARSE_TMP%" (
     for %%I in ("%SRC_DIR%") do set SRC_LEAF=%%~nxI
     findstr /I /C:"!SRC_LEAF!" "%JRPARSE_TMP%" >nul 2>&1
@@ -656,7 +661,7 @@ echo ___________________
 echo @echo off>"%TEST_DIR%\pl_s6_juncwrfile.bat"
 echo echo ViaJunction^>"%SRC_DIR%\junc_rd_link\new.txt">>"%TEST_DIR%\pl_s6_juncwrfile.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s6_juncwrfile.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s6_juncwrfile.bat"
 if exist "%DST_DIR%\junc_rd_real\new.txt" (
     call :Pass "6.5  Junction Write Through: file written via junction landed in real target dir"
 ) else (
@@ -678,7 +683,7 @@ echo ___________________
 echo @echo off>"%TEST_DIR%\pl_s7_regwrite.bat"
 echo reg add "%REG_TARGET%" /v WriteVal /t REG_SZ /d SuccessWrite /f ^>nul>>"%TEST_DIR%\pl_s7_regwrite.bat"
 
-%LAUNCHER% -reg "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regwrite.bat"
+%LAUNCHER% -r "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regwrite.bat"
 
 reg query "%REG_VROOT%\Software\VirtTest_App" /v WriteVal 2>nul | findstr "SuccessWrite" >nul
 if !ERRORLEVEL! EQU 0 (
@@ -699,7 +704,7 @@ echo @echo off>"%TEST_DIR%\pl_s7_regread.bat"
 echo reg query "%REG_TARGET%" /v ReadVal 2^>nul ^| findstr "SuccessRead" ^>nul>>"%TEST_DIR%\pl_s7_regread.bat"
 echo exit /b %%ERRORLEVEL%%>>"%TEST_DIR%\pl_s7_regread.bat"
 
-%LAUNCHER% -reg "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regread.bat"
+%LAUNCHER% -r "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regread.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "7.2  Reg Read: virtual key readable via logical host path"
 ) else (
@@ -711,7 +716,7 @@ echo ___________________
 echo @echo off>"%TEST_DIR%\pl_s7_regdel.bat"
 echo reg delete "%REG_TARGET%" /v ReadVal /f ^>nul 2^>^&1 >>"%TEST_DIR%\pl_s7_regdel.bat"
 
-%LAUNCHER% -reg "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regdel.bat"
+%LAUNCHER% -r "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regdel.bat"
 reg query "%REG_VROOT%\Software\VirtTest_App" /v ReadVal >nul 2>nul
 if !ERRORLEVEL! NEQ 0 (
     call :Pass "7.3  Reg Delete Value: value deleted from virtual root"
@@ -724,7 +729,7 @@ echo ___________________
 echo @echo off>"%TEST_DIR%\pl_s7_regsub.bat"
 echo reg add "%REG_TARGET%\SubA\SubB\SubC" /v Nested /t REG_SZ /d NestedVal /f ^>nul>>"%TEST_DIR%\pl_s7_regsub.bat"
 
-%LAUNCHER% -reg "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regsub.bat"
+%LAUNCHER% -r "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regsub.bat"
 reg query "%REG_VROOT%\Software\VirtTest_App\SubA\SubB\SubC" /v Nested 2>nul | findstr "NestedVal" >nul
 if !ERRORLEVEL! EQU 0 (
     call :Pass "7.4  Reg Nested Subkey: 3-level deep key created in virtual root"
@@ -738,7 +743,7 @@ echo @echo off>"%TEST_DIR%\pl_s7_regenum.bat"
 echo reg query "%REG_TARGET%" 2^>nul ^| findstr /i "SubA" ^>nul>>"%TEST_DIR%\pl_s7_regenum.bat"
 echo exit /b %%ERRORLEVEL%%>>"%TEST_DIR%\pl_s7_regenum.bat"
 
-%LAUNCHER% -reg "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regenum.bat"
+%LAUNCHER% -r "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regenum.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "7.5  Reg Enumerate: virtual subkeys enumerable via logical path"
 ) else (
@@ -752,7 +757,7 @@ echo reg add "%REG_TARGET%" /v DwordVal /t REG_DWORD /d 0x1234 /f ^>nul>>"%TEST_
 echo reg query "%REG_TARGET%" /v DwordVal 2^>nul ^| findstr "0x1234" ^>nul>>"%TEST_DIR%\pl_s7_regdword.bat"
 echo exit /b %%ERRORLEVEL%%>>"%TEST_DIR%\pl_s7_regdword.bat"
 
-%LAUNCHER% -reg "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regdword.bat"
+%LAUNCHER% -r "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regdword.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "7.6  Reg DWORD: DWORD written and read back correctly via virtual path"
 ) else (
@@ -768,7 +773,7 @@ echo reg add "%REG_TARGET%" /v ValC /t REG_SZ /d CCC /f ^>nul>>"%TEST_DIR%\pl_s7
 echo reg query "%REG_TARGET%" 2^>nul ^| findstr "ValC" ^>nul>>"%TEST_DIR%\pl_s7_regmulti.bat"
 echo exit /b %%ERRORLEVEL%%>>"%TEST_DIR%\pl_s7_regmulti.bat"
 
-%LAUNCHER% -reg "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regmulti.bat"
+%LAUNCHER% -r "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regmulti.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "7.7  Reg Multi-value: multiple values all enumerable in virtual key"
 ) else (
@@ -783,7 +788,7 @@ echo ___________________
 echo @echo off>"%TEST_DIR%\pl_s7_regdeltree.bat"
 echo reg delete "%REG_TARGET%\SubA" /f ^>nul 2^>^&1 >>"%TEST_DIR%\pl_s7_regdeltree.bat"
 
-%LAUNCHER% -reg "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regdeltree.bat"
+%LAUNCHER% -r "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regdeltree.bat"
 reg query "%REG_VROOT%\Software\VirtTest_App\SubA" >nul 2>nul
 if !ERRORLEVEL! NEQ 0 (
     call :Pass "7.8  Reg Delete Subtree: SubA and all children removed from virtual root"
@@ -801,7 +806,7 @@ echo reg add "%REG_TARGET%" /v BinVal /t REG_BINARY /d DEADBEEF /f ^>nul>>"%TEST
 echo reg query "%REG_TARGET%" /v BinVal 2^>nul ^| findstr /C:"DEADBEEF" ^>nul>>"%TEST_DIR%\pl_s7_regbin.bat"
 echo exit /b %%ERRORLEVEL%%>>"%TEST_DIR%\pl_s7_regbin.bat"
 
-%LAUNCHER% -reg "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regbin.bat"
+%LAUNCHER% -r "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regbin.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "7.9  Reg BINARY: REG_BINARY written and read back via virtual path"
 ) else (
@@ -818,7 +823,7 @@ echo ___________________
 echo @echo off>"%TEST_DIR%\pl_s7_regisolate.bat"
 echo reg add "%REG_TARGET%" /v VirtOnlyVal /t REG_SZ /d VirtOnlyData /f ^>nul>>"%TEST_DIR%\pl_s7_regisolate.bat"
 
-%LAUNCHER% -reg "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regisolate.bat"
+%LAUNCHER% -r "%REG_VROOT%" cmd /c "%TEST_DIR%\pl_s7_regisolate.bat"
 
 :: Value must be in the virtual root
 reg query "%REG_VROOT%\Software\VirtTest_App" /v VirtOnlyVal 2>nul | findstr "VirtOnlyData" >nul
@@ -858,7 +863,7 @@ echo @echo off>"%TEST_DIR%\pl_s8_gc_outer.bat"
 echo cmd /c "%TEST_DIR%\pl_s8_gc_inner.bat">>"%TEST_DIR%\pl_s8_gc_outer.bat"
 echo exit /b %%ERRORLEVEL%%>>"%TEST_DIR%\pl_s8_gc_outer.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s8_gc_outer.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s8_gc_outer.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "8.1  Grandchild Read: grandchild process sees FS virtualization"
 ) else (
@@ -873,7 +878,7 @@ echo echo GrandchildWrite^>"%SRC_DIR%\gc_write.txt">>"%TEST_DIR%\pl_s8_gcw_inner
 echo @echo off>"%TEST_DIR%\pl_s8_gcw_outer.bat"
 echo cmd /c "%TEST_DIR%\pl_s8_gcw_inner.bat">>"%TEST_DIR%\pl_s8_gcw_outer.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s8_gcw_outer.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s8_gcw_outer.bat"
 if exist "%DST_DIR%\gc_write.txt" (
     if not exist "%SRC_DIR%\gc_write.txt" (
         call :Pass "8.2  Grandchild Write: write landed in dst, not src"
@@ -915,7 +920,7 @@ set VL_CTRL=%TEMP%\vl_ctrl_%RANDOM%.txt
 echo @echo off>"%TEST_DIR%\pl_s9_ctrl.bat"
 echo echo ControlContent^>"%VL_CTRL%">>"%TEST_DIR%\pl_s9_ctrl.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s9_ctrl.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s9_ctrl.bat"
 if exist "%VL_CTRL%" (
     call :Pass "9.2  Control: write outside redirect zone went to real %TEMP%"
     del "%VL_CTRL%" 2>nul
@@ -923,7 +928,7 @@ if exist "%VL_CTRL%" (
     call :Fail "9.2  Control: write outside redirect zone was lost or wrongly redirected"
 )
 
-:: 9.3  Without -fs flag, writes go to the real path (no hook active)
+:: 9.3  Without -c flag, writes go to the real path (no hook active)
 echo ___________________
 set VL_NOHOOK=%TEST_DIR%\nohook_test.txt
 echo @echo off>"%TEST_DIR%\pl_s9_nohook.bat"
@@ -931,10 +936,10 @@ echo echo NoHookContent^>"%SRC_DIR%\nohook_verify.txt">>"%TEST_DIR%\pl_s9_nohook
 
 %LAUNCHER% cmd /c "%TEST_DIR%\pl_s9_nohook.bat"
 if exist "%SRC_DIR%\nohook_verify.txt" (
-    call :Pass "9.3  No-Hook Baseline: without -fs, writes go to real src path (hook inactive)"
+    call :Pass "9.3  No-Hook Baseline: without -c, writes go to real src path (hook inactive)"
     del "%SRC_DIR%\nohook_verify.txt" 2>nul
 ) else (
-    call :Fail "9.3  No-Hook Baseline: write to src failed even without -fs flag"
+    call :Fail "9.3  No-Hook Baseline: write to src failed even without -c flag"
 )
 
 

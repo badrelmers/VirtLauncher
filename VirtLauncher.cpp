@@ -26,21 +26,30 @@
 //
 // ============================================================
 // Usage:
-//   VirtLauncher.exe [-reg <HivePath>] [-fs <config.ini>] <app.exe> [args...]
+//   VirtLauncher.exe [options] <app.exe> [args...]
 //
-//   -reg <HivePath>
-//       Win32 registry path to use as the virtual root.
-//       All app registry writes go here; reads show a merged view.
-//       Examples:
-//         -reg HKEY_CURRENT_USER\VirtLauncher
-//         -reg HKCU\MyApp
-//         -reg HKEY_LOCAL_MACHINE\SOFTWARE\VirtApps\Foo
+// Options:
+//   --verbose, -v          Print informational messages to stdout.
+//                          Env: VLAUNCHER_VERBOSE=1
 //
-//   -fs <config.ini>
-//       Path to a file-system redirect config (INI format).
-//       See below for format.
+//   --debug, -d            Enable debug logging to DebugView (OutputDebugString).
+//                          Env: VLAUNCHER_DEBUG=1
 //
-// FS Config File Format  (plain text, UTF-8 or ANSI):
+//   --registry [HivePath], -r [HivePath]
+//                          Enable registry virtualisation.
+//                          Default hive: HKCU\VirtLauncher
+//
+//   --filesystem [Folder], -f [Folder]
+//                          Enable filesystem virtualisation using Folder as the
+//                          virtual store root. Default: .\VIRTL
+//
+//   --config <config.ini>, -c <config.ini>
+//                          Load explicit FS redirect rules from an INI file.
+//                          Takes precedence over --filesystem for matched paths.
+//
+//   --help, -h, /?         Show this help.
+//
+// FS Config File Format  (plain text, UTF-8 or ANSI)  [--config]:
 //   # Comment lines start with # or ;
 //   [redirect]
 //   C:\OriginalPath=D:\RedirectedPath
@@ -59,6 +68,12 @@
 //   The launcher auto-detects target bitness and warns on mismatch.
 //   VirtHook32.dll / VirtHook64.dll must be in the same folder
 //   as the launcher EXE.
+//
+// Internal environment variables (set automatically, do not set manually):
+//   VIRTLAUNCHER_REG   NT registry base path passed to VirtHook.dll
+//   VIRTLAUNCHER_FS    Path to the FS redirect config INI for VirtHook.dll
+//   VIRTLAUNCHER_FSDIR Virtual store root folder path for VirtHook.dll
+//   VIRTLAUNCHER_DLL   Absolute path to VirtHook DLL for child injection
 // ============================================================
 
 #define WIN32_LEAN_AND_MEAN
@@ -81,15 +96,36 @@
 #pragma comment(lib, "detours.lib")
 
 // ============================================================
+// Global flags (set from CLI args or environment)
+// ============================================================
+
+static bool g_Verbose = false;  // --verbose / VLAUNCHER_VERBOSE
+static bool g_Debug   = false;  // --debug   / VLAUNCHER_DEBUG
+
+// Verbose-only informational output.
+// Errors use wprintf directly so they always appear.
+#define VL_INFO(...)  do { if (g_Verbose) wprintf(__VA_ARGS__); } while(0)
+
+// ============================================================
 // Utilities
 // ============================================================
+
+// Check a boolean environment variable ("1", "true", "yes" → true).
+static bool GetEnvBool(const wchar_t* name) {
+    wchar_t buf[16] = {};
+    if (GetEnvironmentVariableW(name, buf, 15) > 0)
+        return (_wcsicmp(buf, L"1")    == 0 ||
+                _wcsicmp(buf, L"true") == 0 ||
+                _wcsicmp(buf, L"yes")  == 0);
+    return false;
+}
 
 static bool StartsWithI(const std::wstring& s, const wchar_t* pfx) {
     size_t n = wcslen(pfx);
     return s.size() >= n && _wcsnicmp(s.c_str(), pfx, n) == 0;
 }
 
-// Return true if the PE at 'path' is a 64-bit image
+// Return true if the PE at 'path' is a 64-bit image.
 static bool IsPe64(const wchar_t* path) {
     HANDLE hf = CreateFileW(path, GENERIC_READ,
                              FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -110,14 +146,10 @@ static bool IsPe64(const wchar_t* path) {
     ReadFile(hf, &fh, sizeof(fh), &rd, NULL);
     CloseHandle(hf);
 
-    // return fh.Machine == IMAGE_FILE_MACHINE_AMD64 ||
-    //        fh.Machine == IMAGE_FILE_MACHINE_IA64  ||
-    //        fh.Machine == IMAGE_FILE_MACHINE_ARM64;
-    
     return fh.Machine == IMAGE_FILE_MACHINE_AMD64;
 }
 
-// Build path to VirtHookNN.dll (same directory as this EXE)
+// Build path to VirtHookNN.dll (same directory as this EXE).
 static void BuildHookDllPath(wchar_t* out, size_t cch, bool want64) {
     wchar_t dir[MAX_PATH] = {};
     GetModuleFileNameW(NULL, dir, MAX_PATH);
@@ -125,6 +157,25 @@ static void BuildHookDllPath(wchar_t* out, size_t cch, bool want64) {
     _snwprintf(out, cch - 1, L"%s\\VirtHook%s.dll",
                dir, want64 ? L"64" : L"32");
     out[cch - 1] = L'\0';
+}
+
+// Recursively create all components of a directory path.
+static void CreateFolderRecursive(const wchar_t* path) {
+    if (!path || !path[0]) return;
+    DWORD attr = GetFileAttributesW(path);
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
+        return; // already exists
+
+    // Create parent first
+    wchar_t parent[MAX_PATH];
+    wcsncpy(parent, path, MAX_PATH - 1);
+    parent[MAX_PATH - 1] = L'\0';
+    PathRemoveFileSpecW(parent);
+
+    if (parent[0] && wcscmp(parent, path) != 0)
+        CreateFolderRecursive(parent);
+
+    CreateDirectoryW(path, NULL);
 }
 
 // ============================================================
@@ -190,28 +241,93 @@ static std::wstring RegWin32ToNt(const std::wstring& win32) {
 }
 
 // ============================================================
-// Print Usage
+// Print Help
 // ============================================================
 
 static void PrintUsage(const wchar_t* self) {
     wprintf(L"VirtLauncher - Application Virtualization Launcher\n");
     wprintf(L"Requires VirtHook32.dll / VirtHook64.dll alongside the EXE.\n\n");
+
     wprintf(L"Usage:\n");
-    wprintf(L"  %s [-reg <HivePath>] [-fs <config.ini>] <app.exe> [app args...]\n\n",
-            self);
+    wprintf(L"  %s [options] <app.exe> [app args...]\n\n", self);
+
     wprintf(L"Options:\n");
-    wprintf(L"  -reg <HivePath>   Virtual registry root.\n");
-    wprintf(L"                    e.g.  -reg HKCU\\VirtLauncher\n");
-    wprintf(L"  -fs  <config.ini> File system redirect config.\n\n");
-    wprintf(L"FS Config format (one redirect per line):\n");
-    wprintf(L"  # Comment\n");
+    wprintf(L"  --verbose, -v\n");
+    wprintf(L"      Print informational messages to stdout while launching.\n");
+    wprintf(L"      Set VLAUNCHER_VERBOSE=1 as an alternative.\n\n");
+
+    wprintf(L"  --debug, -d\n");
+    wprintf(L"      Enable hook-level debug logging visible in Sysinternals DebugView.\n");
+    wprintf(L"      Run DebugView as Administrator before launching.\n");
+    wprintf(L"      Set VLAUNCHER_DEBUG=1 as an alternative.\n\n");
+
+    wprintf(L"  --registry [HivePath], -r [HivePath]\n");
+    wprintf(L"      Enable registry virtualisation. All writes from the target app go\n");
+    wprintf(L"      to HivePath; reads show a merged view (virtual shadowing real).\n");
+    wprintf(L"      HivePath is optional; default: HKCU\\VirtLauncher\n");
+    wprintf(L"      Supported hive prefixes: HKCU, HKLM, HKU, HKCR, HKEY_*\n\n");
+
+    wprintf(L"  --filesystem [Folder], -f [Folder]\n");
+    wprintf(L"      Enable filesystem virtualisation. All file writes from the target\n");
+    wprintf(L"      app are redirected into Folder (organised by drive letter).\n");
+    wprintf(L"      Reads check Folder first, then fall back to the real path.\n");
+    wprintf(L"      Folder is optional; default: .\\VIRTL  (created if absent)\n\n");
+
+    wprintf(L"  --config <config.ini>, -c <config.ini>\n");
+    wprintf(L"      Load explicit source=destination path redirect rules from an INI\n");
+    wprintf(L"      file.  If --filesystem is also set, --config rules take precedence\n");
+    wprintf(L"      (matched paths follow the INI; everything else goes to the folder).\n\n");
+
+    wprintf(L"  --help, -h, /?\n");
+    wprintf(L"      Show this help.\n\n");
+
+    wprintf(L"FS Config file format  (--config):\n");
+    wprintf(L"  # Lines starting with # or ; are comments\n");
     wprintf(L"  [redirect]\n");
-    wprintf(L"  C:\\OldPath=D:\\NewPath\n\n");
+    wprintf(L"  C:\\OldPath=D:\\NewPath\n");
+    wprintf(L"  C:\\Program Files\\MyApp=E:\\Portable\\MyApp\n\n");
+    wprintf(L"  Rules:\n");
+    wprintf(L"    - One redirect per line: source=destination (Win32 absolute paths)\n");
+    wprintf(L"    - Matching is case-insensitive prefix match on NT paths\n");
+    wprintf(L"    - List more-specific rules before less-specific ones\n\n");
+
     wprintf(L"Architecture:\n");
-    wprintf(L"  VirtLauncher32.exe + VirtHook32.dll  -> for 32-bit apps\n");
-    wprintf(L"  VirtLauncher64.exe + VirtHook64.dll  -> for 64-bit apps\n\n");
-    wprintf(L"Example:\n");
-    wprintf(L"  VirtLauncher64.exe -reg HKCU\\VirtApp -fs redir.ini notepad.exe\n");
+    wprintf(L"  VirtLauncher32.exe + VirtHook32.dll  -> for 32-bit target apps\n");
+    wprintf(L"  VirtLauncher64.exe + VirtHook64.dll  -> for 64-bit target apps\n");
+    wprintf(L"  Detours handles cross-arch (32-bit launcher + 64-bit target) automatically.\n\n");
+
+    wprintf(L"Environment variables (user-settable):\n");
+    wprintf(L"  VLAUNCHER_VERBOSE=1   Same effect as --verbose\n");
+    wprintf(L"  VLAUNCHER_DEBUG=1     Same effect as --debug\n\n");
+
+    wprintf(L"Examples:\n");
+    wprintf(L"  # Capture all registry writes from notepad.exe into HKCU\\VirtApp\n");
+    wprintf(L"  VirtLauncher64.exe --registry HKCU\\VirtApp notepad.exe\n\n");
+
+    wprintf(L"  # Capture all file writes into the default .\\VIRTL folder\n");
+    wprintf(L"  VirtLauncher64.exe --filesystem notepad.exe\n\n");
+
+    wprintf(L"  # Use a custom virtual store folder\n");
+    wprintf(L"  VirtLauncher64.exe --filesystem D:\\MySandbox notepad.exe\n\n");
+
+    wprintf(L"  # Redirect specific paths via INI config only\n");
+    wprintf(L"  VirtLauncher64.exe --config redir.ini notepad.exe\n\n");
+
+    wprintf(L"  # INI config for specific paths + catch-all virtual folder for everything else\n");
+    wprintf(L"  VirtLauncher64.exe --config redir.ini --filesystem D:\\Sandbox notepad.exe\n\n");
+
+    wprintf(L"  # Full virtualisation: registry + filesystem + verbose output\n");
+    wprintf(L"  VirtLauncher64.exe --verbose --registry HKCU\\VirtApp\n");
+    wprintf(L"                     --filesystem D:\\Sandbox installer.exe /SILENT\n\n");
+
+    wprintf(L"  # Registry default hive, filesystem default folder, with debug logging\n");
+    wprintf(L"  VirtLauncher64.exe --debug --registry --filesystem notepad.exe\n\n");
+
+    wprintf(L"Notes:\n");
+    wprintf(L"  - VIRTLAUNCHER_REG, VIRTLAUNCHER_FS, VIRTLAUNCHER_FSDIR, VIRTLAUNCHER_DLL\n");
+    wprintf(L"    are set automatically by the launcher for VirtHook.dll -- do not set\n");
+    wprintf(L"    these manually unless you are doing advanced custom injection.\n");
+    wprintf(L"  - Run as Administrator if the target requires elevation.\n");
 }
 
 // ============================================================
@@ -219,22 +335,59 @@ static void PrintUsage(const wchar_t* self) {
 // ============================================================
 
 int wmain(int argc, wchar_t* argv[]) {
-    // Parse arguments
+    // --- Read env-var defaults before parsing CLI (CLI overrides) ---
+    g_Verbose = GetEnvBool(L"VLAUNCHER_VERBOSE");
+    g_Debug   = GetEnvBool(L"VLAUNCHER_DEBUG");
+
+    // --- Parse arguments ---
     std::wstring regPath;
-    std::wstring fsConfig;
+    bool         regEnabled   = false;
+    std::wstring fsConfig;        // --config  INI file (replaces old -fs)
+    std::wstring fsFolder;        // --filesystem  virtual store folder
+    bool         fsDirEnabled = false;
     int appIdx = 1;
 
     while (appIdx < argc) {
-        if (_wcsicmp(argv[appIdx], L"-reg") == 0 && appIdx + 1 < argc) {
-            regPath = argv[++appIdx];
-        } else if (_wcsicmp(argv[appIdx], L"-fs") == 0 && appIdx + 1 < argc) {
-            fsConfig = argv[++appIdx];
-        } else if (_wcsicmp(argv[appIdx], L"-h") == 0 ||
-                   _wcsicmp(argv[appIdx], L"--help") == 0 ||
-                   _wcsicmp(argv[appIdx], L"/?") == 0) {
+        const wchar_t* arg = argv[appIdx];
+
+        if (_wcsicmp(arg, L"--verbose") == 0 || _wcsicmp(arg, L"-v") == 0) {
+            g_Verbose = true;
+        }
+        else if (_wcsicmp(arg, L"--debug") == 0 || _wcsicmp(arg, L"-d") == 0) {
+            g_Debug = true;
+        }
+        else if (_wcsicmp(arg, L"--registry") == 0 || _wcsicmp(arg, L"-r") == 0) {
+            regEnabled = true;
+            // Next non-dash arg is the optional hive path
+            if (appIdx + 1 < argc && argv[appIdx + 1][0] != L'-') {
+                regPath = argv[++appIdx];
+            } else {
+                regPath = L"HKCU\\VirtLauncher";
+            }
+        }
+        else if (_wcsicmp(arg, L"--config") == 0 || _wcsicmp(arg, L"-c") == 0) {
+            if (appIdx + 1 < argc) {
+                fsConfig = argv[++appIdx];
+            } else {
+                wprintf(L"Error: --config requires an INI file path argument.\n");
+                return 1;
+            }
+        }
+        else if (_wcsicmp(arg, L"--filesystem") == 0 || _wcsicmp(arg, L"-f") == 0) {
+            fsDirEnabled = true;
+            // Next non-dash arg is the optional folder
+            if (appIdx + 1 < argc && argv[appIdx + 1][0] != L'-') {
+                fsFolder = argv[++appIdx];
+            }
+            // else resolved to default (.\VIRTL) below
+        }
+        else if (_wcsicmp(arg, L"-h") == 0 ||
+                 _wcsicmp(arg, L"--help") == 0 ||
+                 _wcsicmp(arg, L"/?") == 0) {
             PrintUsage(argv[0]);
             return 0;
-        } else {
+        }
+        else {
             break; // start of app exe + args
         }
         ++appIdx;
@@ -254,9 +407,8 @@ int wmain(int argc, wchar_t* argv[]) {
     if (!SearchPathW(NULL, appExe, L".exe", MAX_PATH, appFullPath, NULL)) {
         wcsncpy(appFullPath, appExe, MAX_PATH - 1);
         // Also try GetFullPathName in case it's a relative path
-        if (GetFileAttributesW(appFullPath) == INVALID_FILE_ATTRIBUTES) {
+        if (GetFileAttributesW(appFullPath) == INVALID_FILE_ATTRIBUTES)
             GetFullPathNameW(appExe, MAX_PATH, appFullPath, NULL);
-        }
     }
 
     if (GetFileAttributesW(appFullPath) == INVALID_FILE_ATTRIBUTES) {
@@ -270,12 +422,12 @@ int wmain(int argc, wchar_t* argv[]) {
     bool target64 = IsPe64(appFullPath);
     bool self64   = (sizeof(void*) == 8);
 
-    wprintf(L"[VirtLauncher] Target : %s (%s)\n",
+    VL_INFO(L"[VirtLauncher] Target : %s (%s)\n",
             appFullPath, target64 ? L"64-bit" : L"32-bit");
-    wprintf(L"[VirtLauncher] Launcher: %s\n", self64 ? L"64-bit" : L"32-bit");
+    VL_INFO(L"[VirtLauncher] Launcher: %s\n", self64 ? L"64-bit" : L"32-bit");
 
     if (target64 != self64) {
-        wprintf(L"[VirtLauncher] Note: cross-arch launch (Detours will use rundll32 helper).\n");
+        VL_INFO(L"[VirtLauncher] Note: cross-arch launch (Detours will use rundll32 helper).\n");
     }
 
     // --------------------------------------------------------
@@ -295,21 +447,30 @@ int wmain(int argc, wchar_t* argv[]) {
                     dllPath);
             return 1;
         }
-        wprintf(L"[VirtLauncher] Using fallback DLL (arch mismatch may occur).\n");
+        VL_INFO(L"[VirtLauncher] Using fallback DLL (arch mismatch may occur).\n");
     }
 
-    wprintf(L"[VirtLauncher] Hook DLL: %s\n", dllPath);
+    VL_INFO(L"[VirtLauncher] Hook DLL: %s\n", dllPath);
+
+    // --------------------------------------------------------
+    // Propagate verbose/debug flags to child processes
+    // --------------------------------------------------------
+    if (g_Verbose) SetEnvironmentVariableW(L"VLAUNCHER_VERBOSE", L"1");
+    if (g_Debug)   SetEnvironmentVariableW(L"VLAUNCHER_DEBUG",   L"1");
 
     // --------------------------------------------------------
     // Set environment variables consumed by VirtHook.dll
     // --------------------------------------------------------
-    if (!regPath.empty()) {
+
+    // Registry virtualisation
+    if (regEnabled && !regPath.empty()) {
         std::wstring ntPath = RegWin32ToNt(regPath);
         SetEnvironmentVariableW(L"VIRTLAUNCHER_REG", ntPath.c_str());
-        wprintf(L"[VirtLauncher] Reg VRoot : %s\n", ntPath.c_str());
-        wprintf(L"                (Win32)  : %s\n", regPath.c_str());
+        VL_INFO(L"[VirtLauncher] Reg VRoot : %s\n", ntPath.c_str());
+        VL_INFO(L"                (Win32)  : %s\n", regPath.c_str());
     }
 
+    // FS redirect via config INI (--config, takes precedence over --filesystem)
     if (!fsConfig.empty()) {
         wchar_t absFs[MAX_PATH] = {};
         GetFullPathNameW(fsConfig.c_str(), MAX_PATH, absFs, NULL);
@@ -317,15 +478,35 @@ int wmain(int argc, wchar_t* argv[]) {
             wprintf(L"[VirtLauncher] Warning: FS config not found: %s\n", absFs);
         } else {
             SetEnvironmentVariableW(L"VIRTLAUNCHER_FS", absFs);
-            wprintf(L"[VirtLauncher] FS Config : %s\n", absFs);
+            VL_INFO(L"[VirtLauncher] FS Config : %s\n", absFs);
         }
     }
 
-    // Store DLL path so the hook can propagate injection to children.
-    // We set BOTH arch-specific paths so that a 32-bit hook inside a child
-    // can correctly inject into a 64-bit grandchild and vice-versa.
-    SetEnvironmentVariableW(L"VIRTLAUNCHER_DLL", dllPath);
+    // FS virtualisation via virtual store folder (--filesystem)
+    if (fsDirEnabled) {
+        if (fsFolder.empty()) {
+            // Default: .\VIRTL  (current working directory)
+            wchar_t cwd[MAX_PATH] = {};
+            GetCurrentDirectoryW(MAX_PATH, cwd);
+            std::wstring virtl = std::wstring(cwd) + L"\\VIRTL";
+            fsFolder = virtl;
+        }
+        // Resolve to absolute path
+        wchar_t absFsDir[MAX_PATH] = {};
+        GetFullPathNameW(fsFolder.c_str(), MAX_PATH, absFsDir, NULL);
+        // Create directory if it doesn't exist
+        CreateFolderRecursive(absFsDir);
+        SetEnvironmentVariableW(L"VIRTLAUNCHER_FSDIR", absFsDir);
+        VL_INFO(L"[VirtLauncher] FS VRoot  : %s\n", absFsDir);
+        if (!fsConfig.empty()) {
+            VL_INFO(L"               (--config rules take precedence for matched paths)\n");
+        }
+    }
 
+    // Store DLL paths so the hook can propagate injection to children.
+    // Set BOTH arch-specific paths so a 32-bit hook inside a child can inject
+    // into a 64-bit grandchild and vice-versa.
+    SetEnvironmentVariableW(L"VIRTLAUNCHER_DLL", dllPath);
     {
         wchar_t dll32[MAX_PATH] = {}, dll64[MAX_PATH] = {};
         BuildHookDllPath(dll32, MAX_PATH, false);  // VirtHook32.dll
@@ -362,7 +543,7 @@ int wmain(int argc, wchar_t* argv[]) {
     std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
     cmdBuf.push_back(L'\0');
 
-    wprintf(L"[VirtLauncher] Command  : %s\n\n", cmdLine.c_str());
+    VL_INFO(L"[VirtLauncher] Command  : %s\n", cmdLine.c_str());
 
     // --------------------------------------------------------
     // Prepare DLL path for Detours injection.
@@ -384,8 +565,8 @@ int wmain(int argc, wchar_t* argv[]) {
     }
     const char* dlls[1] = { dllPathA };
 
-    wprintf(L"[VirtLauncher] Injecting : %S\n", dllPathA);
-    wprintf(L"               (Detours swaps 32<->64 automatically for cross-arch)\n");
+    VL_INFO(L"[VirtLauncher] Injecting : %S\n", dllPathA);
+    VL_INFO(L"               (Detours swaps 32<->64 automatically for cross-arch)\n");
 
     // --------------------------------------------------------
     // Launch target with DLL injection via Detours.
@@ -418,7 +599,7 @@ int wmain(int argc, wchar_t* argv[]) {
         NULL,                     // lpThreadAttributes
         FALSE,                    // bInheritHandles
         CREATE_DEFAULT_ERROR_MODE,// dwCreationFlags
-        NULL,                     // lpEnvironment  (inherited, includes VIRTLAUNCHER_*)
+        NULL,                     // lpEnvironment  (inherited environment (includes all VIRTLAUNCHER_* vars))
         NULL,                     // lpCurrentDirectory
         &si,
         &pi,
@@ -445,7 +626,7 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
 
-    wprintf(L"[VirtLauncher] Process started (PID %u). Waiting for exit...\n",
+    VL_INFO(L"[VirtLauncher] Process started (PID %u). Waiting for exit...\n",
             pi.dwProcessId);
 
     // Wait for the process to finish
@@ -457,7 +638,7 @@ int wmain(int argc, wchar_t* argv[]) {
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
-    wprintf(L"[VirtLauncher] Process exited with code %u (0x%X).\n",
+    VL_INFO(L"[VirtLauncher] Process exited with code %u (0x%X).\n",
             exitCode, exitCode);
     return static_cast<int>(exitCode);
 }

@@ -5,6 +5,12 @@ CD /D "%~dp0"
 REM check admin
 fltmc >nul 2>&1 || ( color 4F & echo. & echo RUNME AS ADMIN & echo. & pause & exit )
 
+::_______________________________________________
+REM set VLAUNCHER_VERBOSE=true
+REM set VLAUNCHER_DEBUG=true
+
+
+::_______________________________________________
 
 :: Navigate to the build directory where VirtLauncher is compiled
 if exist "..\build" (
@@ -71,7 +77,7 @@ echo ___________________:: 1. FS Write / Create
 echo @echo off > "%TEST_DIR%\payload_fs_write.bat"
 echo echo VirtualContent ^> "%SRC_DIR%\file_write.txt" >> "%TEST_DIR%\payload_fs_write.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_write.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_write.bat"
 if exist "%DST_DIR%\file_write.txt" (
     if not exist "%SRC_DIR%\file_write.txt" (
         call :Pass "FS Write: File successfully created in destination without leaking."
@@ -89,7 +95,7 @@ echo @echo off > "%TEST_DIR%\payload_fs_read.bat"
 echo findstr "HiddenContent" "%SRC_DIR%\file_read.txt" ^>nul >> "%TEST_DIR%\payload_fs_read.bat"
 echo exit /b %%ERRORLEVEL%% >> "%TEST_DIR%\payload_fs_read.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_read.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_read.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "FS Read: App successfully read destination file via logical source path."
 ) else (
@@ -102,7 +108,7 @@ echo RenameMe > "%DST_DIR%\file_ren.txt"
 echo @echo off > "%TEST_DIR%\payload_fs_ren.bat"
 echo rename "%SRC_DIR%\file_ren.txt" file_renamed.txt >> "%TEST_DIR%\payload_fs_ren.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_ren.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_ren.bat"
 if exist "%DST_DIR%\file_renamed.txt" (
     call :Pass "FS Rename: File correctly renamed inside the virtual destination."
 ) else (
@@ -115,7 +121,7 @@ echo DeleteMe > "%DST_DIR%\file_del.txt"
 echo @echo off > "%TEST_DIR%\payload_fs_del.bat"
 echo del "%SRC_DIR%\file_del.txt" >> "%TEST_DIR%\payload_fs_del.bat"
 
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_del.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_del.bat"
 if not exist "%DST_DIR%\file_del.txt" (
     call :Pass "FS Delete: File successfully deleted from virtual destination."
 ) else (
@@ -130,7 +136,7 @@ echo ___________________:: 5. FS Move
 echo MoveMe > "%DST_DIR%\file_move_src.txt"
 echo @echo off > "%TEST_DIR%\payload_fs_move.bat"
 echo move "%SRC_DIR%\file_move_src.txt" "%SRC_DIR%\file_move_dst.txt" ^>nul >> "%TEST_DIR%\payload_fs_move.bat"
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_move.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_move.bat"
 if exist "%DST_DIR%\file_move_dst.txt" (
     if not exist "%DST_DIR%\file_move_src.txt" (
         call :Pass "FS Move: File successfully moved within virtual destination."
@@ -146,7 +152,7 @@ echo ___________________:: 6. FS Copy (From real unmapped directory to mapped di
 echo CopyMe > "%OUTSIDE_DIR%\file_copy_src.txt"
 echo @echo off > "%TEST_DIR%\payload_fs_copy.bat"
 echo copy "%OUTSIDE_DIR%\file_copy_src.txt" "%SRC_DIR%\file_copy_dst.txt" ^>nul >> "%TEST_DIR%\payload_fs_copy.bat"
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_copy.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_copy.bat"
 if exist "%DST_DIR%\file_copy_dst.txt" (
     call :Pass "FS Copy: File successfully copied into virtual destination."
 ) else (
@@ -158,7 +164,7 @@ echo ___________________:: 7. FS Attributes (Hide file)
 echo AttrTest > "%DST_DIR%\file_attr.txt"
 echo @echo off > "%TEST_DIR%\payload_fs_attr.bat"
 echo attrib +h "%SRC_DIR%\file_attr.txt" >> "%TEST_DIR%\payload_fs_attr.bat"
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_attr.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_attr.bat"
 set ATTR_FOUND=0
 for /f "tokens=*" %%A in ('dir /ah /b "%DST_DIR%\file_attr.txt" 2^>nul') do set ATTR_FOUND=1
 if !ATTR_FOUND! EQU 1 (
@@ -174,7 +180,7 @@ echo --- [ FS Redirect Tests: Directories ] ---
 echo ___________________:: 8. FS Mkdir
 echo @echo off > "%TEST_DIR%\payload_fs_mkdir.bat"
 echo mkdir "%SRC_DIR%\dir_test" >> "%TEST_DIR%\payload_fs_mkdir.bat"
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_mkdir.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_mkdir.bat"
 if exist "%DST_DIR%\dir_test\" (
     call :Pass "FS MkDir: Directory successfully created in virtual destination."
 ) else (
@@ -186,7 +192,7 @@ echo ___________________:: 9. FS Rmdir
 mkdir "%DST_DIR%\dir_del"
 echo @echo off > "%TEST_DIR%\payload_fs_rmdir.bat"
 echo rmdir "%SRC_DIR%\dir_del" >> "%TEST_DIR%\payload_fs_rmdir.bat"
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_rmdir.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_rmdir.bat"
 if not exist "%DST_DIR%\dir_del\" (
     call :Pass "FS RmDir: Directory successfully deleted from virtual destination."
 ) else (
@@ -202,7 +208,7 @@ echo HLinkData > "%DST_DIR%\file_hlink_src.txt"
 echo @echo off > "%TEST_DIR%\payload_fs_hlink.bat"
 echo mklink /H "%SRC_DIR%\file_hlink_dst.txt" "%SRC_DIR%\file_hlink_src.txt" ^>nul >> "%TEST_DIR%\payload_fs_hlink.bat"
 echo echo AppendedLink ^>^> "%SRC_DIR%\file_hlink_dst.txt" >> "%TEST_DIR%\payload_fs_hlink.bat"
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_hlink.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_hlink.bat"
 if exist "%DST_DIR%\file_hlink_dst.txt" (
     findstr "AppendedLink" "%DST_DIR%\file_hlink_src.txt" >nul
     if !ERRORLEVEL! EQU 0 (
@@ -220,7 +226,7 @@ echo SymlinkData > "%DST_DIR%\file_sym_src.txt"
 echo @echo off > "%TEST_DIR%\payload_fs_sym.bat"
 echo mklink "%SRC_DIR%\file_sym_dst.txt" "%SRC_DIR%\file_sym_src.txt" ^>nul >> "%TEST_DIR%\payload_fs_sym.bat"
 echo echo AppendedSym ^>^> "%SRC_DIR%\file_sym_dst.txt" >> "%TEST_DIR%\payload_fs_sym.bat"
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_sym.bat" >nul 2>&1
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_sym.bat" >nul 2>&1
 if exist "%DST_DIR%\file_sym_dst.txt" (
     findstr "AppendedSym" "%DST_DIR%\file_sym_src.txt" >nul
     if !ERRORLEVEL! EQU 0 (
@@ -238,7 +244,7 @@ mkdir "%DST_DIR%\dir_sym_src"
 echo @echo off > "%TEST_DIR%\payload_fs_dir_sym.bat"
 echo mklink /D "%SRC_DIR%\dir_sym_dst" "%SRC_DIR%\dir_sym_src" ^>nul >> "%TEST_DIR%\payload_fs_dir_sym.bat"
 echo echo InSymDir ^> "%SRC_DIR%\dir_sym_dst\test.txt" >> "%TEST_DIR%\payload_fs_dir_sym.bat"
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_dir_sym.bat" >nul 2>&1
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_dir_sym.bat" >nul 2>&1
 if exist "%DST_DIR%\dir_sym_src\test.txt" (
     call :Pass "FS Symlink Dir: Directory symlink created and written to successfully."
 ) else (
@@ -255,7 +261,7 @@ mkdir "%DST_DIR%\dir_junc_src"
 echo @echo off > "%TEST_DIR%\payload_fs_dir_junc.bat"
 echo mklink /J "%SRC_DIR%\dir_junc_dst" "%SRC_DIR%\dir_junc_src" ^>nul >> "%TEST_DIR%\payload_fs_dir_junc.bat"
 echo echo InJuncDir ^> "%SRC_DIR%\dir_junc_dst\test.txt" >> "%TEST_DIR%\payload_fs_dir_junc.bat"
-%LAUNCHER% -fs "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_dir_junc.bat"
+%LAUNCHER% -c "%INI_FILE%" cmd /c "%TEST_DIR%\payload_fs_dir_junc.bat"
 if exist "%DST_DIR%\dir_junc_src\test.txt" (
     call :Pass "FS Junction Dir: Directory junction created and written to successfully."
 ) else (
@@ -274,7 +280,7 @@ echo ___________________:: 1. Reg Write
 echo @echo off > "%TEST_DIR%\payload_reg_write.bat"
 echo reg add "%REG_TARGET%" /v WriteVal /t REG_SZ /d SuccessWrite /f ^>nul >> "%TEST_DIR%\payload_reg_write.bat"
 
-%LAUNCHER% -reg "%REG_VROOT%" cmd /c "%TEST_DIR%\payload_reg_write.bat"
+%LAUNCHER% -r "%REG_VROOT%" cmd /c "%TEST_DIR%\payload_reg_write.bat"
 
 :: Check if it exists in the virtual root
 reg query "%REG_VROOT%\Software\VirtTest_App" /v WriteVal 2>nul | findstr "SuccessWrite" >nul
@@ -299,7 +305,7 @@ echo @echo off > "%TEST_DIR%\payload_reg_read.bat"
 echo reg query "%REG_TARGET%" /v ReadVal 2^>nul ^| findstr "SuccessRead" ^>nul >> "%TEST_DIR%\payload_reg_read.bat"
 echo exit /b %%ERRORLEVEL%% >> "%TEST_DIR%\payload_reg_read.bat"
 
-%LAUNCHER% -reg "%REG_VROOT%" cmd /c "%TEST_DIR%\payload_reg_read.bat"
+%LAUNCHER% -r "%REG_VROOT%" cmd /c "%TEST_DIR%\payload_reg_read.bat"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "Reg Read: App successfully read Virtual Root key via logical path."
 ) else (
@@ -311,7 +317,7 @@ echo ___________________:: 3. Reg Delete
 echo @echo off > "%TEST_DIR%\payload_reg_del.bat"
 echo reg delete "%REG_TARGET%" /v ReadVal /f ^>nul 2^>^&1 >> "%TEST_DIR%\payload_reg_del.bat"
 
-%LAUNCHER% -reg "%REG_VROOT%" cmd /c "%TEST_DIR%\payload_reg_del.bat"
+%LAUNCHER% -r "%REG_VROOT%" cmd /c "%TEST_DIR%\payload_reg_del.bat"
 
 :: Check if it's actually removed from virtual root
 reg query "%REG_VROOT%\Software\VirtTest_App" /v ReadVal >nul 2>nul

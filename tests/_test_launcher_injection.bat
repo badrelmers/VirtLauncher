@@ -2,6 +2,13 @@
 SETLOCAL
 CD /D "%~dp0"
 
+::_______________________________________________
+REM set VLAUNCHER_VERBOSE=true
+REM set VLAUNCHER_DEBUG=true
+
+
+::_______________________________________________
+
 @rem dont use tasklist to list exe dll, it does not list all dll of x32 exe!! use listdlls
 
 
@@ -41,28 +48,28 @@ timeout /t 1 /nobreak >nul
 :: --- Run Tests ---
 echo ______________________________
 :: x64 Launcher Tests
-call :RunTest "x64 Launcher - x64 App (via cmd)" "VirtLauncher64.exe -reg HKEY_CURRENT_USER\VirtApp -fs redirects.ini cmd /c %TEST64_PATH%" "VirtHook64.dll" "%APP64_NAME%"
+call :RunTest "x64 Launcher - x64 App (via cmd)" "VirtLauncher64.exe -r HKEY_CURRENT_USER\VirtApp -c redirects.ini cmd /c %TEST64_PATH%" "VirtHook64.dll" "%APP64_NAME%"
 echo ______________________________
-call :RunTest "x64 Launcher - x64 App (Direct)"  "VirtLauncher64.exe -reg HKEY_CURRENT_USER\VirtApp -fs redirects.ini %TEST64_PATH%" "VirtHook64.dll" "%APP64_NAME%"
+call :RunTest "x64 Launcher - x64 App (Direct)"  "VirtLauncher64.exe -r HKEY_CURRENT_USER\VirtApp -c redirects.ini %TEST64_PATH%" "VirtHook64.dll" "%APP64_NAME%"
 
 echo ______________________________
 :: x32 Launcher Tests
-call :RunTest "x32 Launcher - x32 App (via cmd)" "VirtLauncher32.exe -reg HKEY_CURRENT_USER\VirtApp -fs redirects.ini cmd /c %TEST32_PATH%" "VirtHook32.dll" "%APP32_NAME%"
+call :RunTest "x32 Launcher - x32 App (via cmd)" "VirtLauncher32.exe -r HKEY_CURRENT_USER\VirtApp -c redirects.ini cmd /c %TEST32_PATH%" "VirtHook32.dll" "%APP32_NAME%"
 
 echo ______________________________
-call :RunTest "x32 Launcher - x32 App (Direct)"  "VirtLauncher32.exe -reg HKEY_CURRENT_USER\VirtApp -fs redirects.ini %TEST32_PATH%" "VirtHook32.dll" "%APP32_NAME%"
+call :RunTest "x32 Launcher - x32 App (Direct)"  "VirtLauncher32.exe -r HKEY_CURRENT_USER\VirtApp -c redirects.ini %TEST32_PATH%" "VirtHook32.dll" "%APP32_NAME%"
 
 echo ______________________________
 :: Cross-Arch Tests
-call :RunTest "x32 Launcher - x64 App (via cmd)" "VirtLauncher32.exe -reg HKEY_CURRENT_USER\VirtApp -fs redirects.ini cmd /c %TEST64_PATH%" "VirtHook64.dll" "%APP64_NAME%"
+call :RunTest "x32 Launcher - x64 App (via cmd)" "VirtLauncher32.exe -r HKEY_CURRENT_USER\VirtApp -c redirects.ini cmd /c %TEST64_PATH%" "VirtHook64.dll" "%APP64_NAME%"
 
 echo ______________________________
-call :RunTest "x32 Launcher - x64 App (Direct)"  "VirtLauncher32.exe -reg HKEY_CURRENT_USER\VirtApp -fs redirects.ini %TEST64_PATH%" "VirtHook64.dll" "%APP64_NAME%"
+call :RunTest "x32 Launcher - x64 App (Direct)"  "VirtLauncher32.exe -r HKEY_CURRENT_USER\VirtApp -c redirects.ini %TEST64_PATH%" "VirtHook64.dll" "%APP64_NAME%"
 
 echo ______________________________
-call :RunTest "x64 Launcher - x32 App (via cmd)" "VirtLauncher64.exe -reg HKEY_CURRENT_USER\VirtApp -fs redirects.ini cmd /c %TEST32_PATH%" "VirtHook32.dll" "%APP32_NAME%"
+call :RunTest "x64 Launcher - x32 App (via cmd)" "VirtLauncher64.exe -r HKEY_CURRENT_USER\VirtApp -c redirects.ini cmd /c %TEST32_PATH%" "VirtHook32.dll" "%APP32_NAME%"
 echo ______________________________
-call :RunTest "x64 Launcher - x32 App (Direct)"  "VirtLauncher64.exe -reg HKEY_CURRENT_USER\VirtApp -fs redirects.ini %TEST32_PATH%" "VirtHook32.dll" "%APP32_NAME%"
+call :RunTest "x64 Launcher - x32 App (Direct)"  "VirtLauncher64.exe -r HKEY_CURRENT_USER\VirtApp -c redirects.ini %TEST32_PATH%" "VirtHook32.dll" "%APP32_NAME%"
 
 :: --- Final Results ---
 echo.
@@ -94,7 +101,8 @@ echo [TEST] %~1
 @rem echo [EXEC] %~2
 
 :: Start the launcher in the background so we can check it
-start "" /b %~2 >nul 2>&1
+@rem start "" /b %~2 >nul 2>&1
+start "" /b %~2
 
 :: Wait a moment for the process to initialize and the DLL to load
 timeout /t 3 /nobreak >nul
