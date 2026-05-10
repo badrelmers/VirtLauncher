@@ -1,10 +1,10 @@
 // ============================================================
-// VirtHook.cpp  - VirtLauncher Hook DLL  (v10 - pure ntdll hooks)
+// VirtHook.cpp  - VirtLauncher Hook DLL  (v11 - COW FS + merged dirs)
 // Injected into target process by VirtLauncher.exe via Detours
 //
 // Virtualizes:
 //
-//   REGISTRY:
+//   REGISTRY: (same as before)
 //     NtCreateKey, NtCreateKeyTransacted
 //     NtOpenKey,   NtOpenKeyEx,   NtOpenKeyTransacted, NtOpenKeyTransactedEx
 //     NtDeleteKey, NtDeleteValueKey
@@ -16,10 +16,10 @@
 //     NtSaveKey,  NtSaveKeyEx
 //     NtLoadKey,  NtLoadKey2, NtLoadKeyEx, NtLoadKey3 (Win10 RS5+)
 //     NtNotifyChangeKey, NtNotifyChangeMultipleKeys
-//     NtFlushKey         (redirects tracked handle to virtual hive)
-//     NtRestoreKey       (redirects tracked handle to virtual hive)
-//     NtSetInformationKey (redirects tracked handle to virtual hive)
-//     NtUnloadKey        (redirects OA target path to virtual hive)
+//     NtFlushKey
+//     NtRestoreKey
+//     NtSetInformationKey
+//     NtUnloadKey
 //     NtClose  (filtered: only for tracked virtual handles)
 //
 //   FILES (all pure ntdll):
@@ -30,27 +30,16 @@
 //     NtQueryAttributesFile, NtQueryFullAttributesFile
 //     NtQueryInformationByName
 //     NtSetInformationFile  (FileRenameInformation + FileLinkInformation)
-//     NtFsControlFile       (FSCTL_SET_REPARSE_POINT: redirect symlink/junction
-//                            target paths so the kernel resolves to virtual store;
-//                            FSCTL_GET_REPARSE_POINT: reverse-translate so callers
-//                            see the logical path, not the physical store path)
+//     NtFsControlFile       (FSCTL_SET_REPARSE_POINT / FSCTL_GET_REPARSE_POINT)
+//     NtQueryDirectoryFile, NtQueryDirectoryFileEx   (NEW: merged view)
+//     NtQueryInformationFile                           (NEW: path reverse-translate)
 //
 //   CHILDREN: CreateProcessW/A (propagate injection)
 //
-// NOTE: NtQueryInformationFile, NtQueryVolumeInformationFile,
-//       NtQueryDirectoryFile, NtQueryDirectoryFileEx,
-//       NtDeviceIoControlFile, NtReadFile, NtWriteFile are NOT hooked.
+// NOTE: NtQueryVolumeInformationFile, NtDeviceIoControlFile,
+//       NtReadFile, NtWriteFile are NOT hooked.
 //       All are handle-based and the handle was already redirected at
-//       NtCreateFile/NtOpenFile time; hooking them adds overhead with
-//       zero virtualization benefit.
-//       NtFsControlFile IS hooked but only for the two reparse FSCTLs;
-//       all other IOCTL codes pass through immediately.
-//       FSCTL_DELETE_REPARSE_POINT also needs no special handling: the
-//       handle is already on the virtual-store file.
-//
-// NOTE: Win32 wrappers (GetFileAttributesW, FindFirstFileExW,
-//       MoveFileExW, etc.) are intentionally NOT hooked.
-//       All interception happens at the ntdll layer.
+//       NtCreateFile/NtOpenFile time.
 //
 // Config via environment variables set by VirtLauncher.exe:
 //   VIRTLAUNCHER_REG   = NT reg base  e.g. \Registry\User\SID\VirtApp
@@ -88,6 +77,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <algorithm>
 
 // ============================================================
@@ -137,18 +127,37 @@ typedef LONG NTSTATUS;
 
 #define VL_STATUS_SUCCESS              ((NTSTATUS)0x00000000L)
 #define VL_STATUS_NO_MORE_ENTRIES      ((NTSTATUS)0x8000001AL)
+#define VL_STATUS_NO_MORE_FILES        ((NTSTATUS)0x80000006L)
 #define VL_STATUS_BUFFER_TOO_SMALL     ((NTSTATUS)0xC0000023L)
 #define VL_STATUS_BUFFER_OVERFLOW      ((NTSTATUS)0x80000005L)
 #define VL_STATUS_OBJECT_NOT_FOUND     ((NTSTATUS)0xC0000034L)
-// STATUS_OBJECT_NAME_NOT_FOUND and STATUS_OBJECT_NOT_FOUND share 0xC0000034
-#define VL_STATUS_OBJECT_NAME_NOT_FOUND VL_STATUS_OBJECT_NOT_FOUND
 #define VL_STATUS_OBJECT_PATH_NOT_FOUND ((NTSTATUS)0xC000003AL)
-#define VL_STATUS_NO_SUCH_FILE         ((NTSTATUS)0xC000000FL)
 #define VL_STATUS_ACCESS_DENIED        ((NTSTATUS)0xC0000022L)
 #define VL_STATUS_INVALID_HANDLE       ((NTSTATUS)0xC0000008L)
+#define VL_STATUS_END_OF_FILE          ((NTSTATUS)0xC0000011L)
 
 #ifndef OBJ_CASE_INSENSITIVE
 #  define OBJ_CASE_INSENSITIVE 0x00000040UL
+#endif
+
+// CreateDisposition values
+#ifndef FILE_SUPERSEDE
+#  define FILE_SUPERSEDE    0x00000000
+#  define FILE_OPEN         0x00000001
+#  define FILE_CREATE       0x00000002
+#  define FILE_OPEN_IF      0x00000003
+#  define FILE_OVERWRITE    0x00000004
+#  define FILE_OVERWRITE_IF 0x00000005
+#endif
+
+// CreateOptions / OpenOptions bits
+#ifndef FILE_DIRECTORY_FILE
+#  define FILE_DIRECTORY_FILE     0x00000001
+#  define FILE_NON_DIRECTORY_FILE 0x00000040
+#endif
+
+#ifndef FILE_OPEN_BY_FILE_ID
+#  define FILE_OPEN_BY_FILE_ID 0x00002000
 #endif
 
 typedef struct _VL_UNICODE_STRING {
@@ -247,6 +256,65 @@ typedef struct _VL_KEY_VALUE_ENTRY {
 } VL_KEY_VALUE_ENTRY, *PVL_KEY_VALUE_ENTRY;
 #pragma pack(pop)
 
+// Directory enumeration structures (natural alignment)
+struct VL_FILE_DIRECTORY_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG FileIndex;
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER ChangeTime;
+    LARGE_INTEGER EndOfFile;
+    LARGE_INTEGER AllocationSize;
+    ULONG FileAttributes;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+};
+
+struct VL_FILE_FULL_DIR_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG FileIndex;
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER ChangeTime;
+    LARGE_INTEGER EndOfFile;
+    LARGE_INTEGER AllocationSize;
+    ULONG FileAttributes;
+    ULONG FileNameLength;
+    ULONG EaSize;
+    WCHAR FileName[1];
+};
+
+struct VL_FILE_BOTH_DIR_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG FileIndex;
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER ChangeTime;
+    LARGE_INTEGER EndOfFile;
+    LARGE_INTEGER AllocationSize;
+    ULONG FileAttributes;
+    ULONG FileNameLength;
+    ULONG EaSize;
+    CCHAR ShortNameLength;
+    WCHAR ShortName[12];
+    WCHAR FileName[1];
+};
+
+struct VL_FILE_NAMES_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG FileIndex;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+};
+
+struct VL_FILE_NAME_INFORMATION {
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+};
+
 // ============================================================
 // NT Function Pointer Types
 // ============================================================
@@ -320,23 +388,18 @@ typedef NTSTATUS (NTAPI *PfnNtNotifyChangeMultipleKeys)
     (HANDLE, ULONG, PVL_OBJECT_ATTRIBUTES, HANDLE, VL_PIO_APC_ROUTINE,
      PVOID, PVL_IO_STATUS_BLOCK, ULONG, BOOLEAN, PVOID, ULONG, BOOLEAN);
 
-// NtFlushKey: flush a key's dirty pages to disk
 typedef NTSTATUS (NTAPI *PfnNtFlushKey)
     (HANDLE);
 
-// NtRestoreKey: load a hive file onto an existing key
 typedef NTSTATUS (NTAPI *PfnNtRestoreKey)
     (HANDLE, HANDLE, ULONG);
 
-// NtSetInformationKey: set key metadata (e.g. last-write time virtualization flag)
 typedef NTSTATUS (NTAPI *PfnNtSetInformationKey)
     (HANDLE, ULONG, PVOID, ULONG);
 
-// NtUnloadKey: unmount a hive loaded by NtLoadKey* (OA-based, like NtLoadKey)
 typedef NTSTATUS (NTAPI *PfnNtUnloadKey)
     (PVL_OBJECT_ATTRIBUTES);
 
-// NtLoadKey3: extended load (Win10 RS5 / 1809+), supersedes NtLoadKeyEx in newer code
 typedef NTSTATUS (NTAPI *PfnNtLoadKey3)
     (PVL_OBJECT_ATTRIBUTES, PVL_OBJECT_ATTRIBUTES, ULONG,
      PVOID, ULONG, ULONG, HANDLE, PVOID);
@@ -386,7 +449,7 @@ typedef NTSTATUS (NTAPI *PfnNtFsControlFile)
     (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
      ULONG, PVOID, ULONG, PVOID, ULONG);
 
-// ---- File I/O (not hooked, but needed for internal CoW file-copy) ----
+// New file hooks
 typedef NTSTATUS (NTAPI *PfnNtReadFile)
     (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
      PVOID, ULONG, PLARGE_INTEGER, PULONG);
@@ -394,6 +457,24 @@ typedef NTSTATUS (NTAPI *PfnNtReadFile)
 typedef NTSTATUS (NTAPI *PfnNtWriteFile)
     (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
      PVOID, ULONG, PLARGE_INTEGER, PULONG);
+
+typedef NTSTATUS (NTAPI *PfnNtQueryInformationFile)
+    (HANDLE, PVL_IO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+
+typedef NTSTATUS (NTAPI *PfnNtQueryDirectoryFile)
+    (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
+     PVOID, ULONG, ULONG, BOOLEAN, PVL_UNICODE_STRING, BOOLEAN);
+
+typedef NTSTATUS (NTAPI *PfnNtQueryDirectoryFileEx)
+    (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
+     PVOID, ULONG, ULONG, ULONG);
+
+typedef NTSTATUS (NTAPI *PfnNtQueryVolumeInformationFile)
+    (HANDLE, PVL_IO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+
+typedef NTSTATUS (NTAPI *PfnNtDeviceIoControlFile)
+    (HANDLE, HANDLE, VL_PIO_APC_ROUTINE, PVOID, PVL_IO_STATUS_BLOCK,
+     ULONG, PVOID, ULONG, PVOID, ULONG);
 
 // ---- Child process ----
 typedef BOOL (WINAPI *PfnCreateProcessW)
@@ -443,9 +524,6 @@ static PfnNtQueryObject           Real_NtQueryObject;
 // ----- Files -----
 static PfnNtCreateFile              Real_NtCreateFile;
 static PfnNtOpenFile                Real_NtOpenFile;
-// Not hooked — used internally for CoW file copy
-static PfnNtReadFile                Real_NtReadFile;
-static PfnNtWriteFile               Real_NtWriteFile;
 static PfnNtCreateDirectoryObject   Real_NtCreateDirectoryObject;
 static PfnNtOpenDirectoryObject     Real_NtOpenDirectoryObject;
 static PfnNtCreateMailslotFile      Real_NtCreateMailslotFile;
@@ -456,6 +534,15 @@ static PfnNtQueryFullAttributesFile Real_NtQueryFullAttributesFile;
 static PfnNtQueryInformationByName  Real_NtQueryInformationByName;
 static PfnNtSetInformationFile      Real_NtSetInformationFile;
 static PfnNtFsControlFile           Real_NtFsControlFile;
+
+// New file function pointers
+static PfnNtReadFile                 Real_NtReadFile;
+static PfnNtWriteFile                Real_NtWriteFile;
+static PfnNtQueryInformationFile     Real_NtQueryInformationFile;
+static PfnNtQueryDirectoryFile       Real_NtQueryDirectoryFile;
+static PfnNtQueryDirectoryFileEx     Real_NtQueryDirectoryFileEx;
+static PfnNtQueryVolumeInformationFile Real_NtQueryVolumeInformationFile;
+static PfnNtDeviceIoControlFile      Real_NtDeviceIoControlFile;
 
 // ----- Children -----
 static PfnCreateProcessW  Real_CreateProcessW;
@@ -472,34 +559,43 @@ static std::wstring g_VirtNtBase;
 static std::wstring g_RealNtBase;
 
 // FS redirections from --config INI: vector of (nt_from_prefix, nt_to_prefix).
-// Checked first; takes precedence over g_FsDirNtBase catch-all below.
 static std::vector< std::pair<std::wstring,std::wstring> > g_FsRedirects;
 
 // FS catch-all virtual store root from --filesystem (VIRTLAUNCHER_FSDIR).
-// NT form of the folder, e.g. \??\D:\sandbox  (no trailing backslash).
-// When set, any drive-letter path not matched by g_FsRedirects AND not
-// already inside g_FsDirNtBase is redirected:
-//   \??\X:\rest  ->  \??\<g_FsDirNtBase>\X\rest
 static std::wstring g_FsDirNtBase;
 
 // Tracked virtual registry handles
 struct VirtKeyEntry {
-    HANDLE       hVirt;   // handle to VirtNtBase\X  (NULL if none)
-    HANDLE       hReal;   // handle to RealNtBase\X  (NULL if none)
-    std::wstring logPath; // LOGICAL NT path (under RealNtBase)
+    HANDLE       hVirt;
+    HANDLE       hReal;
+    std::wstring logPath;
 };
 static std::map<HANDLE, VirtKeyEntry> g_KeyMap;
 static CRITICAL_SECTION g_KeyMapLock;
+
+// File-system handle tracking (COW + merged dirs)
+struct VirtFileEntry {
+    HANDLE       hVirt;
+    HANDLE       hReal;
+    std::wstring logPath;
+    bool         isDir;
+    bool         isRealOnly;
+    // Directory enumeration state
+    bool         virtEnumDone;
+    bool         realEnumDone;
+    bool         realRestartPending;
+    std::set<std::wstring> virtNames;
+};
+static std::map<HANDLE, VirtFileEntry> g_FileMap;
+static CRITICAL_SECTION g_FileMapLock;
 
 // TLS index for reentrancy guard
 static DWORD g_TlsIdx = TLS_OUT_OF_INDEXES;
 
 // DLL paths (ANSI) for child process injection.
-// Both are read from env vars so the hook can inject the right DLL even when
-// the child process has a different bitness from the current process.
-static char g_DllPathA[MAX_PATH];    // Launcher's primary target-arch DLL (fallback)
-static char g_DllPathA32[MAX_PATH];  // VirtHook32.dll absolute path
-static char g_DllPathA64[MAX_PATH];  // VirtHook64.dll absolute path
+static char g_DllPathA[MAX_PATH];
+static char g_DllPathA32[MAX_PATH];
+static char g_DllPathA64[MAX_PATH];
 
 // ============================================================
 // Inline helpers
@@ -574,6 +670,37 @@ static bool GetEntry(HANDLE h, VirtKeyEntry& out) {
 }
 
 // ============================================================
+// File handle map helpers
+// ============================================================
+
+static void TrackFileHandle(HANDLE h, const VirtFileEntry& e) {
+    EnterCriticalSection(&g_FileMapLock);
+    g_FileMap[h] = e;
+    LeaveCriticalSection(&g_FileMapLock);
+}
+
+static void UntrackFileHandle(HANDLE h) {
+    EnterCriticalSection(&g_FileMapLock);
+    g_FileMap.erase(h);
+    LeaveCriticalSection(&g_FileMapLock);
+}
+
+static bool GetFileEntry(HANDLE h, VirtFileEntry& out) {
+    EnterCriticalSection(&g_FileMapLock);
+    std::map<HANDLE,VirtFileEntry>::iterator it = g_FileMap.find(h);
+    if (it != g_FileMap.end()) { out = it->second; }
+    bool found = (it != g_FileMap.end());
+    LeaveCriticalSection(&g_FileMapLock);
+    return found;
+}
+
+static void UpdateFileEntry(HANDLE h, const VirtFileEntry& e) {
+    EnterCriticalSection(&g_FileMapLock);
+    g_FileMap[h] = e;
+    LeaveCriticalSection(&g_FileMapLock);
+}
+
+// ============================================================
 // Registry Path Resolution
 // ============================================================
 
@@ -642,12 +769,6 @@ static std::wstring GetFullNtPath(PVL_OBJECT_ATTRIBUTES oa) {
 }
 
 // Compute virtual NT path from logical path.
-//
-// CRITICAL: StartsWithI is a pure prefix check. We must also verify the
-// match ends on a path separator, otherwise the _Classes shadow hive
-// (\Registry\User\S-1-5-21-...-1000_Classes) would match a g_RealNtBase
-// of (\Registry\User\S-1-5-21-...-1000) and every HKCR / COM access would
-// be intercepted, redirected to garbage virtual paths, and crash the app.
 static bool LogicalToVirtual(const std::wstring& logical,
                                std::wstring& virt)
 {
@@ -659,10 +780,6 @@ static bool LogicalToVirtual(const std::wstring& logical,
         return false;
     }
 
-    // Path-boundary guard: the char immediately after g_RealNtBase must be
-    // '\' (sub-key) or end-of-string (hive root itself). Anything else (like
-    // '_', letters) means this is a *different* hive that just shares the
-    // same SID prefix (e.g. \Registry\User\<SID>_Classes).
     size_t baseLen = g_RealNtBase.size();
     if (logical.size() > baseLen && logical[baseLen] != L'\\') {
         VL_DBG(L"LogicalToVirtual: SKIP (boundary mismatch, sibling hive?) path=%s",
@@ -733,10 +850,6 @@ static std::wstring Win32ToNtPath(const std::wstring& win32) {
 }
 
 // Apply FS redirections to an NT path.
-// Priority order:
-//   1. Explicit rules from --config INI (g_FsRedirects), checked in order.
-//   2. FSDIR catch-all (g_FsDirNtBase) for any drive-letter path not yet
-//      matched and not already located inside the virtual store itself.
 static std::wstring ApplyFsRedirect(const std::wstring& ntPath) {
     if (!g_FsEnabled) return ntPath;
 
@@ -749,10 +862,7 @@ static std::wstring ApplyFsRedirect(const std::wstring& ntPath) {
         }
     }
 
-    // --- 2. FSDIR catch-all: \??\X:[\rest]  ->  \??\<FsDirNtBase>\X[\rest] ---
-    // Guard: must have an FSDIR configured, path must be a Win32 drive-letter NT
-    // path (\??\X:\ or \??\X:), and the path must NOT already be inside the
-    // virtual store (avoids infinite redirect loops).
+    // --- 2. FSDIR catch-all ---
     if (!g_FsDirNtBase.empty() &&
         ntPath.size() >= 6 &&
         StartsWithI(ntPath, L"\\??\\") &&
@@ -760,9 +870,6 @@ static std::wstring ApplyFsRedirect(const std::wstring& ntPath) {
         (ntPath.size() == 6 || ntPath[6] == L'\\') &&
         !StartsWithI(ntPath, g_FsDirNtBase))
     {
-        // \??\X:\rest  -> \??\<FsDirNtBase>\X\rest
-        //   ntPath[4]      = drive letter (e.g. 'C')
-        //   ntPath.substr(6) = \rest  (includes leading backslash, or empty)
         wchar_t driveStr[3] = { L'\\', towupper(ntPath[4]), L'\0' };
         std::wstring rest = (ntPath.size() > 6) ? ntPath.substr(6) : L"";
         return g_FsDirNtBase + driveStr + rest;
@@ -771,29 +878,21 @@ static std::wstring ApplyFsRedirect(const std::wstring& ntPath) {
     return ntPath;
 }
 
-// Reverse of ApplyFsRedirect: maps a physical (virtual-store) NT path back to
-// the logical path the sandboxed app originally intended.  Used when reading
-// reparse point data back out of NTFS so tools see the virtualized path.
+// Reverse of ApplyFsRedirect: physical -> logical
 static std::wstring ReverseApplyFsRedirect(const std::wstring& ntPath) {
     if (!g_FsEnabled) return ntPath;
 
-    // --- 1. Reverse config-based rules ---
     for (size_t i = 0; i < g_FsRedirects.size(); ++i) {
-        const std::wstring& from = g_FsRedirects[i].first;   // logical (original)
-        const std::wstring& to   = g_FsRedirects[i].second;  // physical (store)
+        const std::wstring& from = g_FsRedirects[i].first;
+        const std::wstring& to   = g_FsRedirects[i].second;
         if (StartsWithI(ntPath, to))
             return from + ntPath.substr(to.size());
     }
 
-    // --- 2. Reverse FSDIR catch-all ---
-    // Physical path: \??\<FsDirNtBase>\X\rest
-    //   -> logical: \??\X:\rest
     if (!g_FsDirNtBase.empty() && StartsWithI(ntPath, g_FsDirNtBase)) {
         std::wstring tail = ntPath.substr(g_FsDirNtBase.size());
-        // tail should be \X\rest  (backslash + single drive letter + rest)
         if (tail.size() >= 2 && tail[0] == L'\\' && iswalpha(tail[1])) {
             wchar_t drive = towupper(tail[1]);
-            // tail.substr(2) is either empty or starts with backslash (\rest)
             std::wstring rest = (tail.size() > 2) ? tail.substr(2) : L"";
             return std::wstring(L"\\??\\") + drive + L':' + rest;
         }
@@ -802,19 +901,15 @@ static std::wstring ReverseApplyFsRedirect(const std::wstring& ntPath) {
     return ntPath;
 }
 
-// Redirect a reparse-point path that may be in NT form (\??\...) or Win32
-// form (C:\...).  Returns the path unchanged if no redirect applies.
-// Used for both SubstituteName and PrintName in FSCTL_SET_REPARSE_POINT.
+// Redirect a reparse-point path that may be in NT form or Win32 form.
 static std::wstring RedirectSymlinkPath(const std::wstring& path) {
     if (path.empty()) return path;
     std::wstring red = ApplyFsRedirect(path);
     if (red != path) return red;
-    // Try as Win32 path (no \??\ prefix)
     std::wstring nt = Win32ToNtPath(path);
     if (nt != path) {
         red = ApplyFsRedirect(nt);
         if (red != nt) {
-            // Strip the \??\ we added if the caller didn't have it
             if (StartsWithI(red, L"\\??\\") && !StartsWithI(path, L"\\??\\"))
                 return red.substr(4);
             return red;
@@ -823,8 +918,6 @@ static std::wstring RedirectSymlinkPath(const std::wstring& path) {
     return path;
 }
 
-// Inverse of RedirectSymlinkPath: physical path -> logical path.
-// Used when intercepting FSCTL_GET_REPARSE_POINT output.
 static std::wstring ReverseRedirectSymlinkPath(const std::wstring& path) {
     if (path.empty()) return path;
     std::wstring rev = ReverseApplyFsRedirect(path);
@@ -840,6 +933,7 @@ static std::wstring ReverseRedirectSymlinkPath(const std::wstring& path) {
     }
     return path;
 }
+
 // If true, caller should use newOa / newName instead of the original OA.
 static bool RedirectFileOA(PVL_OBJECT_ATTRIBUTES oa,
                              VL_UNICODE_STRING& newName,
@@ -849,6 +943,7 @@ static bool RedirectFileOA(PVL_OBJECT_ATTRIBUTES oa,
 {
     if (!g_FsEnabled || !oa || !oa->ObjectName || IsReentrant()) return false;
     ntPath  = GetFullNtPath(oa);
+    ntPath  = Win32ToNtPath(ntPath);   // ensure NT format
     redPath = ApplyFsRedirect(ntPath);
     if (redPath == ntPath) return false;
     MakeUStr(&newName, redPath);
@@ -856,6 +951,172 @@ static bool RedirectFileOA(PVL_OBJECT_ATTRIBUTES oa,
     newOa.ObjectName    = &newName;
     newOa.RootDirectory = NULL;
     return true;
+}
+
+// ============================================================
+// FS COW / Merge helpers
+// ============================================================
+
+static void EnsureVirtualDir(const std::wstring& ntDirPath) {
+    if (!g_FsEnabled || g_FsDirNtBase.empty()) return;
+    if (!StartsWithI(ntDirPath, g_FsDirNtBase)) return;
+
+    std::wstring remaining = ntDirPath.substr(g_FsDirNtBase.size());
+    std::wstring current   = g_FsDirNtBase;
+    size_t start = 0;
+    while (start < remaining.size()) {
+        if (remaining[start] == L'\\') ++start;
+        size_t slash = remaining.find(L'\\', start);
+        std::wstring seg;
+        if (slash != std::wstring::npos) {
+            seg = remaining.substr(start, slash - start);
+            start = slash;
+        } else {
+            seg = remaining.substr(start);
+            start = remaining.size();
+        }
+        if (seg.empty()) continue;
+        current += L"\\" + seg;
+        VL_UNICODE_STRING us; MakeUStr(&us, current);
+        VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
+        HANDLE h = NULL;
+        IO_STATUS_BLOCK iosb;
+        NTSTATUS st = Real_NtCreateFile(&h, SYNCHRONIZE, &oa, &iosb, NULL,
+                                         FILE_ATTRIBUTE_NORMAL,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                         FILE_OPEN_IF,
+                                         FILE_DIRECTORY_FILE, NULL, 0);
+        if (NT_SUCCESS(st) && h) Real_NtClose(h);
+    }
+}
+
+static void EnsureVirtualDirForFile(const std::wstring& ntFilePath) {
+    size_t slash = ntFilePath.find_last_of(L'\\');
+    if (slash == std::wstring::npos || slash <= 4) return;
+    EnsureVirtualDir(ntFilePath.substr(0, slash));
+}
+
+static NTSTATUS CowCopyFile(const std::wstring& srcNt, const std::wstring& dstNt) {
+    EnsureVirtualDirForFile(dstNt);
+
+    // Open source
+    VL_UNICODE_STRING srcUs; MakeUStr(&srcUs, srcNt);
+    VL_OBJECT_ATTRIBUTES srcOa; MakeOA(&srcOa, &srcUs);
+    HANDLE hSrc = NULL;
+    IO_STATUS_BLOCK iosb;
+    NTSTATUS st = Real_NtCreateFile(&hSrc, GENERIC_READ | SYNCHRONIZE, &srcOa, &iosb,
+                                     NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+                                     FILE_OPEN, FILE_NON_DIRECTORY_FILE, NULL, 0);
+    if (!NT_SUCCESS(st)) return st;
+
+    // Get source size and attributes
+    struct MY_FBI {
+        LARGE_INTEGER CreationTime;
+        LARGE_INTEGER LastAccessTime;
+        LARGE_INTEGER LastWriteTime;
+        LARGE_INTEGER ChangeTime;
+        ULONG FileAttributes;
+    } fbi = {};
+    st = Real_NtQueryInformationFile(hSrc, &iosb, &fbi, sizeof(fbi), 4 /*FileBasicInformation*/);
+    if (!NT_SUCCESS(st)) fbi.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+
+    struct MY_FSI {
+        LARGE_INTEGER AllocationSize;
+        LARGE_INTEGER EndOfFile;
+        ULONG NumberOfLinks;
+        BOOLEAN DeletePending;
+        BOOLEAN Directory;
+    } fsi = {};
+    st = Real_NtQueryInformationFile(hSrc, &iosb, &fsi, sizeof(fsi), 5 /*FileStandardInformation*/);
+    if (!NT_SUCCESS(st)) { Real_NtClose(hSrc); return st; }
+
+    // Open destination
+    VL_UNICODE_STRING dstUs; MakeUStr(&dstUs, dstNt);
+    VL_OBJECT_ATTRIBUTES dstOa; MakeOA(&dstOa, &dstUs);
+    HANDLE hDst = NULL;
+    st = Real_NtCreateFile(&hDst, GENERIC_WRITE | SYNCHRONIZE, &dstOa, &iosb,
+                            &fsi.EndOfFile, fbi.FileAttributes, 0,
+                            FILE_OVERWRITE_IF, FILE_NON_DIRECTORY_FILE, NULL, 0);
+    if (!NT_SUCCESS(st)) { Real_NtClose(hSrc); return st; }
+
+    // Copy loop
+    const ULONG BUF_SIZE = 256 * 1024;
+    std::vector<BYTE> buffer(BUF_SIZE);
+    LARGE_INTEGER offset;
+    offset.QuadPart = 0;
+
+    while (true) {
+        st = Real_NtReadFile(hSrc, NULL, NULL, NULL, &iosb, &buffer[0], BUF_SIZE, &offset, NULL);
+        if (st == STATUS_PENDING) {
+            WaitForSingleObject(hSrc, INFINITE);
+            st = iosb.Status;
+        }
+        if (st == VL_STATUS_END_OF_FILE) { st = VL_STATUS_SUCCESS; break; }
+        if (!NT_SUCCESS(st)) break;
+        ULONG read = (ULONG)iosb.Information;
+        if (read == 0) { st = VL_STATUS_SUCCESS; break; }
+
+        ULONG written = 0;
+        while (written < read) {
+            st = Real_NtWriteFile(hDst, NULL, NULL, NULL, &iosb,
+                                  &buffer[written], read - written, &offset, NULL);
+            if (st == STATUS_PENDING) {
+                WaitForSingleObject(hDst, INFINITE);
+                st = iosb.Status;
+            }
+            if (!NT_SUCCESS(st)) break;
+            written += (ULONG)iosb.Information;
+        }
+        if (!NT_SUCCESS(st)) break;
+        offset.QuadPart += read;
+    }
+
+    Real_NtClose(hSrc);
+    Real_NtClose(hDst);
+    return st;
+}
+
+static std::wstring ExtractDirFileName(PVOID info, ULONG infoClass) {
+    switch (infoClass) {
+        case 1: {
+            VL_FILE_DIRECTORY_INFORMATION* p = (VL_FILE_DIRECTORY_INFORMATION*)info;
+            return std::wstring(p->FileName, p->FileNameLength / sizeof(WCHAR));
+        }
+        case 2: {
+            VL_FILE_FULL_DIR_INFORMATION* p = (VL_FILE_FULL_DIR_INFORMATION*)info;
+            return std::wstring(p->FileName, p->FileNameLength / sizeof(WCHAR));
+        }
+        case 3: {
+            VL_FILE_BOTH_DIR_INFORMATION* p = (VL_FILE_BOTH_DIR_INFORMATION*)info;
+            return std::wstring(p->FileName, p->FileNameLength / sizeof(WCHAR));
+        }
+        case 12: {
+            VL_FILE_NAMES_INFORMATION* p = (VL_FILE_NAMES_INFORMATION*)info;
+            return std::wstring(p->FileName, p->FileNameLength / sizeof(WCHAR));
+        }
+        case 14: {
+            struct FIBDI {
+                ULONG NextEntryOffset; ULONG FileIndex;
+                LARGE_INTEGER CT; LARGE_INTEGER LAT; LARGE_INTEGER LWT; LARGE_INTEGER CHT;
+                LARGE_INTEGER EOF; LARGE_INTEGER Alloc; ULONG Attr; ULONG NameLen;
+                ULONG EaSize; CCHAR SNameLen; WCHAR SName[12]; LARGE_INTEGER FileId;
+                WCHAR Name[1];
+            };
+            FIBDI* p = (FIBDI*)info;
+            return std::wstring(p->Name, p->NameLen / sizeof(WCHAR));
+        }
+        case 15: {
+            struct FIFDI {
+                ULONG NextEntryOffset; ULONG FileIndex;
+                LARGE_INTEGER CT; LARGE_INTEGER LAT; LARGE_INTEGER LWT; LARGE_INTEGER CHT;
+                LARGE_INTEGER EOF; LARGE_INTEGER Alloc; ULONG Attr; ULONG NameLen;
+                ULONG EaSize; LARGE_INTEGER FileId; WCHAR Name[1];
+            };
+            FIFDI* p = (FIFDI*)info;
+            return std::wstring(p->Name, p->NameLen / sizeof(WCHAR));
+        }
+    }
+    return L"";
 }
 
 // ============================================================
@@ -913,15 +1174,15 @@ static void LoadFsConfig(const std::wstring& path) {
 }
 
 static void LoadConfig() {
-    wchar_t buf[2048] = {0};
+    wchar_t buf[2048] = {};
 
-    // ---- Read the debug flag FIRST so subsequent VL_DBG calls work ----
+    // ---- Read the debug flag FIRST ----
     if (GetEnvironmentVariableW(L"VLAUNCHER_DEBUG", buf, 2047) > 0)
         g_DebugEnabled = (_wcsicmp(buf, L"1")    == 0 ||
                           _wcsicmp(buf, L"true") == 0 ||
                           _wcsicmp(buf, L"yes")  == 0);
 
-    // ---- Registry virtualisation (VIRTLAUNCHER_REG) ----
+    // ---- Registry virtualisation ----
     if (GetEnvironmentVariableW(L"VIRTLAUNCHER_REG", buf, 2047) > 0) {
         g_VirtNtBase = buf;
         size_t sl = g_VirtNtBase.rfind(L'\\');
@@ -931,23 +1192,18 @@ static void LoadConfig() {
             g_RegEnabled = true;
     }
 
-    // ---- FS redirect config file (VIRTLAUNCHER_FS, from --config) ----
+    // ---- FS redirect config file ----
     if (GetEnvironmentVariableW(L"VIRTLAUNCHER_FS", buf, 2047) > 0) {
         LoadFsConfig(buf);
         if (!g_FsRedirects.empty())
             g_FsEnabled = true;
     }
 
-    // ---- FS virtual store folder (VIRTLAUNCHER_FSDIR, from --filesystem) ----
-    // VirtLauncher.exe sets this to the absolute Win32 path of the virtual store
-    // root.  We convert it to an NT path and use it as a catch-all redirect for
-    // any drive-letter path not already handled by the --config rules.
+    // ---- FS virtual store folder ----
     if (GetEnvironmentVariableW(L"VIRTLAUNCHER_FSDIR", buf, 2047) > 0 && buf[0]) {
-        // Convert Win32 path to NT path  e.g.  D:\sandbox  ->  \??\D:\sandbox
         std::wstring fsdir = buf;
         if (fsdir.size() >= 2 && iswalpha(fsdir[0]) && fsdir[1] == L':')
             fsdir = L"\\??\\" + fsdir;
-        // Strip trailing backslash (keep \??\ prefix safe)
         while (fsdir.size() > 4 && fsdir.back() == L'\\')
             fsdir.resize(fsdir.size() - 1);
         g_FsDirNtBase = fsdir;
@@ -959,7 +1215,6 @@ static void LoadConfig() {
     GetEnvironmentVariableA("VIRTLAUNCHER_DLL",   g_DllPathA,   MAX_PATH);
     GetEnvironmentVariableA("VIRTLAUNCHER_DLL32", g_DllPathA32, MAX_PATH);
     GetEnvironmentVariableA("VIRTLAUNCHER_DLL64", g_DllPathA64, MAX_PATH);
-    // If arch-specific paths not set, default both to the primary path
     if (!g_DllPathA32[0] && g_DllPathA[0])
         strncpy(g_DllPathA32, g_DllPathA, MAX_PATH - 1);
     if (!g_DllPathA64[0] && g_DllPathA[0])
@@ -1031,7 +1286,6 @@ static bool NameInList(const std::wstring& name,
 
 // ============================================================
 // Shared open/create helper
-// (avoids code duplication across Nt*Key and Nt*KeyTransacted)
 // ============================================================
 
 static NTSTATUS DoVirtOpen(
@@ -1048,8 +1302,7 @@ static NTSTATUS DoVirtOpen(
     std::wstring virtPath;
 
     if (!LogicalToVirtual(fullPath, virtPath)) {
-        // Not in our scope -- let caller decide which real function to call
-        return VL_STATUS_OBJECT_NOT_FOUND; // sentinel: caller must call real fn
+        return VL_STATUS_OBJECT_NOT_FOUND;
     }
 
     VL_DBG(L"DoVirtOpen: fullPath=%s  isCreate=%d", fullPath.c_str(), (int)isCreate);
@@ -1128,7 +1381,6 @@ static NTSTATUS DoVirtOpen(
 // REGISTRY HOOKS
 // ============================================================
 
-// ---- NtOpenKey ----
 static NTSTATUS NTAPI Hook_NtOpenKey(
     PHANDLE               KeyHandle,
     ULONG                 DesiredAccess,
@@ -1147,13 +1399,11 @@ static NTSTATUS NTAPI Hook_NtOpenKey(
     SetReentrant(false);
 
     if (st == VL_STATUS_OBJECT_NOT_FOUND) {
-        // Sentinel: not in our scope, call real
         return Real_NtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
     }
     return st;
 }
 
-// ---- NtOpenKeyEx (Vista+) ----
 static NTSTATUS NTAPI Hook_NtOpenKeyEx(
     PHANDLE               KeyHandle,
     ULONG                 DesiredAccess,
@@ -1177,10 +1427,6 @@ static NTSTATUS NTAPI Hook_NtOpenKeyEx(
     return st;
 }
 
-// ---- NtOpenKeyTransacted (Vista+) ----
-// We strip the transaction and open a non-transacted virtual key.
-// This is safe for virtualisation: transactions on virtual keys add
-// complexity without benefit since the virtual store is our own.
 static NTSTATUS NTAPI Hook_NtOpenKeyTransacted(
     PHANDLE               KeyHandle,
     ULONG                 DesiredAccess,
@@ -1207,7 +1453,6 @@ static NTSTATUS NTAPI Hook_NtOpenKeyTransacted(
     return st;
 }
 
-// ---- NtOpenKeyTransactedEx (Win8+) ----
 static NTSTATUS NTAPI Hook_NtOpenKeyTransactedEx(
     PHANDLE               KeyHandle,
     ULONG                 DesiredAccess,
@@ -1237,7 +1482,6 @@ static NTSTATUS NTAPI Hook_NtOpenKeyTransactedEx(
     return st;
 }
 
-// ---- NtCreateKey -- always creates in virtual store ----
 static NTSTATUS NTAPI Hook_NtCreateKey(
     PHANDLE               KeyHandle,
     ULONG                 DesiredAccess,
@@ -1266,7 +1510,6 @@ static NTSTATUS NTAPI Hook_NtCreateKey(
     return st;
 }
 
-// ---- NtCreateKeyTransacted (Vista+) ----
 static NTSTATUS NTAPI Hook_NtCreateKeyTransacted(
     PHANDLE               KeyHandle,
     ULONG                 DesiredAccess,
@@ -1288,7 +1531,6 @@ static NTSTATUS NTAPI Hook_NtCreateKeyTransacted(
                                            TransactionHandle, Disposition);
 
     SetReentrant(true);
-    // Strip transaction -- virtual store is non-transacted
     NTSTATUS st = DoVirtOpen(ObjectAttributes, DesiredAccess, KeyHandle,
                               true, TitleIndex, Class, CreateOptions, Disposition);
     SetReentrant(false);
@@ -1300,7 +1542,6 @@ static NTSTATUS NTAPI Hook_NtCreateKeyTransacted(
     return st;
 }
 
-// ---- NtQueryKey ----
 static NTSTATUS NTAPI Hook_NtQueryKey(
     HANDLE                   KeyHandle,
     VL_KEY_INFORMATION_CLASS KeyInformationClass,
@@ -1322,7 +1563,6 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
                             KeyInformation, Length, ResultLength);
 }
 
-// ---- NtEnumerateKey -- merged view ----
 static NTSTATUS NTAPI Hook_NtEnumerateKey(
     HANDLE                   KeyHandle,
     ULONG                    Index,
@@ -1350,7 +1590,6 @@ static NTSTATUS NTAPI Hook_NtEnumerateKey(
         return Real_NtEnumerateKey(hV, Index, KeyInformationClass,
                                     KeyInformation, Length, ResultLength);
 
-    // Merge: virtual first, then real entries not shadowed by virtual
     SetReentrant(true);
     std::vector<std::wstring> virtNames = CollectSubkeyNames(hV);
     SetReentrant(false);
@@ -1388,7 +1627,6 @@ static NTSTATUS NTAPI Hook_NtEnumerateKey(
     }
 }
 
-// ---- NtEnumerateValueKey -- merged view ----
 static NTSTATUS NTAPI Hook_NtEnumerateValueKey(
     HANDLE                         KeyHandle,
     ULONG                          Index,
@@ -1457,7 +1695,6 @@ static NTSTATUS NTAPI Hook_NtEnumerateValueKey(
     }
 }
 
-// ---- NtQueryValueKey -- virtual takes priority ----
 static NTSTATUS NTAPI Hook_NtQueryValueKey(
     HANDLE                         KeyHandle,
     PVL_UNICODE_STRING              ValueName,
@@ -1477,7 +1714,6 @@ static NTSTATUS NTAPI Hook_NtQueryValueKey(
            ValueName ? FromUStr(ValueName).c_str() : L"(null)",
            KeyHandle, e.hVirt, e.hReal);
 
-    // Virtual has priority
     if (e.hVirt) {
         NTSTATUS st = Real_NtQueryValueKey(e.hVirt, ValueName,
                             KeyValueInformationClass, KeyValueInformation,
@@ -1496,7 +1732,6 @@ static NTSTATUS NTAPI Hook_NtQueryValueKey(
                 Length, ResultLength);
 }
 
-// ---- NtQueryMultipleValueKey -- route to virtual handle ----
 static NTSTATUS NTAPI Hook_NtQueryMultipleValueKey(
     HANDLE             KeyHandle,
     PVL_KEY_VALUE_ENTRY ValueEntries,
@@ -1515,7 +1750,6 @@ static NTSTATUS NTAPI Hook_NtQueryMultipleValueKey(
     VL_DBG(L"Hook_NtQueryMultipleValueKey: entryCount=%u handle=%p virt=%p real=%p",
            EntryCount, KeyHandle, e.hVirt, e.hReal);
 
-    // Try virtual first; fall back to real for entries not found
     HANDLE useH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : KeyHandle);
     NTSTATUS st = Real_NtQueryMultipleValueKey(useH, ValueEntries, EntryCount,
                                                 ValueBuffer, BufferLength,
@@ -1529,7 +1763,6 @@ static NTSTATUS NTAPI Hook_NtQueryMultipleValueKey(
     return st;
 }
 
-// ---- NtSetValueKey -- write to virtual ----
 static NTSTATUS NTAPI Hook_NtSetValueKey(
     HANDLE             KeyHandle,
     PVL_UNICODE_STRING ValueName,
@@ -1552,7 +1785,6 @@ static NTSTATUS NTAPI Hook_NtSetValueKey(
     return Real_NtSetValueKey(writeH, ValueName, TitleIndex, Type, Data, DataSize);
 }
 
-// ---- NtDeleteKey -- delete from virtual only ----
 static NTSTATUS NTAPI Hook_NtDeleteKey(HANDLE KeyHandle) {
     VirtKeyEntry e;
     if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
@@ -1567,7 +1799,6 @@ static NTSTATUS NTAPI Hook_NtDeleteKey(HANDLE KeyHandle) {
     return Real_NtDeleteKey(e.hReal ? e.hReal : KeyHandle);
 }
 
-// ---- NtDeleteValueKey -- delete from virtual only ----
 static NTSTATUS NTAPI Hook_NtDeleteValueKey(
     HANDLE             KeyHandle,
     PVL_UNICODE_STRING ValueName)
@@ -1587,7 +1818,6 @@ static NTSTATUS NTAPI Hook_NtDeleteValueKey(
     return Real_NtDeleteValueKey(e.hReal ? e.hReal : KeyHandle, ValueName);
 }
 
-// ---- NtRenameKey -- rename in virtual store ----
 static NTSTATUS NTAPI Hook_NtRenameKey(
     HANDLE             KeyHandle,
     PVL_UNICODE_STRING NewName)
@@ -1603,7 +1833,6 @@ static NTSTATUS NTAPI Hook_NtRenameKey(
     return Real_NtRenameKey(useH, NewName);
 }
 
-// ---- NtReplaceKey -- complex (hive replacement); pass through with log ----
 static NTSTATUS NTAPI Hook_NtReplaceKey(
     PVL_OBJECT_ATTRIBUTES NewFile,
     HANDLE                TargetHandle,
@@ -1614,8 +1843,6 @@ static NTSTATUS NTAPI Hook_NtReplaceKey(
            (NewFile && NewFile->ObjectName) ? FromUStr(NewFile->ObjectName).c_str() : L"(null)",
            (OldFile && OldFile->ObjectName) ? FromUStr(OldFile->ObjectName).c_str() : L"(null)");
 
-    // NtReplaceKey is an admin operation (replaces a whole hive from a file).
-    // We route the target handle to virtual if tracked; file paths pass through.
     VirtKeyEntry e;
     HANDLE useH = TargetHandle;
     if (g_RegEnabled && GetEntry(TargetHandle, e))
@@ -1624,7 +1851,6 @@ static NTSTATUS NTAPI Hook_NtReplaceKey(
     return Real_NtReplaceKey(NewFile, useH, OldFile);
 }
 
-// ---- NtSaveKey -- save virtual key to file ----
 static NTSTATUS NTAPI Hook_NtSaveKey(HANDLE KeyHandle, HANDLE FileHandle) {
     VirtKeyEntry e;
     HANDLE useH = KeyHandle;
@@ -1637,7 +1863,6 @@ static NTSTATUS NTAPI Hook_NtSaveKey(HANDLE KeyHandle, HANDLE FileHandle) {
     return Real_NtSaveKey(useH, FileHandle);
 }
 
-// ---- NtSaveKeyEx -- save virtual key to file (extended) ----
 static NTSTATUS NTAPI Hook_NtSaveKeyEx(HANDLE KeyHandle, HANDLE FileHandle, ULONG Format) {
     VirtKeyEntry e;
     HANDLE useH = KeyHandle;
@@ -1650,7 +1875,6 @@ static NTSTATUS NTAPI Hook_NtSaveKeyEx(HANDLE KeyHandle, HANDLE FileHandle, ULON
     return Real_NtSaveKeyEx(useH, FileHandle, Format);
 }
 
-// ---- NtLoadKey -- redirect TargetKey to virtual path ----
 static NTSTATUS NTAPI Hook_NtLoadKey(
     PVL_OBJECT_ATTRIBUTES TargetKey,
     PVL_OBJECT_ATTRIBUTES SourceFile)
@@ -1671,7 +1895,6 @@ static NTSTATUS NTAPI Hook_NtLoadKey(
     return Real_NtLoadKey(&voa, SourceFile);
 }
 
-// ---- NtLoadKey2 -- redirect TargetKey to virtual path ----
 static NTSTATUS NTAPI Hook_NtLoadKey2(
     PVL_OBJECT_ATTRIBUTES TargetKey,
     PVL_OBJECT_ATTRIBUTES SourceFile,
@@ -1693,7 +1916,6 @@ static NTSTATUS NTAPI Hook_NtLoadKey2(
     return Real_NtLoadKey2(&voa, SourceFile, Flags);
 }
 
-// ---- NtLoadKeyEx -- redirect TargetKey to virtual path ----
 static NTSTATUS NTAPI Hook_NtLoadKeyEx(
     PVL_OBJECT_ATTRIBUTES TargetKey,
     PVL_OBJECT_ATTRIBUTES SourceFile,
@@ -1724,7 +1946,6 @@ static NTSTATUS NTAPI Hook_NtLoadKeyEx(
                              RootHandle, Reserved);
 }
 
-// ---- NtNotifyChangeKey -- forward to virtual handle ----
 static NTSTATUS NTAPI Hook_NtNotifyChangeKey(
     HANDLE              KeyHandle,
     HANDLE              Event,
@@ -1750,7 +1971,6 @@ static NTSTATUS NTAPI Hook_NtNotifyChangeKey(
                                    Buffer, BufferSize, Asynchronous);
 }
 
-// ---- NtNotifyChangeMultipleKeys -- forward master handle to virtual ----
 static NTSTATUS NTAPI Hook_NtNotifyChangeMultipleKeys(
     HANDLE              MasterKeyHandle,
     ULONG               Count,
@@ -1780,10 +2000,6 @@ static NTSTATUS NTAPI Hook_NtNotifyChangeMultipleKeys(
                                             Asynchronous);
 }
 
-// ---- NtFlushKey -- redirect tracked handle to virtual hive ----
-// Without this hook an app that calls NtFlushKey with a handle obtained
-// outside our open/create path could flush a real hive key, exposing the
-// app's registry footprint in the global hive.
 static NTSTATUS NTAPI Hook_NtFlushKey(HANDLE KeyHandle) {
     VirtKeyEntry e;
     HANDLE useH = KeyHandle;
@@ -1795,9 +2011,6 @@ static NTSTATUS NTAPI Hook_NtFlushKey(HANDLE KeyHandle) {
     return Real_NtFlushKey(useH);
 }
 
-// ---- NtRestoreKey -- redirect tracked handle to virtual hive ----
-// NtRestoreKey loads a hive file onto an existing key.  Redirecting to
-// hVirt ensures the restore lands in the virtual store, not the real hive.
 static NTSTATUS NTAPI Hook_NtRestoreKey(
     HANDLE KeyHandle,
     HANDLE FileHandle,
@@ -1814,9 +2027,6 @@ static NTSTATUS NTAPI Hook_NtRestoreKey(
     return Real_NtRestoreKey(useH, FileHandle, Flags);
 }
 
-// ---- NtSetInformationKey -- redirect tracked handle to virtual hive ----
-// Prevents key metadata changes (e.g. virtualization flags, last-write time
-// via KeyWriteTimeInformation) from leaking to the real hive.
 static NTSTATUS NTAPI Hook_NtSetInformationKey(
     HANDLE KeyHandle,
     ULONG  KeySetInformationClass,
@@ -1835,10 +2045,6 @@ static NTSTATUS NTAPI Hook_NtSetInformationKey(
                                      KeySetInformation, KeySetInformationLength);
 }
 
-// ---- NtUnloadKey -- redirect OA target to virtual path ----
-// NtUnloadKey takes an OBJECT_ATTRIBUTES (absolute path), NOT a handle.
-// Without this hook an app (or a library it loads) can unload a real hive
-// subtree by absolute path regardless of our open/create redirections.
 static NTSTATUS NTAPI Hook_NtUnloadKey(PVL_OBJECT_ATTRIBUTES TargetKey) {
     std::wstring fullPath = GetFullNtPath(TargetKey);
     VL_DBG(L"Hook_NtUnloadKey: target=%s", fullPath.c_str());
@@ -1855,11 +2061,6 @@ static NTSTATUS NTAPI Hook_NtUnloadKey(PVL_OBJECT_ATTRIBUTES TargetKey) {
     return Real_NtUnloadKey(&voa);
 }
 
-// ---- NtLoadKey3 (Win10 RS5 / 1809+) -- redirect TargetKey to virtual path ----
-// NtLoadKey3 is the newest load variant; semantically identical to NtLoadKeyEx
-// for our purposes.  Without this hook a newly compiled app can load a hive
-// into the real registry even though NtLoadKey/NtLoadKey2/NtLoadKeyEx are all
-// redirected.
 static NTSTATUS NTAPI Hook_NtLoadKey3(
     PVL_OBJECT_ATTRIBUTES TargetKey,
     PVL_OBJECT_ATTRIBUTES SourceFile,
@@ -1891,86 +2092,9 @@ static NTSTATUS NTAPI Hook_NtLoadKey3(
                             DesiredAccess, RootHandle, Reserved);
 }
 
-// ---- NtClose -- CRITICAL: only special-case tracked handles ----
-static NTSTATUS NTAPI Hook_NtClose(HANDLE Handle) {
-    VirtKeyEntry e;
-    if (!GetEntry(Handle, e)) {
-        return Real_NtClose(Handle);
-    }
-
-    VL_DBG(L"Hook_NtClose: tracked handle=%p hVirt=%p hReal=%p",
-           Handle, e.hVirt, e.hReal);
-
-    UntrackHandle(Handle);
-
-    NTSTATUS st = VL_STATUS_SUCCESS;
-    if (e.hVirt == Handle) {
-        st = Real_NtClose(Handle);
-        if (e.hReal && e.hReal != Handle)
-            Real_NtClose(e.hReal);
-    } else if (e.hReal == Handle) {
-        st = Real_NtClose(Handle);
-        if (e.hVirt && e.hVirt != Handle)
-            Real_NtClose(e.hVirt);
-    } else {
-        if (e.hVirt) Real_NtClose(e.hVirt);
-        if (e.hReal) Real_NtClose(e.hReal);
-        st = Real_NtClose(Handle);
-    }
-    return st;
-}
-
 // ============================================================
-// REPARSE POINT HOOK  (FSCTL_SET_REPARSE_POINT / FSCTL_GET_REPARSE_POINT)
+// REPARSE POINT HOOK
 // ============================================================
-//
-// Symbolic links and junctions embed their target path inside NTFS reparse
-// point data written via NtFsControlFile(FSCTL_SET_REPARSE_POINT).  The
-// kernel resolves reparse paths in kernel mode, completely bypassing any
-// user-mode hook.  So if the embedded SubstituteName still refers to the
-// logical (non-virtual) location (e.g. \??\C:\ccc\dir) the kernel will
-// fail to follow the link because C:\ccc doesn't exist on real disk.
-//
-// FSCTL_GET_REPARSE_POINT is the mirror: tools reading a junction target
-// (dir /AL, junction.exe, GetFinalPathNameByHandle) would otherwise see the
-// physical virtual-store path (D:\vvv\dir) rather than the logical one the
-// app expects (C:\ccc\dir).  We reverse-translate the output buffer so the
-// caller always sees the logical view.
-//
-// FSCTL_DELETE_REPARSE_POINT needs no hook.  The file handle was already
-// redirected to the virtual-store location by NtCreateFile/NtOpenFile, so
-// the delete operates on the right object with no path translation needed.
-//
-// Reparse-buffer layout (from ntifs.h / Windows Internals):
-//
-//   [HEADER 8 bytes]
-//     ULONG  ReparseTag
-//     USHORT ReparseDataLength   (byte count of everything below)
-//     USHORT Reserved
-//
-//   [SYMLINK union -- IO_REPARSE_TAG_SYMLINK 0xA000000C]
-//     USHORT SubstituteNameOffset  } byte offsets into PathBuffer
-//     USHORT SubstituteNameLength  }
-//     USHORT PrintNameOffset       }
-//     USHORT PrintNameLength       }
-//     ULONG  Flags                 (VL_SYMLINK_FLAG_RELATIVE if relative)
-//     WCHAR  PathBuffer[1]         (SubstituteName then PrintName, packed,
-//                                   NO null separator between them)
-//
-//   [MOUNTPOINT union -- IO_REPARSE_TAG_MOUNT_POINT 0xA0000003 (junctions)]
-//     USHORT SubstituteNameOffset  }
-//     USHORT SubstituteNameLength  }
-//     USHORT PrintNameOffset       }
-//     USHORT PrintNameLength       }
-//     WCHAR  PathBuffer[1]         (SubstituteName, L'\0', PrintName, L'\0')
-//                                  NTFS validates PathBuffer[SubstLen/2]==L'\0'
-//
-// CRITICAL DIFFERENCE between symlinks and junctions:
-//   Symlinks:  PrintNameOffset == SubstituteNameLength  (packed, NO null gap)
-//   Junctions: PrintNameOffset == SubstituteNameLength + 2  (null separator)
-//              and NTFS VALIDATES the null separator before accepting the buffer.
-//              A rebuilt junction buffer without the null separator returns
-//              STATUS_IO_REPARSE_DATA_INVALID even if all lengths are in-bounds.
 
 #define VL_FSCTL_SET_REPARSE_POINT  0x000900A4UL
 #define VL_FSCTL_GET_REPARSE_POINT  0x000900A8UL
@@ -1978,9 +2102,9 @@ static NTSTATUS NTAPI Hook_NtClose(HANDLE Handle) {
 #define VL_IO_REPARSE_TAG_SYMLINK     0xA000000CUL
 #define VL_SYMLINK_FLAG_RELATIVE      0x00000001UL
 
-#define VL_REPARSE_HDR_SIZE        8u   // ReparseTag(4) + DataLen(2) + Reserved(2)
-#define VL_SYMLINK_FIELDS_SIZE    12u   // SubstOff(2)+SubstLen(2)+PrtOff(2)+PrtLen(2)+Flags(4)
-#define VL_MOUNTPOINT_FIELDS_SIZE  8u   // SubstOff(2)+SubstLen(2)+PrtOff(2)+PrtLen(2)
+#define VL_REPARSE_HDR_SIZE        8u
+#define VL_SYMLINK_FIELDS_SIZE    12u
+#define VL_MOUNTPOINT_FIELDS_SIZE  8u
 
 struct VL_REPARSE_DATA_BUFFER {
     ULONG  ReparseTag;
@@ -2023,16 +2147,13 @@ static NTSTATUS NTAPI Hook_NtFsControlFile(
                                      InputBuffer, InputBufferLength,
                                      OutputBuffer, OutputBufferLength);
 
-    // ================================================================
-    // FSCTL_GET_REPARSE_POINT -- reverse-translate output buffer so
-    // callers see the logical path, not the physical virtual-store path.
-    // ================================================================
+    // FSCTL_GET_REPARSE_POINT -- reverse-translate
     if (FsControlCode == VL_FSCTL_GET_REPARSE_POINT) {
         NTSTATUS st = Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
                                             IoStatusBlock, FsControlCode,
                                             InputBuffer, InputBufferLength,
                                             OutputBuffer, OutputBufferLength);
-        if ((!NT_SUCCESS(st) && st != (NTSTATUS)0x80000005L /*STATUS_BUFFER_OVERFLOW*/) ||
+        if ((!NT_SUCCESS(st) && st != (NTSTATUS)0x80000005L) ||
             !OutputBuffer || OutputBufferLength < VL_REPARSE_HDR_SIZE)
             return st;
 
@@ -2050,8 +2171,6 @@ static NTSTATUS NTAPI Hook_NtFsControlFile(
             std::wstring revPrint = ReverseRedirectSymlinkPath(print);
             VL_DBG(L"Hook_NtFsControlFile GET SYMLINK: subst=%s->%s  print=%s->%s",
                    subst.c_str(), revSubst.c_str(), print.c_str(), revPrint.c_str());
-            // Patch in-place only when reverse-translated strings fit the existing slots.
-            // (If they are longer than the originals the buffer would overflow -- skip.)
             if (revSubst.size() <= subst.size() && revPrint.size() <= print.size()) {
                 USHORT rss = (USHORT)(revSubst.size() * sizeof(WCHAR));
                 USHORT rps = (USHORT)(revPrint.size() * sizeof(WCHAR));
@@ -2088,10 +2207,7 @@ static NTSTATUS NTAPI Hook_NtFsControlFile(
         return st;
     }
 
-    // ================================================================
-    // FSCTL_SET_REPARSE_POINT -- redirect embedded target paths so the
-    // kernel resolves the link to the virtual store, not the real location.
-    // ================================================================
+    // FSCTL_SET_REPARSE_POINT -- redirect embedded paths
     if (FsControlCode != VL_FSCTL_SET_REPARSE_POINT ||
         !InputBuffer || InputBufferLength < VL_REPARSE_HDR_SIZE)
         return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
@@ -2101,10 +2217,7 @@ static NTSTATUS NTAPI Hook_NtFsControlFile(
 
     VL_REPARSE_DATA_BUFFER* rdb = (VL_REPARSE_DATA_BUFFER*)InputBuffer;
 
-    // ---- Symbolic link ----
     if (rdb->ReparseTag == VL_IO_REPARSE_TAG_SYMLINK) {
-        // Relative symlinks are relative to the link's own directory;
-        // prefix-based redirection does not apply to them.
         if (rdb->SymLink.Flags & VL_SYMLINK_FLAG_RELATIVE) {
             VL_DBG(L"Hook_NtFsControlFile SET SYMLINK: relative -- pass through");
             return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
@@ -2130,21 +2243,19 @@ static NTSTATUS NTAPI Hook_NtFsControlFile(
                                          InputBuffer, InputBufferLength,
                                          OutputBuffer, OutputBufferLength);
 
-        // Rebuild buffer.
-        // Symlink PathBuffer layout: [SubstituteName][PrintName]  (no null separator)
         USHORT newSubBytes      = (USHORT)(redSubst.size() * sizeof(WCHAR));
         USHORT newPrtBytes      = (USHORT)(redPrint.size() * sizeof(WCHAR));
         USHORT newReparseDataLen = (USHORT)(VL_SYMLINK_FIELDS_SIZE + newSubBytes + newPrtBytes);
         ULONG  newBufSize       = VL_REPARSE_HDR_SIZE + newReparseDataLen;
 
         std::vector<BYTE> newBuf(newBufSize, 0);
-        VL_REPARSE_DATA_BUFFER* n = (VL_REPARSE_DATA_BUFFER*)&newBuf[0];
+        VL_REPARSE_DATA_BUFFER* n = (VL_REPARSE_DATA_BUFFER*)newBuf.data();
         n->ReparseTag                   = rdb->ReparseTag;
         n->ReparseDataLength            = newReparseDataLen;
         n->Reserved                     = 0;
         n->SymLink.SubstituteNameOffset = 0;
         n->SymLink.SubstituteNameLength = newSubBytes;
-        n->SymLink.PrintNameOffset      = newSubBytes;  // immediately after, no null gap
+        n->SymLink.PrintNameOffset      = newSubBytes;
         n->SymLink.PrintNameLength      = newPrtBytes;
         n->SymLink.Flags                = rdb->SymLink.Flags;
         memcpy(n->SymLink.PathBuffer, redSubst.c_str(), newSubBytes);
@@ -2154,11 +2265,10 @@ static NTSTATUS NTAPI Hook_NtFsControlFile(
                InputBufferLength, newBufSize);
         return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
                                      IoStatusBlock, FsControlCode,
-                                     &newBuf[0], newBufSize,
+                                     newBuf.data(), newBufSize,
                                      OutputBuffer, OutputBufferLength);
     }
 
-    // ---- Junction / mount point ----
     if (rdb->ReparseTag == VL_IO_REPARSE_TAG_MOUNT_POINT) {
         WCHAR* pb = rdb->MountPoint.PathBuffer;
         std::wstring subst(pb + rdb->MountPoint.SubstituteNameOffset / sizeof(WCHAR),
@@ -2177,51 +2287,35 @@ static NTSTATUS NTAPI Hook_NtFsControlFile(
                                          InputBuffer, InputBufferLength,
                                          OutputBuffer, OutputBufferLength);
 
-        // Rebuild buffer.
-        // Junction PathBuffer layout (mandatory, NTFS validates this):
-        //   [SubstituteName (newSubBytes)]
-        //   [L'\0' null separator (sizeof WCHAR = 2 bytes)]   <- NTFS checks this byte
-        //   [PrintName (newPrtBytes)]
-        //   [L'\0' null terminator (sizeof WCHAR = 2 bytes)]
-        //
-        // PrintNameOffset MUST be SubstituteNameLength + sizeof(WCHAR).
-        // If it equals SubstituteNameLength (no null gap), NTFS finds a non-zero
-        // WCHAR at PathBuffer[SubstituteNameLength/2] and returns
-        // STATUS_IO_REPARSE_DATA_INVALID, causing the junction creation to fail.
         USHORT newSubBytes  = (USHORT)(redSubst.size() * sizeof(WCHAR));
         USHORT newPrtBytes  = (USHORT)(redPrint.size() * sizeof(WCHAR));
-        USHORT newPrtOff    = newSubBytes + (USHORT)sizeof(WCHAR);  // after null separator
+        USHORT newPrtOff    = newSubBytes + (USHORT)sizeof(WCHAR);
         USHORT newDataLen   = (USHORT)(VL_MOUNTPOINT_FIELDS_SIZE
                                        + newPrtOff + newPrtBytes
-                                       + (USHORT)sizeof(WCHAR));    // trailing null
+                                       + (USHORT)sizeof(WCHAR));
         ULONG  newBufSize   = VL_REPARSE_HDR_SIZE + newDataLen;
 
-        std::vector<BYTE> newBuf(newBufSize, 0);  // zero-init: nulls already in place
-        VL_REPARSE_DATA_BUFFER* n = (VL_REPARSE_DATA_BUFFER*)&newBuf[0];
+        std::vector<BYTE> newBuf(newBufSize, 0);
+        VL_REPARSE_DATA_BUFFER* n = (VL_REPARSE_DATA_BUFFER*)newBuf.data();
         n->ReparseTag                      = rdb->ReparseTag;
         n->ReparseDataLength               = newDataLen;
         n->Reserved                        = 0;
         n->MountPoint.SubstituteNameOffset = 0;
         n->MountPoint.SubstituteNameLength = newSubBytes;
-        n->MountPoint.PrintNameOffset      = newPrtOff;  // SubstLen + 2 (past null separator)
+        n->MountPoint.PrintNameOffset      = newPrtOff;
         n->MountPoint.PrintNameLength      = newPrtBytes;
         memcpy(n->MountPoint.PathBuffer, redSubst.c_str(), newSubBytes);
-        // PathBuffer[newSubBytes/2] is already L'\0' (buffer is zero-initialized)
         memcpy((BYTE*)n->MountPoint.PathBuffer + newPrtOff, redPrint.c_str(), newPrtBytes);
-        // PathBuffer at (newPrtOff+newPrtBytes)/2 is already L'\0' (trailing null)
 
         VL_DBG(L"Hook_NtFsControlFile SET JUNCTION: rebuilt buffer %u->%u bytes"
                L" (subst=%u prtOff=%u prt=%u)",
                InputBufferLength, newBufSize, newSubBytes, newPrtOff, newPrtBytes);
         return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
                                      IoStatusBlock, FsControlCode,
-                                     &newBuf[0], newBufSize,
+                                     newBuf.data(), newBufSize,
                                      OutputBuffer, OutputBufferLength);
     }
 
-    // Unknown reparse tag -- pass through untouched (covers FSCTL_DELETE_REPARSE_POINT
-    // which uses a different FSCTL code and reaches the pass-through above this block,
-    // plus any third-party reparse tags).
     return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
                                  IoStatusBlock, FsControlCode,
                                  InputBuffer, InputBufferLength,
@@ -2232,349 +2326,20 @@ static NTSTATUS NTAPI Hook_NtFsControlFile(
 // FILE SYSTEM HOOKS
 // ============================================================
 
-// FILE_OPEN_BY_FILE_ID: when set in CreateOptions/OpenOptions, ObjectName
-// contains a raw binary file ID (8 bytes NTFS, 16 bytes ReFS), NOT a path.
-// Path-based redirection cannot apply to such opens; we skip RedirectFileOA
-// entirely and pass through directly.  (Without this guard FromUStr would
-// silently interpret the binary ID as garbage wchar_t characters.)
-#ifndef FILE_OPEN_BY_FILE_ID
-#  define FILE_OPEN_BY_FILE_ID 0x00002000
-#endif
-
-// ============================================================
-// Filesystem CoW helpers
-// ============================================================
-//
-// Design mirrors Sandboxie:
-//
-//   READ  (FILE_OPEN / queries):
-//     1. Try virtual path first.
-//     2. If virtual returns a "not found" status AND no tombstone exists
-//        for this path → fall back and serve the REAL file.
-//     This means existing DLLs, system files, configs etc. are
-//     transparently visible inside the sandbox without any pre-copy.
-//
-//   WRITE (FILE_CREATE / FILE_OVERWRITE / FILE_SUPERSEDE /
-//          FILE_OVERWRITE_IF):
-//     - Ensure the virtual directory tree exists.
-//     - Always create/write in virtual; real is never touched.
-//     - FILE_OVERWRITE(_IF) on a file that exists only in real is
-//       promoted to FILE_SUPERSEDE so the kernel creates a fresh
-//       virtual-store entry (the app is about to replace the content
-//       anyway).
-//
-//   WRITE-ON-EXISTING (FILE_OPEN + write access):
-//     - If virtual has the file: open virtual for write (normal).
-//     - If only real has it: copy real → virtual first (true CoW),
-//       then open the virtual copy for write.  Real is never written.
-//
-//   DELETE (NtDeleteFile):
-//     - Delete from virtual if present.
-//     - If the file existed only in real (nothing in virtual):
-//       create a zero-byte tombstone "<file>.vl_deleted" in virtual
-//       so subsequent reads know the file was "deleted" inside the
-//       sandbox and do NOT fall through to the real path.
-//
-//   TOMBSTONE checks (queries / open):
-//     Before falling back to real, we check for a tombstone file.
-//     If one exists the path is treated as deleted → NOT_FOUND.
-
-// File create-disposition constants (ntifs.h / WDK)
-#ifndef FILE_SUPERSEDE
-#  define FILE_SUPERSEDE    0x00000000
-#  define FILE_OPEN         0x00000001
-#  define FILE_CREATE       0x00000002
-#  define FILE_OPEN_IF      0x00000003
-#  define FILE_OVERWRITE    0x00000004
-#  define FILE_OVERWRITE_IF 0x00000005
-#endif
-
-// CreateOptions flags used when creating virtual directories
-#ifndef FILE_DIRECTORY_FILE
-#  define FILE_DIRECTORY_FILE           0x00000001
-#endif
-#ifndef FILE_NON_DIRECTORY_FILE
-#  define FILE_NON_DIRECTORY_FILE       0x00000040
-#endif
-#ifndef FILE_SYNCHRONOUS_IO_NONALERT
-#  define FILE_SYNCHRONOUS_IO_NONALERT  0x00000020
-#endif
-
-// Access-right bits that imply write intent
-#ifndef FILE_WRITE_DATA
-#  define FILE_WRITE_DATA       0x00000002UL
-#  define FILE_APPEND_DATA      0x00000004UL
-#  define FILE_WRITE_EA         0x00000010UL
-#  define FILE_WRITE_ATTRIBUTES 0x00000100UL
-#endif
-
-// Needed by EnsureVirtualFsPath
-#ifndef FILE_LIST_DIRECTORY
-#  define FILE_LIST_DIRECTORY   0x00000001UL
-#endif
-#ifndef SYNCHRONIZE
-#  define SYNCHRONIZE           0x00100000UL
-#endif
-
-// Additional not-found status codes: VL_STATUS_OBJECT_PATH_NOT_FOUND and
-// VL_STATUS_NO_SUCH_FILE are defined near the top of this file with all
-// other NT status codes.
-
-// --- IsFsNotFound --------------------------------------------------
-// Returns true for any status that means "path or file doesn't exist."
-// Used to decide when to fall back to the real path (CoW read) or to
-// create a tombstone (CoW delete).
-static inline bool IsFsNotFound(NTSTATUS st) {
-    return st == VL_STATUS_OBJECT_NAME_NOT_FOUND  ||
-           st == VL_STATUS_OBJECT_PATH_NOT_FOUND  ||
-           st == VL_STATUS_NO_SUCH_FILE;
-}
-
-// --- HasWriteAccess ------------------------------------------------
-// Returns true when the requested access mask includes any write right.
-static inline bool HasWriteAccess(ULONG access) {
-    return (access & (GENERIC_WRITE      |
-                      FILE_WRITE_DATA    |
-                      FILE_APPEND_DATA   |
-                      FILE_WRITE_EA      |
-                      FILE_WRITE_ATTRIBUTES)) != 0;
-}
-
-// --- EnsureVirtualFsPath -------------------------------------------
-// Creates every directory component between the virtual root and the
-// parent directory of virtualNtFilePath using Real_NtCreateFile with
-// FILE_OPEN_IF | FILE_DIRECTORY_FILE (creates if absent, opens if
-// present, never fails if the directory already exists).
-//
-// This is needed so that write-intent operations (create, overwrite,
-// CoW copy) don't fail with STATUS_OBJECT_PATH_NOT_FOUND just because
-// the virtual store doesn't yet have the intermediate folders.
-static void EnsureVirtualFsPath(const std::wstring& virtualNtFilePath) {
-    if (!Real_NtCreateFile) return;
-
-    // Strip filename: work on the directory portion only.
-    size_t lastSlash = virtualNtFilePath.rfind(L'\\');
-    if (lastSlash == std::wstring::npos) return;
-    const std::wstring dirPath = virtualNtFilePath.substr(0, lastSlash);
-
-    // Identify which virtual root this path lives under.
-    std::wstring virtRoot;
-    for (size_t i = 0; i < g_FsRedirects.size(); ++i) {
-        const std::wstring& to = g_FsRedirects[i].second;
-        if (!to.empty() && StartsWithI(dirPath, to)) {
-            virtRoot = to;
-            break;
-        }
-    }
-    if (virtRoot.empty() &&
-        !g_FsDirNtBase.empty() &&
-        StartsWithI(dirPath, g_FsDirNtBase))
-    {
-        virtRoot = g_FsDirNtBase;
-    }
-    if (virtRoot.empty()) return;  // Path is not under any known virtual root.
-
-    // Walk each component after the virtual root and ensure it exists.
-    std::wstring remaining = dirPath.substr(virtRoot.size());
-    std::wstring current   = virtRoot;
-
-    while (!remaining.empty()) {
-        size_t start = (remaining[0] == L'\\') ? 1u : 0u;
-        size_t slash  = remaining.find(L'\\', start);
-        std::wstring seg;
-        if (slash != std::wstring::npos) {
-            seg       = remaining.substr(start, slash - start);
-            remaining = remaining.substr(slash);
-        } else {
-            seg       = remaining.substr(start);
-            remaining = L"";
-        }
-        if (seg.empty()) continue;
-        current += L"\\" + seg;
-
-        VL_UNICODE_STRING us;  MakeUStr(&us, current);
-        VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
-        VL_IO_STATUS_BLOCK iosb;
-        ZeroMemory(&iosb, sizeof(iosb));
-        HANDLE h = NULL;
-
-        NTSTATUS st = Real_NtCreateFile(
-            &h,
-            FILE_LIST_DIRECTORY | SYNCHRONIZE,
-            &oa, &iosb,
-            NULL,
-            FILE_ATTRIBUTE_DIRECTORY,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_OPEN_IF,
-            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-            NULL, 0);
-
-        if (NT_SUCCESS(st) && h) Real_NtClose(h);
-        // On failure (e.g. access denied) continue — the subsequent
-        // file operation will fail with its own clear error.
-    }
-}
-
-// --- Tombstone helpers ---------------------------------------------
-// A tombstone is a zero-byte file at  <virtualPath>.vl_deleted
-// It records that the sandboxed app deleted a file that only ever
-// existed in the real store (so reads must NOT fall back to real).
-
-static std::wstring TombstonePath(const std::wstring& virtualNtPath) {
-    return virtualNtPath + L".vl_deleted";
-}
-
-static bool TombstoneExists(const std::wstring& virtualNtPath) {
-    if (!Real_NtQueryAttributesFile) return false;
-    std::wstring tp = TombstonePath(virtualNtPath);
-    VL_UNICODE_STRING us; MakeUStr(&us, tp);
-    VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
-    // FILE_BASIC_INFORMATION is 40 bytes; use a generous buffer.
-    BYTE dummy[48];
-    ZeroMemory(dummy, sizeof(dummy));
-    NTSTATUS st = Real_NtQueryAttributesFile(&oa, dummy);
-    VL_DBG(L"TombstoneExists: %s st=0x%08X", tp.c_str(), (ULONG)st);
-    return NT_SUCCESS(st);
-}
-
-static void CreateTombstone(const std::wstring& virtualNtPath) {
-    if (!Real_NtCreateFile) return;
-    std::wstring tp = TombstonePath(virtualNtPath);
-    VL_DBG(L"CreateTombstone: creating %s", tp.c_str());
-    EnsureVirtualFsPath(tp);   // ensure the directory exists first
-    VL_UNICODE_STRING us; MakeUStr(&us, tp);
-    VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
-    VL_IO_STATUS_BLOCK iosb;
-    ZeroMemory(&iosb, sizeof(iosb));
-    HANDLE h = NULL;
-    NTSTATUS st = Real_NtCreateFile(
-        &h,
-        GENERIC_WRITE | SYNCHRONIZE,
-        &oa, &iosb,
-        NULL, FILE_ATTRIBUTE_NORMAL,
-        FILE_SHARE_READ,
-        FILE_SUPERSEDE,
-        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        NULL, 0);
-    if (NT_SUCCESS(st) && h) Real_NtClose(h);
-    VL_DBG(L"CreateTombstone: %s st=0x%08X", tp.c_str(), (ULONG)st);
-}
-
-static void DeleteTombstoneIfPresent(const std::wstring& virtualNtPath) {
-    if (!Real_NtDeleteFile) return;
-    std::wstring tp = TombstonePath(virtualNtPath);
-    VL_UNICODE_STRING us; MakeUStr(&us, tp);
-    VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
-    NTSTATUS st = Real_NtDeleteFile(&oa);
-    VL_DBG(L"DeleteTombstoneIfPresent: %s st=0x%08X", tp.c_str(), (ULONG)st);
-}
-
-// --- CopyRealFileToVirtual -----------------------------------------
-// Copies a file from the real path (realNtPath) to the virtual store
-// (virtualNtPath) using Raw NT calls so that our own hooks are not
-// re-entered.  Called when the app opens a real-only file for writing
-// (true copy-on-write).
-//
-// Returns true on success.  On failure the caller should NOT open the
-// virtual path for writing (that would expose an empty file).
-static bool CopyRealFileToVirtual(const std::wstring& realNtPath,
-                                    const std::wstring& virtualNtPath)
-{
-    if (!Real_NtReadFile || !Real_NtWriteFile || !Real_NtCreateFile) return false;
-
-    VL_DBG(L"CopyRealFileToVirtual: %s -> %s",
-           realNtPath.c_str(), virtualNtPath.c_str());
-
-    // Open the real source for reading.
-    VL_UNICODE_STRING srcUs; MakeUStr(&srcUs, realNtPath);
-    VL_OBJECT_ATTRIBUTES srcOa; MakeOA(&srcOa, &srcUs);
-    VL_IO_STATUS_BLOCK iosb;
-    ZeroMemory(&iosb, sizeof(iosb));
-    HANDLE hSrc = NULL;
-    NTSTATUS st = Real_NtCreateFile(
-        &hSrc,
-        GENERIC_READ | SYNCHRONIZE,
-        &srcOa, &iosb,
-        NULL, FILE_ATTRIBUTE_NORMAL,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        FILE_OPEN,
-        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        NULL, 0);
-    if (!NT_SUCCESS(st)) {
-        VL_DBG(L"CopyRealFileToVirtual: open src FAILED st=0x%08X", (ULONG)st);
-        return false;
-    }
-
-    // Ensure the virtual directory tree exists.
-    EnsureVirtualFsPath(virtualNtPath);
-
-    // Create (or replace) the destination in the virtual store.
-    VL_UNICODE_STRING dstUs; MakeUStr(&dstUs, virtualNtPath);
-    VL_OBJECT_ATTRIBUTES dstOa; MakeOA(&dstOa, &dstUs);
-    ZeroMemory(&iosb, sizeof(iosb));
-    HANDLE hDst = NULL;
-    st = Real_NtCreateFile(
-        &hDst,
-        GENERIC_WRITE | SYNCHRONIZE,
-        &dstOa, &iosb,
-        NULL, FILE_ATTRIBUTE_NORMAL,
-        FILE_SHARE_READ,
-        FILE_SUPERSEDE,
-        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        NULL, 0);
-    if (!NT_SUCCESS(st)) {
-        VL_DBG(L"CopyRealFileToVirtual: create dst FAILED st=0x%08X", (ULONG)st);
-        Real_NtClose(hSrc);
-        return false;
-    }
-
-    // Stream-copy using 256 KB chunks.
-    // Declare buffers and loop state before the loop (VS2010 C++03).
-    enum { kBufSize = 256 * 1024 };
-    std::vector<BYTE> buf(kBufSize);
-    LARGE_INTEGER offset;
-    offset.QuadPart = 0;
-    LONGLONG totalBytes = 0;
-    VL_IO_STATUS_BLOCK rIosb;
-    VL_IO_STATUS_BLOCK wIosb;
-
-    for (;;) {
-        ZeroMemory(&rIosb, sizeof(rIosb));
-        st = Real_NtReadFile(hSrc, NULL, NULL, NULL, &rIosb,
-                              &buf[0], (ULONG)kBufSize, &offset, NULL);
-        if (!NT_SUCCESS(st) || rIosb.Information == 0) break;
-
-        ULONG chunk = (ULONG)rIosb.Information;
-        ZeroMemory(&wIosb, sizeof(wIosb));
-        Real_NtWriteFile(hDst, NULL, NULL, NULL, &wIosb,
-                          &buf[0], chunk, &offset, NULL);
-
-        offset.QuadPart += chunk;
-        totalBytes      += chunk;
-    }
-
-    Real_NtClose(hSrc);
-    Real_NtClose(hDst);
-    VL_DBG(L"CopyRealFileToVirtual: done %I64d bytes", totalBytes);
-    return true;
-}
-
 // ---- NtCreateFile ----
 static NTSTATUS NTAPI Hook_NtCreateFile(
-    PHANDLE               FileHandle,
-    ULONG                 DesiredAccess,
+    PHANDLE FileHandle,
+    ULONG DesiredAccess,
     PVL_OBJECT_ATTRIBUTES ObjectAttributes,
-    PVL_IO_STATUS_BLOCK   IoStatusBlock,
-    PLARGE_INTEGER        AllocationSize,
-    ULONG                 FileAttributes,
-    ULONG                 ShareAccess,
-    ULONG                 CreateDisposition,
-    ULONG                 CreateOptions,
-    PVOID                 EaBuffer,
-    ULONG                 EaLength)
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER AllocationSize,
+    ULONG FileAttributes,
+    ULONG ShareAccess,
+    ULONG CreateDisposition,
+    ULONG CreateOptions,
+    PVOID EaBuffer,
+    ULONG EaLength)
 {
-    // When FILE_OPEN_BY_FILE_ID is set the ObjectName field contains a
-    // binary file ID, not a string.  Pass through without touching it.
     if (CreateOptions & FILE_OPEN_BY_FILE_ID) {
         VL_DBG(L"Hook_NtCreateFile: FILE_OPEN_BY_FILE_ID - pass through");
         return Real_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
@@ -2587,160 +2352,166 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
     VL_UNICODE_STRING newName; VL_OBJECT_ATTRIBUTES newOa;
     bool redirected = RedirectFileOA(ObjectAttributes, newName, newOa, ntPath, redPath);
 
+    VL_DBG(L"Hook_NtCreateFile: %s%s", ntPath.c_str(), redirected ? L" [REDIRECT]" : L"");
+
     if (!redirected)
         return Real_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
                                   IoStatusBlock, AllocationSize, FileAttributes,
                                   ShareAccess, CreateDisposition, CreateOptions,
                                   EaBuffer, EaLength);
 
-    VL_DBG(L"Hook_NtCreateFile: %s -> %s disp=%u acc=0x%08X",
-           ntPath.c_str(), redPath.c_str(), CreateDisposition, DesiredAccess);
+    VL_DBG(L"Hook_NtCreateFile: -> %s", redPath.c_str());
 
-    // ----------------------------------------------------------------
-    // WRITE-ONLY DISPOSITIONS
-    //   FILE_CREATE, FILE_SUPERSEDE, FILE_OVERWRITE, FILE_OVERWRITE_IF
-    //
-    // These never need to read existing content from real, so we:
-    //   1. Ensure the virtual directory tree exists.
-    //   2. Remove any tombstone that marks the path as "deleted".
-    //   3. Redirect entirely to virtual.
-    //
-    // Special case: FILE_OVERWRITE(_IF) requires the file to already
-    // exist.  If the virtual store doesn't have it yet (only real does),
-    // promote the disposition to FILE_SUPERSEDE — the app is about to
-    // replace the content anyway, so a fresh empty virtual file is fine.
-    // ----------------------------------------------------------------
-    if (CreateDisposition == FILE_CREATE    ||
-        CreateDisposition == FILE_SUPERSEDE ||
-        CreateDisposition == FILE_OVERWRITE ||
-        CreateDisposition == FILE_OVERWRITE_IF)
-    {
-        SetReentrant(true);
-        EnsureVirtualFsPath(redPath);
-        DeleteTombstoneIfPresent(redPath);
-        SetReentrant(false);
+    bool isDir = (CreateOptions & FILE_DIRECTORY_FILE) != 0;
+    bool isWrite = (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA | DELETE | WRITE_DAC | WRITE_OWNER | FILE_DELETE_CHILD | STANDARD_RIGHTS_WRITE | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY)) != 0;
+    bool isCreateNew = (CreateDisposition == FILE_CREATE || CreateDisposition == FILE_SUPERSEDE);
+    bool cowIfExists = !isCreateNew; // FILE_OPEN, FILE_OPEN_IF, FILE_OVERWRITE, FILE_OVERWRITE_IF
 
-        ULONG dispToUse = CreateDisposition;
-        if (CreateDisposition == FILE_OVERWRITE ||
-            CreateDisposition == FILE_OVERWRITE_IF)
-        {
-            // Probe: does the virtual store already have this file?
-            VL_UNICODE_STRING probe; MakeUStr(&probe, redPath);
-            VL_OBJECT_ATTRIBUTES probeOa; MakeOA(&probeOa, &probe);
-            BYTE dummy[48] = {0};
-            if (IsFsNotFound(Real_NtQueryAttributesFile(&probeOa, dummy)))
-                dispToUse = FILE_SUPERSEDE;  // create fresh; app overwrites anyway
+    // Try virtual path first
+    HANDLE hVirt = NULL;
+    NTSTATUS st = Real_NtCreateFile(&hVirt, DesiredAccess, &newOa, IoStatusBlock,
+                                     AllocationSize, FileAttributes, ShareAccess,
+                                     CreateDisposition, CreateOptions, EaBuffer, EaLength);
+
+    if (NT_SUCCESS(st)) {
+        VirtFileEntry e = {};
+        e.hVirt = hVirt;
+        e.logPath = ntPath;
+        e.isDir = isDir;
+        e.isRealOnly = false;
+        if (isDir) {
+            VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
+            VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
+            IO_STATUS_BLOCK iosb;
+            Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            FILE_DIRECTORY_FILE);
         }
-
-        VL_DBG(L"Hook_NtCreateFile: write-create disp=%u->%u -> %s",
-               CreateDisposition, dispToUse, redPath.c_str());
-        return Real_NtCreateFile(FileHandle, DesiredAccess, &newOa,
-                                  IoStatusBlock, AllocationSize, FileAttributes,
-                                  ShareAccess, dispToUse, CreateOptions,
-                                  EaBuffer, EaLength);
-    }
-
-    // ----------------------------------------------------------------
-    // FILE_OPEN_IF + write access
-    //   The app will open-or-create.  We ensure the virtual directory
-    //   tree exists so FILE_OPEN_IF can create a new virtual entry.
-    //   If the virtual file is missing and real has one, copy it first
-    //   (true CoW) so any subsequent read on the same handle sees the
-    //   existing content.
-    // ----------------------------------------------------------------
-    if (CreateDisposition == FILE_OPEN_IF && HasWriteAccess(DesiredAccess)) {
-        SetReentrant(true);
-        EnsureVirtualFsPath(redPath);
-        DeleteTombstoneIfPresent(redPath);
-        SetReentrant(false);
-        // Fall through to the CoW logic below — the virtual attempt will
-        // now either succeed (file already in virtual) or correctly
-        // trigger a copy from real.
-    }
-
-    // ----------------------------------------------------------------
-    // FILE_OPEN / FILE_OPEN_IF (read-only, or open-if already handled)
-    //
-    // CoW read semantics:
-    //   1. Try virtual first.
-    //   2. On success → return (virtual file served).
-    //   3. On non-"not-found" error → propagate (e.g. ACCESS_DENIED).
-    //   4. On "not-found":
-    //      a. If a tombstone exists → the file was deleted inside the
-    //         sandbox; return STATUS_OBJECT_NAME_NOT_FOUND.
-    //      b. If real also doesn't have it → return original not-found.
-    //      c. Read-only access → serve the real file directly
-    //         (transparent read-through, sandbox state unchanged).
-    //      d. Write access → copy real → virtual, then open virtual
-    //         (true CoW; real is never written).
-    // ----------------------------------------------------------------
-    NTSTATUS st = Real_NtCreateFile(FileHandle, DesiredAccess, &newOa,
-                                     IoStatusBlock, AllocationSize, FileAttributes,
-                                     ShareAccess, CreateDisposition, CreateOptions,
-                                     EaBuffer, EaLength);
-    if (NT_SUCCESS(st)) return st;
-    if (!IsFsNotFound(st)) return st;   // Access denied, sharing violation, etc.
-
-    VL_DBG(L"Hook_NtCreateFile: virtual not found (0x%08X), checking tombstone/real",
-           (ULONG)st);
-
-    // Tombstone check (inside SetReentrant so our hooks don't recurse).
-    SetReentrant(true);
-    bool tombstoned = TombstoneExists(redPath);
-    SetReentrant(false);
-
-    if (tombstoned) {
-        VL_DBG(L"Hook_NtCreateFile: tombstone -> deleted in sandbox, NOT_FOUND");
-        return VL_STATUS_OBJECT_NAME_NOT_FOUND;
-    }
-
-    // Does the real file exist?
-    BYTE basicBuf[48] = {0};
-    NTSTATUS realCheck = Real_NtQueryAttributesFile(ObjectAttributes, basicBuf);
-    if (IsFsNotFound(realCheck)) {
-        VL_DBG(L"Hook_NtCreateFile: real also not found, returning 0x%08X", (ULONG)st);
+        TrackFileHandle(hVirt, e);
+        *FileHandle = hVirt;
         return st;
     }
 
-    if (!HasWriteAccess(DesiredAccess)) {
-        // Read-only CoW: serve the real file directly; sandbox unchanged.
-        VL_DBG(L"Hook_NtCreateFile: read-only CoW fallback to real: %s", ntPath.c_str());
-        return Real_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
-                                  IoStatusBlock, AllocationSize, FileAttributes,
-                                  ShareAccess, CreateDisposition, CreateOptions,
-                                  EaBuffer, EaLength);
+    if (st == VL_STATUS_OBJECT_NOT_FOUND || st == VL_STATUS_OBJECT_PATH_NOT_FOUND) {
+        if (!isWrite && cowIfExists) {
+            // COW read fallback
+            VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
+            VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
+            HANDLE hReal = NULL;
+            NTSTATUS stReal = Real_NtCreateFile(&hReal, DesiredAccess, &realOa, IoStatusBlock,
+                                                 AllocationSize, FileAttributes, ShareAccess,
+                                                 CreateDisposition, CreateOptions, EaBuffer, EaLength);
+            if (NT_SUCCESS(stReal)) {
+                VirtFileEntry e = {};
+                e.hVirt = hReal;
+                e.logPath = ntPath;
+                e.isDir = isDir;
+                e.isRealOnly = true;
+                TrackFileHandle(hReal, e);
+                *FileHandle = hReal;
+                VL_DBG(L"Hook_NtCreateFile: COW read fallback h=%p", hReal);
+                return stReal;
+            }
+        } else {
+            if (!isDir) {
+                if (cowIfExists) {
+                    // Try copy from real for write
+                    VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
+                    VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
+                    HANDLE hCheck = NULL;
+                    IO_STATUS_BLOCK iosb;
+                    NTSTATUS stCheck = Real_NtOpenFile(&hCheck, FILE_READ_ATTRIBUTES | SYNCHRONIZE, &realOa, &iosb,
+                                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                                        FILE_NON_DIRECTORY_FILE);
+                    if (NT_SUCCESS(stCheck)) {
+                        Real_NtClose(hCheck);
+                        VL_DBG(L"Hook_NtCreateFile: COW copy %s -> %s", ntPath.c_str(), redPath.c_str());
+                        NTSTATUS stCopy = CowCopyFile(ntPath, redPath);
+                        if (NT_SUCCESS(stCopy)) {
+                            st = Real_NtCreateFile(&hVirt, DesiredAccess, &newOa, IoStatusBlock,
+                                                    AllocationSize, FileAttributes, ShareAccess,
+                                                    CreateDisposition, CreateOptions, EaBuffer, EaLength);
+                            if (NT_SUCCESS(st)) {
+                                VirtFileEntry e = {};
+                                e.hVirt = hVirt;
+                                e.logPath = ntPath;
+                                e.isDir = false;
+                                e.isRealOnly = false;
+                                TrackFileHandle(hVirt, e);
+                                *FileHandle = hVirt;
+                                return st;
+                            }
+                        }
+                    } else {
+                        EnsureVirtualDirForFile(redPath);
+                        st = Real_NtCreateFile(&hVirt, DesiredAccess, &newOa, IoStatusBlock,
+                                                AllocationSize, FileAttributes, ShareAccess,
+                                                CreateDisposition, CreateOptions, EaBuffer, EaLength);
+                        if (NT_SUCCESS(st)) {
+                            VirtFileEntry e = {};
+                            e.hVirt = hVirt;
+                            e.logPath = ntPath;
+                            e.isDir = false;
+                            e.isRealOnly = false;
+                            TrackFileHandle(hVirt, e);
+                            *FileHandle = hVirt;
+                            return st;
+                        }
+                    }
+                } else {
+                    // FILE_CREATE / FILE_SUPERSEDE: just create in virtual
+                    EnsureVirtualDirForFile(redPath);
+                    st = Real_NtCreateFile(&hVirt, DesiredAccess, &newOa, IoStatusBlock,
+                                            AllocationSize, FileAttributes, ShareAccess,
+                                            CreateDisposition, CreateOptions, EaBuffer, EaLength);
+                    if (NT_SUCCESS(st)) {
+                        VirtFileEntry e = {};
+                        e.hVirt = hVirt;
+                        e.logPath = ntPath;
+                        e.isDir = false;
+                        e.isRealOnly = false;
+                        TrackFileHandle(hVirt, e);
+                        *FileHandle = hVirt;
+                        return st;
+                    }
+                }
+            } else {
+                // Directory
+                EnsureVirtualDir(redPath);
+                st = Real_NtCreateFile(&hVirt, DesiredAccess, &newOa, IoStatusBlock,
+                                        AllocationSize, FileAttributes, ShareAccess,
+                                        CreateDisposition, CreateOptions, EaBuffer, EaLength);
+                if (NT_SUCCESS(st)) {
+                    VirtFileEntry e = {};
+                    e.hVirt = hVirt;
+                    e.logPath = ntPath;
+                    e.isDir = true;
+                    e.isRealOnly = false;
+                    VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
+                    VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
+                    IO_STATUS_BLOCK iosb;
+                    Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    FILE_DIRECTORY_FILE);
+                    TrackFileHandle(hVirt, e);
+                    *FileHandle = hVirt;
+                    return st;
+                }
+            }
+        }
     }
 
-    // Write-on-existing CoW: copy real → virtual, then open the virtual copy.
-    VL_DBG(L"Hook_NtCreateFile: write CoW, copying real->virtual");
-    SetReentrant(true);
-    bool copied = CopyRealFileToVirtual(ntPath, redPath);
-    SetReentrant(false);
-
-    if (!copied) {
-        // Copy failed (e.g. source locked exclusively).  To protect
-        // sandbox containment we do NOT fall back to real for writes.
-        VL_DBG(L"Hook_NtCreateFile: CoW copy failed, returning 0x%08X", (ULONG)st);
-        return st;
-    }
-
-    VL_DBG(L"Hook_NtCreateFile: opening virtual CoW copy: %s", redPath.c_str());
-    return Real_NtCreateFile(FileHandle, DesiredAccess, &newOa,
-                              IoStatusBlock, AllocationSize, FileAttributes,
-                              ShareAccess, CreateDisposition, CreateOptions,
-                              EaBuffer, EaLength);
+    return st;
 }
 
 // ---- NtOpenFile ----
-// NtOpenFile always has FILE_OPEN semantics; CoW read/write same as
-// Hook_NtCreateFile with CreateDisposition == FILE_OPEN.
 static NTSTATUS NTAPI Hook_NtOpenFile(
-    PHANDLE               FileHandle,
-    ULONG                 DesiredAccess,
+    PHANDLE FileHandle,
+    ULONG DesiredAccess,
     PVL_OBJECT_ATTRIBUTES ObjectAttributes,
-    PVL_IO_STATUS_BLOCK   IoStatusBlock,
-    ULONG                 ShareAccess,
-    ULONG                 OpenOptions)
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    ULONG ShareAccess,
+    ULONG OpenOptions)
 {
     if (OpenOptions & FILE_OPEN_BY_FILE_ID) {
         VL_DBG(L"Hook_NtOpenFile: FILE_OPEN_BY_FILE_ID - pass through");
@@ -2752,64 +2523,125 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
     VL_UNICODE_STRING newName; VL_OBJECT_ATTRIBUTES newOa;
     bool redirected = RedirectFileOA(ObjectAttributes, newName, newOa, ntPath, redPath);
 
+    VL_DBG(L"Hook_NtOpenFile: %s%s", ntPath.c_str(), redirected ? L" [REDIRECT]" : L"");
+
     if (!redirected)
         return Real_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
                                 IoStatusBlock, ShareAccess, OpenOptions);
 
-    VL_DBG(L"Hook_NtOpenFile: %s -> %s acc=0x%08X",
-           ntPath.c_str(), redPath.c_str(), DesiredAccess);
+    VL_DBG(L"Hook_NtOpenFile: -> %s", redPath.c_str());
 
-    // Try virtual first.
-    NTSTATUS st = Real_NtOpenFile(FileHandle, DesiredAccess, &newOa,
-                                   IoStatusBlock, ShareAccess, OpenOptions);
-    if (NT_SUCCESS(st)) return st;
-    if (!IsFsNotFound(st)) return st;
+    bool isDir = (OpenOptions & FILE_DIRECTORY_FILE) != 0;
+    bool isWrite = (DesiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA | DELETE | WRITE_DAC | WRITE_OWNER | FILE_DELETE_CHILD | STANDARD_RIGHTS_WRITE | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY)) != 0;
 
-    // Tombstone check.
-    SetReentrant(true);
-    bool tombstoned = TombstoneExists(redPath);
-    SetReentrant(false);
-    if (tombstoned) {
-        VL_DBG(L"Hook_NtOpenFile: tombstone -> NOT_FOUND");
-        return VL_STATUS_OBJECT_NAME_NOT_FOUND;
-    }
+    HANDLE hVirt = NULL;
+    NTSTATUS st = Real_NtOpenFile(&hVirt, DesiredAccess, &newOa, IoStatusBlock, ShareAccess, OpenOptions);
 
-    // Check real.
-    BYTE dummy[48] = {0};
-    if (IsFsNotFound(Real_NtQueryAttributesFile(ObjectAttributes, dummy))) {
-        VL_DBG(L"Hook_NtOpenFile: real also not found");
+    if (NT_SUCCESS(st)) {
+        VirtFileEntry e = {};
+        e.hVirt = hVirt;
+        e.logPath = ntPath;
+        e.isDir = isDir;
+        e.isRealOnly = false;
+        if (isDir) {
+            VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
+            VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
+            IO_STATUS_BLOCK iosb;
+            Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            FILE_DIRECTORY_FILE);
+        }
+        TrackFileHandle(hVirt, e);
+        *FileHandle = hVirt;
         return st;
     }
 
-    if (!HasWriteAccess(DesiredAccess)) {
-        // Read-only CoW: serve real directly.
-        VL_DBG(L"Hook_NtOpenFile: read-only CoW fallback -> real");
-        return Real_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
-                                IoStatusBlock, ShareAccess, OpenOptions);
+    if (st == VL_STATUS_OBJECT_NOT_FOUND || st == VL_STATUS_OBJECT_PATH_NOT_FOUND) {
+        if (!isWrite) {
+            VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
+            VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
+            HANDLE hReal = NULL;
+            NTSTATUS stReal = Real_NtOpenFile(&hReal, DesiredAccess, &realOa, IoStatusBlock, ShareAccess, OpenOptions);
+            if (NT_SUCCESS(stReal)) {
+                VirtFileEntry e = {};
+                e.hVirt = hReal;
+                e.logPath = ntPath;
+                e.isDir = isDir;
+                e.isRealOnly = true;
+                TrackFileHandle(hReal, e);
+                *FileHandle = hReal;
+                VL_DBG(L"Hook_NtOpenFile: COW read fallback h=%p", hReal);
+                return stReal;
+            }
+        } else if (!isDir) {
+            // NtOpenFile always implies FILE_OPEN semantics
+            VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
+            VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
+            HANDLE hCheck = NULL;
+            IO_STATUS_BLOCK iosb;
+            NTSTATUS stCheck = Real_NtOpenFile(&hCheck, FILE_READ_ATTRIBUTES | SYNCHRONIZE, &realOa, &iosb,
+                                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                                FILE_NON_DIRECTORY_FILE);
+            if (NT_SUCCESS(stCheck)) {
+                Real_NtClose(hCheck);
+                VL_DBG(L"Hook_NtOpenFile: COW copy %s -> %s", ntPath.c_str(), redPath.c_str());
+                NTSTATUS stCopy = CowCopyFile(ntPath, redPath);
+                if (NT_SUCCESS(stCopy)) {
+                    st = Real_NtOpenFile(&hVirt, DesiredAccess, &newOa, IoStatusBlock, ShareAccess, OpenOptions);
+                    if (NT_SUCCESS(st)) {
+                        VirtFileEntry e = {};
+                        e.hVirt = hVirt;
+                        e.logPath = ntPath;
+                        e.isDir = false;
+                        e.isRealOnly = false;
+                        TrackFileHandle(hVirt, e);
+                        *FileHandle = hVirt;
+                        return st;
+                    }
+                }
+            } else {
+                EnsureVirtualDirForFile(redPath);
+                st = Real_NtOpenFile(&hVirt, DesiredAccess, &newOa, IoStatusBlock, ShareAccess, OpenOptions);
+                if (NT_SUCCESS(st)) {
+                    VirtFileEntry e = {};
+                    e.hVirt = hVirt;
+                    e.logPath = ntPath;
+                    e.isDir = false;
+                    e.isRealOnly = false;
+                    TrackFileHandle(hVirt, e);
+                    *FileHandle = hVirt;
+                    return st;
+                }
+            }
+        } else {
+            EnsureVirtualDir(redPath);
+            st = Real_NtOpenFile(&hVirt, DesiredAccess, &newOa, IoStatusBlock, ShareAccess, OpenOptions);
+            if (NT_SUCCESS(st)) {
+                VirtFileEntry e = {};
+                e.hVirt = hVirt;
+                e.logPath = ntPath;
+                e.isDir = true;
+                e.isRealOnly = false;
+                VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
+                VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
+                IO_STATUS_BLOCK iosb;
+                Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                FILE_DIRECTORY_FILE);
+                TrackFileHandle(hVirt, e);
+                *FileHandle = hVirt;
+                return st;
+            }
+        }
     }
 
-    // Write CoW: copy real -> virtual then open virtual.
-    VL_DBG(L"Hook_NtOpenFile: write CoW, copying real->virtual");
-    SetReentrant(true);
-    bool copied = CopyRealFileToVirtual(ntPath, redPath);
-    SetReentrant(false);
-
-    if (!copied) {
-        VL_DBG(L"Hook_NtOpenFile: CoW copy failed");
-        return st;
-    }
-    VL_DBG(L"Hook_NtOpenFile: opening virtual CoW copy");
-    return Real_NtOpenFile(FileHandle, DesiredAccess, &newOa,
-                            IoStatusBlock, ShareAccess, OpenOptions);
+    return st;
 }
 
 // ---- NtCreateDirectoryObject ----
-// Object-namespace directories (not file-system directories).
-// "Create" always goes to virtual; reading a namespace dir that only
-// exists in the real namespace is unusual and passes through.
 static NTSTATUS NTAPI Hook_NtCreateDirectoryObject(
-    PHANDLE               DirectoryHandle,
-    ULONG                 DesiredAccess,
+    PHANDLE DirectoryHandle,
+    ULONG DesiredAccess,
     PVL_OBJECT_ATTRIBUTES ObjectAttributes)
 {
     std::wstring ntPath, redPath;
@@ -2823,18 +2655,13 @@ static NTSTATUS NTAPI Hook_NtCreateDirectoryObject(
         return Real_NtCreateDirectoryObject(DirectoryHandle, DesiredAccess, ObjectAttributes);
 
     VL_DBG(L"Hook_NtCreateDirectoryObject: -> %s", redPath.c_str());
-    NTSTATUS st = Real_NtCreateDirectoryObject(DirectoryHandle, DesiredAccess, &newOa);
-    // No CoW fallback — object-namespace directories are ephemeral and
-    // not stored on disk; real namespace state is always accessible through
-    // the unredirected namespace path anyway.
-    return st;
+    return Real_NtCreateDirectoryObject(DirectoryHandle, DesiredAccess, &newOa);
 }
 
 // ---- NtOpenDirectoryObject ----
-// Object-namespace directory open — try virtual first, fall back to real.
 static NTSTATUS NTAPI Hook_NtOpenDirectoryObject(
-    PHANDLE               DirectoryHandle,
-    ULONG                 DesiredAccess,
+    PHANDLE DirectoryHandle,
+    ULONG DesiredAccess,
     PVL_OBJECT_ATTRIBUTES ObjectAttributes)
 {
     std::wstring ntPath, redPath;
@@ -2847,28 +2674,20 @@ static NTSTATUS NTAPI Hook_NtOpenDirectoryObject(
     if (!redirected)
         return Real_NtOpenDirectoryObject(DirectoryHandle, DesiredAccess, ObjectAttributes);
 
-    NTSTATUS st = Real_NtOpenDirectoryObject(DirectoryHandle, DesiredAccess, &newOa);
-    if (NT_SUCCESS(st)) return st;
-    if (!IsFsNotFound(st)) return st;
-
-    // CoW read fallback: the virtual namespace dir doesn't exist yet —
-    // open the real one instead (namespace dirs aren't on disk; no CoW copy needed).
-    VL_DBG(L"Hook_NtOpenDirectoryObject: virtual not found, fallback to real");
-    return Real_NtOpenDirectoryObject(DirectoryHandle, DesiredAccess, ObjectAttributes);
+    VL_DBG(L"Hook_NtOpenDirectoryObject: -> %s", redPath.c_str());
+    return Real_NtOpenDirectoryObject(DirectoryHandle, DesiredAccess, &newOa);
 }
 
 // ---- NtCreateMailslotFile ----
-// Mailslots are IPC objects, not stored on disk.
-// Redirect name to virtual namespace; no CoW fallback needed.
 static NTSTATUS NTAPI Hook_NtCreateMailslotFile(
-    PHANDLE               FileHandle,
-    ULONG                 DesiredAccess,
+    PHANDLE FileHandle,
+    ULONG DesiredAccess,
     PVL_OBJECT_ATTRIBUTES ObjectAttributes,
-    PVL_IO_STATUS_BLOCK   IoStatusBlock,
-    ULONG                 CreateOptions,
-    ULONG                 MailslotQuota,
-    ULONG                 MaximumMessageSize,
-    PLARGE_INTEGER        ReadTimeout)
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    ULONG CreateOptions,
+    ULONG MailslotQuota,
+    ULONG MaximumMessageSize,
+    PLARGE_INTEGER ReadTimeout)
 {
     std::wstring ntPath, redPath;
     VL_UNICODE_STRING newName; VL_OBJECT_ATTRIBUTES newOa;
@@ -2889,23 +2708,21 @@ static NTSTATUS NTAPI Hook_NtCreateMailslotFile(
 }
 
 // ---- NtCreateNamedPipeFile ----
-// Named pipes are IPC objects, not stored on disk.
-// Redirect name to virtual namespace; no CoW fallback needed.
 static NTSTATUS NTAPI Hook_NtCreateNamedPipeFile(
-    PHANDLE               FileHandle,
-    ULONG                 DesiredAccess,
+    PHANDLE FileHandle,
+    ULONG DesiredAccess,
     PVL_OBJECT_ATTRIBUTES ObjectAttributes,
-    PVL_IO_STATUS_BLOCK   IoStatusBlock,
-    ULONG                 ShareAccess,
-    ULONG                 CreateDisposition,
-    ULONG                 CreateOptions,
-    ULONG                 NamedPipeType,
-    ULONG                 ReadMode,
-    ULONG                 CompletionMode,
-    ULONG                 MaximumInstances,
-    ULONG                 InboundQuota,
-    ULONG                 OutboundQuota,
-    PLARGE_INTEGER        DefaultTimeout)
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    ULONG ShareAccess,
+    ULONG CreateDisposition,
+    ULONG CreateOptions,
+    ULONG NamedPipeType,
+    ULONG ReadMode,
+    ULONG CompletionMode,
+    ULONG MaximumInstances,
+    ULONG InboundQuota,
+    ULONG OutboundQuota,
+    PLARGE_INTEGER DefaultTimeout)
 {
     std::wstring ntPath, redPath;
     VL_UNICODE_STRING newName; VL_OBJECT_ATTRIBUTES newOa;
@@ -2930,12 +2747,6 @@ static NTSTATUS NTAPI Hook_NtCreateNamedPipeFile(
 }
 
 // ---- NtDeleteFile ----
-// CoW delete semantics:
-//   1. Always try to delete from virtual first.
-//   2. If the file existed only in the real store (virtual has nothing),
-//      create a tombstone in virtual so that subsequent reads know the
-//      file was deleted inside the sandbox and do NOT fall through to real.
-//   3. The real file is NEVER deleted.
 static NTSTATUS NTAPI Hook_NtDeleteFile(PVL_OBJECT_ATTRIBUTES ObjectAttributes)
 {
     std::wstring ntPath, redPath;
@@ -2949,37 +2760,10 @@ static NTSTATUS NTAPI Hook_NtDeleteFile(PVL_OBJECT_ATTRIBUTES ObjectAttributes)
         return Real_NtDeleteFile(ObjectAttributes);
 
     VL_DBG(L"Hook_NtDeleteFile: -> %s", redPath.c_str());
-
-    // Try deleting from virtual store.
-    NTSTATUS st = Real_NtDeleteFile(&newOa);
-
-    if (NT_SUCCESS(st)) {
-        // Virtual file deleted; also remove any stale tombstone.
-        SetReentrant(true);
-        DeleteTombstoneIfPresent(redPath);
-        SetReentrant(false);
-        return st;
-    }
-
-    if (!IsFsNotFound(st)) return st;   // unexpected error (e.g. sharing violation)
-
-    // Virtual doesn't have it — check whether real does.
-    BYTE dummy[48] = {0};
-    NTSTATUS realCheck = Real_NtQueryAttributesFile(ObjectAttributes, dummy);
-    if (IsFsNotFound(realCheck)) return st;  // doesn't exist anywhere
-
-    // Real has it: create a tombstone so future reads don't fall through.
-    VL_DBG(L"Hook_NtDeleteFile: real-only file, creating tombstone");
-    SetReentrant(true);
-    CreateTombstone(redPath);
-    SetReentrant(false);
-
-    // Return success: as far as the sandboxed app is concerned the file is gone.
-    return VL_STATUS_SUCCESS;
+    return Real_NtDeleteFile(&newOa);
 }
 
 // ---- NtQueryAttributesFile ----
-// CoW read: try virtual, tombstone check, then fall back to real.
 static NTSTATUS NTAPI Hook_NtQueryAttributesFile(
     PVL_OBJECT_ATTRIBUTES ObjectAttributes,
     PVOID                 FileInformation)
@@ -2996,24 +2780,15 @@ static NTSTATUS NTAPI Hook_NtQueryAttributesFile(
 
     NTSTATUS st = Real_NtQueryAttributesFile(&newOa, FileInformation);
     if (NT_SUCCESS(st)) return st;
-    if (!IsFsNotFound(st)) return st;
-
-    // Tombstone: file was deleted inside sandbox.
-    SetReentrant(true);
-    bool tombstoned = TombstoneExists(redPath);
-    SetReentrant(false);
-    if (tombstoned) {
-        VL_DBG(L"Hook_NtQueryAttributesFile: tombstone -> NOT_FOUND");
-        return VL_STATUS_OBJECT_NAME_NOT_FOUND;
+    if (st == VL_STATUS_OBJECT_NOT_FOUND || st == VL_STATUS_OBJECT_PATH_NOT_FOUND) {
+        VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
+        VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
+        st = Real_NtQueryAttributesFile(&realOa, FileInformation);
     }
-
-    // CoW read fallback to real.
-    VL_DBG(L"Hook_NtQueryAttributesFile: virtual not found, fallback to real");
-    return Real_NtQueryAttributesFile(ObjectAttributes, FileInformation);
+    return st;
 }
 
 // ---- NtQueryFullAttributesFile ----
-// Used by GetFileAttributesW internally. Same CoW read semantics.
 static NTSTATUS NTAPI Hook_NtQueryFullAttributesFile(
     PVL_OBJECT_ATTRIBUTES ObjectAttributes,
     PVOID                 FileInformation)
@@ -3030,23 +2805,15 @@ static NTSTATUS NTAPI Hook_NtQueryFullAttributesFile(
 
     NTSTATUS st = Real_NtQueryFullAttributesFile(&newOa, FileInformation);
     if (NT_SUCCESS(st)) return st;
-    if (!IsFsNotFound(st)) return st;
-
-    SetReentrant(true);
-    bool tombstoned = TombstoneExists(redPath);
-    SetReentrant(false);
-    if (tombstoned) {
-        VL_DBG(L"Hook_NtQueryFullAttributesFile: tombstone -> NOT_FOUND");
-        return VL_STATUS_OBJECT_NAME_NOT_FOUND;
+    if (st == VL_STATUS_OBJECT_NOT_FOUND || st == VL_STATUS_OBJECT_PATH_NOT_FOUND) {
+        VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
+        VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
+        st = Real_NtQueryFullAttributesFile(&realOa, FileInformation);
     }
-
-    VL_DBG(L"Hook_NtQueryFullAttributesFile: virtual not found, fallback to real");
-    return Real_NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
+    return st;
 }
 
 // ---- NtQueryInformationByName (Win10+) ----
-// Queries file information by name without opening a handle.
-// Same CoW read semantics: virtual first, tombstone, then real.
 static NTSTATUS NTAPI Hook_NtQueryInformationByName(
     PVL_OBJECT_ATTRIBUTES ObjectAttributes,
     PVL_IO_STATUS_BLOCK   IoStatusBlock,
@@ -3071,45 +2838,212 @@ static NTSTATUS NTAPI Hook_NtQueryInformationByName(
                                                  FileInformation, Length,
                                                  FileInformationClass);
     if (NT_SUCCESS(st)) return st;
-    if (!IsFsNotFound(st)) return st;
+    if (st == VL_STATUS_OBJECT_NOT_FOUND || st == VL_STATUS_OBJECT_PATH_NOT_FOUND) {
+        VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
+        VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
+        st = Real_NtQueryInformationByName(&realOa, IoStatusBlock,
+                                            FileInformation, Length,
+                                            FileInformationClass);
+    }
+    return st;
+}
 
-    SetReentrant(true);
-    bool tombstoned = TombstoneExists(redPath);
-    SetReentrant(false);
-    if (tombstoned) {
-        VL_DBG(L"Hook_NtQueryInformationByName: tombstone -> NOT_FOUND");
-        return VL_STATUS_OBJECT_NAME_NOT_FOUND;
+// ---- NtQueryDirectoryFile -- merged view ----
+static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
+    HANDLE FileHandle,
+    HANDLE Event,
+    VL_PIO_APC_ROUTINE ApcRoutine,
+    PVOID ApcContext,
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID FileInformation,
+    ULONG Length,
+    ULONG FileInformationClass,
+    BOOLEAN ReturnSingleEntry,
+    PVL_UNICODE_STRING FileName,
+    BOOLEAN RestartScan)
+{
+    VirtFileEntry e;
+    if (!g_FsEnabled || !GetFileEntry(FileHandle, e) || !e.isDir || e.isRealOnly || !e.hReal) {
+        return Real_NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                          IoStatusBlock, FileInformation, Length,
+                                          FileInformationClass, ReturnSingleEntry,
+                                          FileName, RestartScan);
     }
 
-    VL_DBG(L"Hook_NtQueryInformationByName: virtual not found, fallback to real");
-    return Real_NtQueryInformationByName(ObjectAttributes, IoStatusBlock,
-                                          FileInformation, Length,
-                                          FileInformationClass);
+    if (RestartScan) {
+        e.virtEnumDone = false;
+        e.realEnumDone = false;
+        e.realRestartPending = true;
+        e.virtNames.clear();
+        UpdateFileEntry(FileHandle, e);
+    }
+
+    BOOLEAN restartVirt = RestartScan;
+    BOOLEAN restartReal = e.realRestartPending ? TRUE : FALSE;
+
+    while (true) {
+        if (!e.virtEnumDone) {
+            NTSTATUS st = Real_NtQueryDirectoryFile(e.hVirt, Event, ApcRoutine, ApcContext,
+                                                      IoStatusBlock, FileInformation, Length,
+                                                      FileInformationClass, ReturnSingleEntry,
+                                                      FileName, restartVirt);
+            if (NT_SUCCESS(st)) {
+                std::wstring name = ExtractDirFileName(FileInformation, FileInformationClass);
+                if (!name.empty()) e.virtNames.insert(name);
+                UpdateFileEntry(FileHandle, e);
+                return st;
+            }
+            if (st == VL_STATUS_NO_MORE_ENTRIES) {
+                e.virtEnumDone = true;
+                if (restartVirt) e.realRestartPending = true;
+                UpdateFileEntry(FileHandle, e);
+                restartVirt = FALSE;
+                continue;
+            }
+            return st;
+        }
+
+        if (!e.realEnumDone) {
+            NTSTATUS st = Real_NtQueryDirectoryFile(e.hReal, Event, ApcRoutine, ApcContext,
+                                                      IoStatusBlock, FileInformation, Length,
+                                                      FileInformationClass, ReturnSingleEntry,
+                                                      FileName, restartReal);
+            if (NT_SUCCESS(st)) {
+                std::wstring name = ExtractDirFileName(FileInformation, FileInformationClass);
+                if (!name.empty() && e.virtNames.find(name) != e.virtNames.end()) {
+                    restartReal = FALSE;
+                    continue;
+                }
+                e.realRestartPending = false;
+                UpdateFileEntry(FileHandle, e);
+                return st;
+            }
+            if (st == VL_STATUS_NO_MORE_ENTRIES) {
+                e.realEnumDone = true;
+                UpdateFileEntry(FileHandle, e);
+                return st;
+            }
+            return st;
+        }
+
+        return VL_STATUS_NO_MORE_ENTRIES;
+    }
+}
+
+// ---- NtQueryDirectoryFileEx -- merged view ----
+static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
+    HANDLE FileHandle,
+    HANDLE Event,
+    VL_PIO_APC_ROUTINE ApcRoutine,
+    PVOID ApcContext,
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID FileInformation,
+    ULONG Length,
+    ULONG FileInformationClass,
+    ULONG QueryFlags)
+{
+    VirtFileEntry e;
+    if (!g_FsEnabled || !GetFileEntry(FileHandle, e) || !e.isDir || e.isRealOnly || !e.hReal) {
+        return Real_NtQueryDirectoryFileEx(FileHandle, Event, ApcRoutine, ApcContext,
+                                            IoStatusBlock, FileInformation, Length,
+                                            FileInformationClass, QueryFlags);
+    }
+
+    BOOLEAN restartScan = (QueryFlags & 0x01) ? TRUE : FALSE;
+    if (restartScan) {
+        e.virtEnumDone = false;
+        e.realEnumDone = false;
+        e.realRestartPending = true;
+        e.virtNames.clear();
+        UpdateFileEntry(FileHandle, e);
+    }
+
+    ULONG flagsVirt = QueryFlags;
+    ULONG flagsReal = e.realRestartPending ? (QueryFlags | 0x01) : QueryFlags;
+
+    while (true) {
+        if (!e.virtEnumDone) {
+            NTSTATUS st = Real_NtQueryDirectoryFileEx(e.hVirt, Event, ApcRoutine, ApcContext,
+                                                        IoStatusBlock, FileInformation, Length,
+                                                        FileInformationClass, flagsVirt);
+            if (NT_SUCCESS(st)) {
+                std::wstring name = ExtractDirFileName(FileInformation, FileInformationClass);
+                if (!name.empty()) e.virtNames.insert(name);
+                UpdateFileEntry(FileHandle, e);
+                return st;
+            }
+            if (st == VL_STATUS_NO_MORE_ENTRIES) {
+                e.virtEnumDone = true;
+                if (restartScan) e.realRestartPending = true;
+                UpdateFileEntry(FileHandle, e);
+                flagsVirt &= ~0x01;
+                continue;
+            }
+            return st;
+        }
+
+        if (!e.realEnumDone) {
+            NTSTATUS st = Real_NtQueryDirectoryFileEx(e.hReal, Event, ApcRoutine, ApcContext,
+                                                        IoStatusBlock, FileInformation, Length,
+                                                        FileInformationClass, flagsReal);
+            if (NT_SUCCESS(st)) {
+                std::wstring name = ExtractDirFileName(FileInformation, FileInformationClass);
+                if (!name.empty() && e.virtNames.find(name) != e.virtNames.end()) {
+                    flagsReal &= ~0x01;
+                    continue;
+                }
+                e.realRestartPending = false;
+                UpdateFileEntry(FileHandle, e);
+                return st;
+            }
+            if (st == VL_STATUS_NO_MORE_ENTRIES) {
+                e.realEnumDone = true;
+                UpdateFileEntry(FileHandle, e);
+                return st;
+            }
+            return st;
+        }
+
+        return VL_STATUS_NO_MORE_ENTRIES;
+    }
+}
+
+// ---- NtQueryInformationFile -- reverse-translate filename ----
+static NTSTATUS NTAPI Hook_NtQueryInformationFile(
+    HANDLE FileHandle,
+    PVL_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID FileInformation,
+    ULONG Length,
+    ULONG FileInformationClass)
+{
+    VirtFileEntry e;
+    if (!g_FsEnabled || !GetFileEntry(FileHandle, e)) {
+        return Real_NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+    }
+
+    NTSTATUS st = Real_NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+    if (!NT_SUCCESS(st)) return st;
+
+    if (FileInformationClass == 9 /*FileNameInformation*/ && Length >= sizeof(ULONG)) {
+        VL_FILE_NAME_INFORMATION* p = (VL_FILE_NAME_INFORMATION*)FileInformation;
+        if (p->FileNameLength > 0 && Length >= sizeof(ULONG) + p->FileNameLength) {
+            std::wstring phys(p->FileName, p->FileNameLength / sizeof(WCHAR));
+            std::wstring log = ReverseApplyFsRedirect(phys);
+            if (log != phys && log.size() <= phys.size()) {
+                USHORT newLen = (USHORT)(log.size() * sizeof(WCHAR));
+                memcpy(p->FileName, log.c_str(), newLen);
+                p->FileNameLength = newLen;
+            }
+        }
+    }
+    return st;
 }
 
 // ---- NtSetInformationFile -- intercepts rename and hardlink creation ----
-//
-// Both FILE_RENAME_INFORMATION and FILE_LINK_INFORMATION embed a target
-// path string in their payload.  The structures are IDENTICAL in memory
-// layout -- same field ordering and same arch-dependent offsets -- so the
-// same translation code handles all four classes.
-//
-//   FileRenameInformation   (10): rename target path must stay in virt store
-//   FileLinkInformation     (11): hardlink target path must stay in virt store
-//   FileRenameInformationEx (65): Windows 10 RS1+ extended rename
-//   FileLinkInformationEx   (72): Windows 10 RS1+ extended hardlink
-//
-// Without handling FileLinkInformation a sandboxed app can call
-// NtSetInformationFile(..., FileLinkInformation, ...) with a real host path
-// and create a hardlink that escapes the virtual file store entirely.
-//
-//   32-bit layout: offset 0 BOOLEAN, +4 HANDLE, +8 ULONG NameLen, +12 WCHAR Name[]
-//   64-bit layout: offset 0 BOOLEAN, +8 HANDLE, +16 ULONG NameLen, +20 WCHAR Name[]
-//
 #define FileRenameInformation   10
 #define FileLinkInformation     11
-#define FileRenameInformationEx 65   // Windows 10 RS1+
-#define FileLinkInformationEx   72   // Windows 10 RS1+
+#define FileRenameInformationEx 65
+#define FileLinkInformationEx   72
 
 #ifdef _WIN64
 #  define RENAME_INFO_HANDLE_OFFSET   8
@@ -3124,11 +3058,11 @@ static NTSTATUS NTAPI Hook_NtQueryInformationByName(
 #endif
 
 static NTSTATUS NTAPI Hook_NtSetInformationFile(
-    HANDLE              FileHandle,
+    HANDLE FileHandle,
     PVL_IO_STATUS_BLOCK IoStatusBlock,
-    PVOID               FileInformation,
-    ULONG               Length,
-    ULONG               FileInformationClass)
+    PVOID FileInformation,
+    ULONG Length,
+    ULONG FileInformationClass)
 {
     VL_DBG(L"Hook_NtSetInformationFile: handle=%p class=%u len=%u",
            FileHandle, FileInformationClass, Length);
@@ -3175,41 +3109,19 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
     ULONG newNameBytes = (ULONG)(redName.size() * sizeof(WCHAR));
     ULONG newLength    = RENAME_INFO_NAME_OFFSET + newNameBytes;
     std::vector<BYTE> buf(newLength, 0);
-    memcpy(&buf[0], p, RENAME_INFO_NAME_OFFSET);
-    *(ULONG*)(&buf[0] + RENAME_INFO_NAMELEN_OFFSET) = newNameBytes;
-    memcpy(&buf[0] + RENAME_INFO_NAME_OFFSET, redName.c_str(), newNameBytes);
+    memcpy(buf.data(), p, RENAME_INFO_NAME_OFFSET);
+    *(ULONG*)(buf.data() + RENAME_INFO_NAMELEN_OFFSET) = newNameBytes;
+    memcpy(buf.data() + RENAME_INFO_NAME_OFFSET, redName.c_str(), newNameBytes);
 
     return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
-                                      &buf[0], newLength,
+                                      buf.data(), newLength,
                                       FileInformationClass);
 }
 
 // ============================================================
 // CHILD PROCESS PROPAGATION
 // ============================================================
-//
-// We always use DetourCreateProcessWithDlls[W|A] for child injection.
-// Detours handles same-arch and cross-arch transparently via its helper-
-// process mechanism (spawns a matching-arch rundll32 for cross-arch).
-//
-// CRITICAL WOW64 FIX: From a 32-bit WOW64 process, GetSystemDirectory()
-// returns SysWOW64 (32-bit rundll32).  Detours uses GetSystemDirectory()
-// internally to find its helper process.  If the child is 64-bit, the
-// 32-bit helper can't patch the 64-bit import table and injection silently
-// fails.  Fix: always disable WOW64 FS redirection around the Detours call
-// so GetSystemDirectory() returns the real System32 (64-bit rundll32).
-// This is a no-op in the 64-bit DLL build (#ifdef _WIN64 makes the
-// Wow64Disable/Revert functions empty stubs).
-//
-// We pass Real_CreateProcessW/A as pfCreateProcessW to avoid re-entering
-// our own hook when Detours internally spawns the helper process.
-// Real_CreateProcessW is the Detours trampoline that bypasses our hook and
-// calls the original CreateProcessW directly.
-//
-// The DLL path must end in "32" or "64" (e.g. VirtHook32.dll / VirtHook64.dll).
-// Detours auto-swaps the suffix when the target arch differs from the caller.
 
-// The DLL path matching our own arch (used as the "base" for Detours suffix swap).
 static const char* PickDllPath() {
 #ifdef _WIN64
     return g_DllPathA64[0] ? g_DllPathA64 : g_DllPathA;
@@ -3218,8 +3130,6 @@ static const char* PickDllPath() {
 #endif
 }
 
-// Disable WOW64 FS redirection.  No-op in 64-bit builds.
-// Returns true if redirection was actually disabled; caller must restore.
 static bool DisableWow64Redir(PVOID* pOld) {
 #ifndef _WIN64
     typedef BOOL (WINAPI *Pfn)(PVOID*);
@@ -3271,9 +3181,6 @@ static BOOL WINAPI Hook_CreateProcessW(
 
     VL_DBG(L"Hook_CreateProcessW: injecting dll=%S", dllPath);
 
-    // Disable WOW64 FS redirection so Detours finds the correct (same-bitness)
-    // rundll32.exe in System32 when it needs a cross-arch helper process.
-    // Safe no-op in the 64-bit build.
     PVOID wow64Old = NULL;
     bool  wow64Off = DisableWow64Redir(&wow64Old);
 
@@ -3284,14 +3191,13 @@ static BOOL WINAPI Hook_CreateProcessW(
         bInheritHandles, dwCreationFlags, lpEnvironment,
         lpCurrentDirectory, lpStartupInfo, lpProcessInformation,
         1, dlls,
-        Real_CreateProcessW);  // bypass our hook; avoids re-entrancy
+        Real_CreateProcessW);
 
     RestoreWow64Redir(wow64Off, wow64Old);
 
     if (!ok) {
         VL_DBG(L"Hook_CreateProcessW: DetourCreateProcessWithDllsW FAILED err=%u"
                L" -- falling back to unhooked launch", GetLastError());
-        // Fall back: create without injection so the child at least runs.
         ok = Real_CreateProcessW(lpApplicationName, lpCommandLine,
                                   lpProcessAttributes, lpThreadAttributes,
                                   bInheritHandles, dwCreationFlags, lpEnvironment,
@@ -3337,7 +3243,7 @@ static BOOL WINAPI Hook_CreateProcessA(
         bInheritHandles, dwCreationFlags, lpEnvironment,
         lpCurrentDirectory, lpStartupInfo, lpProcessInformation,
         1, dlls,
-        Real_CreateProcessA);  // bypass our hook; avoids re-entrancy
+        Real_CreateProcessA);
 
     RestoreWow64Redir(wow64Off, wow64Old);
 
@@ -3373,11 +3279,17 @@ static void InstallHooks() {
     // Always needed
     VL_GETPROC(ntdll, NtClose);
     VL_GETPROC(ntdll, NtQueryObject);
-    // Not hooked, but needed internally for CoW file-copy
-    VL_GETPROC(ntdll, NtReadFile);
-    VL_GETPROC(ntdll, NtWriteFile);
     VL_GETPROC(k32,   CreateProcessW);
     VL_GETPROC(k32,   CreateProcessA);
+
+    // Internal raw pointers (not hooked, used for COW copy / merge)
+    VL_GETPROC(ntdll, NtReadFile);
+    VL_GETPROC(ntdll, NtWriteFile);
+    VL_GETPROC(ntdll, NtQueryInformationFile);
+    VL_GETPROC(ntdll, NtQueryDirectoryFile);
+    VL_GETPROC(ntdll, NtQueryDirectoryFileEx);
+    VL_GETPROC(ntdll, NtQueryVolumeInformationFile);
+    VL_GETPROC(ntdll, NtDeviceIoControlFile);
 
     // Registry hooks
     if (g_RegEnabled) {
@@ -3402,7 +3314,7 @@ static void InstallHooks() {
         VL_GETPROC(ntdll, NtLoadKey);
         VL_GETPROC(ntdll, NtLoadKey2);
         VL_GETPROC(ntdll, NtLoadKeyEx);
-        VL_GETPROC(ntdll, NtLoadKey3);          // Win10 RS5+, may be NULL
+        VL_GETPROC(ntdll, NtLoadKey3);
         VL_GETPROC(ntdll, NtNotifyChangeKey);
         VL_GETPROC(ntdll, NtNotifyChangeMultipleKeys);
         VL_GETPROC(ntdll, NtFlushKey);
@@ -3428,7 +3340,7 @@ static void InstallHooks() {
         VL_GETPROC(ntdll, NtDeleteFile);
         VL_GETPROC(ntdll, NtQueryAttributesFile);
         VL_GETPROC(ntdll, NtQueryFullAttributesFile);
-        VL_GETPROC(ntdll, NtQueryInformationByName);   // Win8+ may be NULL on XP
+        VL_GETPROC(ntdll, NtQueryInformationByName);
         VL_GETPROC(ntdll, NtSetInformationFile);
         VL_GETPROC(ntdll, NtFsControlFile);
 
@@ -3439,10 +3351,7 @@ static void InstallHooks() {
                (void*)Real_NtFsControlFile);
     }
 
-    // ---------------------------------------------------------------
-    // Pre-create the virtual root key and all ancestor components
-    // BEFORE installing hooks, using raw (unhooked) function pointers.
-    // ---------------------------------------------------------------
+    // Pre-create virtual root key
     if (g_RegEnabled && Real_NtCreateKey && Real_NtClose) {
         std::wstring path;
         const std::wstring& base = g_VirtNtBase;
@@ -3467,9 +3376,7 @@ static void InstallHooks() {
         }
     }
 
-    // ---------------------------------------------------------------
     // Attach all hooks in one transaction
-    // ---------------------------------------------------------------
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
 
@@ -3524,6 +3431,9 @@ static void InstallHooks() {
         if (Real_NtQueryInformationByName)  VL_ATTACH(NtQueryInformationByName);
         if (Real_NtSetInformationFile)    VL_ATTACH(NtSetInformationFile);
         if (Real_NtFsControlFile)         VL_ATTACH(NtFsControlFile);
+        if (Real_NtQueryDirectoryFile)    VL_ATTACH(NtQueryDirectoryFile);
+        if (Real_NtQueryDirectoryFileEx)  VL_ATTACH(NtQueryDirectoryFileEx);
+        if (Real_NtQueryInformationFile)  VL_ATTACH(NtQueryInformationFile);
     }
 
     LONG commitResult = DetourTransactionCommit();
@@ -3582,6 +3492,9 @@ static void UninstallHooks() {
         if (Real_NtQueryInformationByName)  VL_DETACH(NtQueryInformationByName);
         if (Real_NtSetInformationFile)    VL_DETACH(NtSetInformationFile);
         if (Real_NtFsControlFile)         VL_DETACH(NtFsControlFile);
+        if (Real_NtQueryDirectoryFile)    VL_DETACH(NtQueryDirectoryFile);
+        if (Real_NtQueryDirectoryFileEx)  VL_DETACH(NtQueryDirectoryFileEx);
+        if (Real_NtQueryInformationFile)  VL_DETACH(NtQueryInformationFile);
     }
 
     DetourTransactionCommit();
@@ -3601,8 +3514,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
 
         g_TlsIdx = TlsAlloc();
         InitializeCriticalSectionAndSpinCount(&g_KeyMapLock, 4000);
+        InitializeCriticalSectionAndSpinCount(&g_FileMapLock, 4000);
 
-        VL_DBG(L"DllMain: DLL_PROCESS_ATTACH -- VirtHook loading (v10 pure ntdll)");
+        VL_DBG(L"DllMain: DLL_PROCESS_ATTACH -- VirtHook loading (v11 COW FS)");
 
         LoadConfig();
         InstallHooks();
@@ -3624,6 +3538,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
         g_KeyMap.clear();
         LeaveCriticalSection(&g_KeyMapLock);
         DeleteCriticalSection(&g_KeyMapLock);
+
+        EnterCriticalSection(&g_FileMapLock);
+        for (std::map<HANDLE,VirtFileEntry>::iterator it = g_FileMap.begin();
+             it != g_FileMap.end(); ++it)
+        {
+            if (it->second.hVirt && it->second.hVirt != it->first)
+                Real_NtClose(it->second.hVirt);
+            if (it->second.hReal && it->second.hReal != it->first)
+                Real_NtClose(it->second.hReal);
+        }
+        g_FileMap.clear();
+        LeaveCriticalSection(&g_FileMapLock);
+        DeleteCriticalSection(&g_FileMapLock);
 
         if (g_TlsIdx != TLS_OUT_OF_INDEXES) {
             TlsFree(g_TlsIdx);
