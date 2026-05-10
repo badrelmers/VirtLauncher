@@ -140,6 +140,10 @@ typedef LONG NTSTATUS;
 #define VL_STATUS_BUFFER_TOO_SMALL     ((NTSTATUS)0xC0000023L)
 #define VL_STATUS_BUFFER_OVERFLOW      ((NTSTATUS)0x80000005L)
 #define VL_STATUS_OBJECT_NOT_FOUND     ((NTSTATUS)0xC0000034L)
+// STATUS_OBJECT_NAME_NOT_FOUND and STATUS_OBJECT_NOT_FOUND share 0xC0000034
+#define VL_STATUS_OBJECT_NAME_NOT_FOUND VL_STATUS_OBJECT_NOT_FOUND
+#define VL_STATUS_OBJECT_PATH_NOT_FOUND ((NTSTATUS)0xC000003AL)
+#define VL_STATUS_NO_SUCH_FILE         ((NTSTATUS)0xC000000FL)
 #define VL_STATUS_ACCESS_DENIED        ((NTSTATUS)0xC0000022L)
 #define VL_STATUS_INVALID_HANDLE       ((NTSTATUS)0xC0000008L)
 
@@ -909,7 +913,7 @@ static void LoadFsConfig(const std::wstring& path) {
 }
 
 static void LoadConfig() {
-    wchar_t buf[2048] = {};
+    wchar_t buf[2048] = {0};
 
     // ---- Read the debug flag FIRST so subsequent VL_DBG calls work ----
     if (GetEnvironmentVariableW(L"VLAUNCHER_DEBUG", buf, 2047) > 0)
@@ -2134,7 +2138,7 @@ static NTSTATUS NTAPI Hook_NtFsControlFile(
         ULONG  newBufSize       = VL_REPARSE_HDR_SIZE + newReparseDataLen;
 
         std::vector<BYTE> newBuf(newBufSize, 0);
-        VL_REPARSE_DATA_BUFFER* n = (VL_REPARSE_DATA_BUFFER*)newBuf.data();
+        VL_REPARSE_DATA_BUFFER* n = (VL_REPARSE_DATA_BUFFER*)&newBuf[0];
         n->ReparseTag                   = rdb->ReparseTag;
         n->ReparseDataLength            = newReparseDataLen;
         n->Reserved                     = 0;
@@ -2150,7 +2154,7 @@ static NTSTATUS NTAPI Hook_NtFsControlFile(
                InputBufferLength, newBufSize);
         return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
                                      IoStatusBlock, FsControlCode,
-                                     newBuf.data(), newBufSize,
+                                     &newBuf[0], newBufSize,
                                      OutputBuffer, OutputBufferLength);
     }
 
@@ -2193,7 +2197,7 @@ static NTSTATUS NTAPI Hook_NtFsControlFile(
         ULONG  newBufSize   = VL_REPARSE_HDR_SIZE + newDataLen;
 
         std::vector<BYTE> newBuf(newBufSize, 0);  // zero-init: nulls already in place
-        VL_REPARSE_DATA_BUFFER* n = (VL_REPARSE_DATA_BUFFER*)newBuf.data();
+        VL_REPARSE_DATA_BUFFER* n = (VL_REPARSE_DATA_BUFFER*)&newBuf[0];
         n->ReparseTag                      = rdb->ReparseTag;
         n->ReparseDataLength               = newDataLen;
         n->Reserved                        = 0;
@@ -2211,7 +2215,7 @@ static NTSTATUS NTAPI Hook_NtFsControlFile(
                InputBufferLength, newBufSize, newSubBytes, newPrtOff, newPrtBytes);
         return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
                                      IoStatusBlock, FsControlCode,
-                                     newBuf.data(), newBufSize,
+                                     &newBuf[0], newBufSize,
                                      OutputBuffer, OutputBufferLength);
     }
 
@@ -2312,9 +2316,9 @@ static NTSTATUS NTAPI Hook_NtFsControlFile(
 #  define SYNCHRONIZE           0x00100000UL
 #endif
 
-// Additional not-found status codes we need to recognise
-#define VL_STATUS_OBJECT_PATH_NOT_FOUND  ((NTSTATUS)0xC000003AL)
-#define VL_STATUS_NO_SUCH_FILE           ((NTSTATUS)0xC000000FL)
+// Additional not-found status codes: VL_STATUS_OBJECT_PATH_NOT_FOUND and
+// VL_STATUS_NO_SUCH_FILE are defined near the top of this file with all
+// other NT status codes.
 
 // --- IsFsNotFound --------------------------------------------------
 // Returns true for any status that means "path or file doesn't exist."
@@ -2390,7 +2394,8 @@ static void EnsureVirtualFsPath(const std::wstring& virtualNtFilePath) {
 
         VL_UNICODE_STRING us;  MakeUStr(&us, current);
         VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
-        VL_IO_STATUS_BLOCK iosb = {};
+        VL_IO_STATUS_BLOCK iosb;
+        ZeroMemory(&iosb, sizeof(iosb));
         HANDLE h = NULL;
 
         NTSTATUS st = Real_NtCreateFile(
@@ -2420,21 +2425,27 @@ static std::wstring TombstonePath(const std::wstring& virtualNtPath) {
 }
 
 static bool TombstoneExists(const std::wstring& virtualNtPath) {
+    if (!Real_NtQueryAttributesFile) return false;
     std::wstring tp = TombstonePath(virtualNtPath);
     VL_UNICODE_STRING us; MakeUStr(&us, tp);
     VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
     // FILE_BASIC_INFORMATION is 40 bytes; use a generous buffer.
-    BYTE dummy[48] = {};
-    return NT_SUCCESS(Real_NtQueryAttributesFile(&oa, dummy));
+    BYTE dummy[48];
+    ZeroMemory(dummy, sizeof(dummy));
+    NTSTATUS st = Real_NtQueryAttributesFile(&oa, dummy);
+    VL_DBG(L"TombstoneExists: %s st=0x%08X", tp.c_str(), (ULONG)st);
+    return NT_SUCCESS(st);
 }
 
 static void CreateTombstone(const std::wstring& virtualNtPath) {
     if (!Real_NtCreateFile) return;
     std::wstring tp = TombstonePath(virtualNtPath);
-    EnsureVirtualFsPath(tp);                     // ensure the directory exists
+    VL_DBG(L"CreateTombstone: creating %s", tp.c_str());
+    EnsureVirtualFsPath(tp);   // ensure the directory exists first
     VL_UNICODE_STRING us; MakeUStr(&us, tp);
     VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
-    VL_IO_STATUS_BLOCK iosb = {};
+    VL_IO_STATUS_BLOCK iosb;
+    ZeroMemory(&iosb, sizeof(iosb));
     HANDLE h = NULL;
     NTSTATUS st = Real_NtCreateFile(
         &h,
@@ -2450,10 +2461,12 @@ static void CreateTombstone(const std::wstring& virtualNtPath) {
 }
 
 static void DeleteTombstoneIfPresent(const std::wstring& virtualNtPath) {
+    if (!Real_NtDeleteFile) return;
     std::wstring tp = TombstonePath(virtualNtPath);
     VL_UNICODE_STRING us; MakeUStr(&us, tp);
     VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
-    Real_NtDeleteFile(&oa);   // silently ignore errors (tombstone may not exist)
+    NTSTATUS st = Real_NtDeleteFile(&oa);
+    VL_DBG(L"DeleteTombstoneIfPresent: %s st=0x%08X", tp.c_str(), (ULONG)st);
 }
 
 // --- CopyRealFileToVirtual -----------------------------------------
@@ -2475,7 +2488,8 @@ static bool CopyRealFileToVirtual(const std::wstring& realNtPath,
     // Open the real source for reading.
     VL_UNICODE_STRING srcUs; MakeUStr(&srcUs, realNtPath);
     VL_OBJECT_ATTRIBUTES srcOa; MakeOA(&srcOa, &srcUs);
-    VL_IO_STATUS_BLOCK iosb = {};
+    VL_IO_STATUS_BLOCK iosb;
+    ZeroMemory(&iosb, sizeof(iosb));
     HANDLE hSrc = NULL;
     NTSTATUS st = Real_NtCreateFile(
         &hSrc,
@@ -2497,7 +2511,7 @@ static bool CopyRealFileToVirtual(const std::wstring& realNtPath,
     // Create (or replace) the destination in the virtual store.
     VL_UNICODE_STRING dstUs; MakeUStr(&dstUs, virtualNtPath);
     VL_OBJECT_ATTRIBUTES dstOa; MakeOA(&dstOa, &dstUs);
-    iosb = {};
+    ZeroMemory(&iosb, sizeof(iosb));
     HANDLE hDst = NULL;
     st = Real_NtCreateFile(
         &hDst,
@@ -2515,22 +2529,25 @@ static bool CopyRealFileToVirtual(const std::wstring& realNtPath,
     }
 
     // Stream-copy using 256 KB chunks.
-    static const ULONG kBufSize = 256 * 1024;
+    // Declare buffers and loop state before the loop (VS2010 C++03).
+    enum { kBufSize = 256 * 1024 };
     std::vector<BYTE> buf(kBufSize);
     LARGE_INTEGER offset;
     offset.QuadPart = 0;
     LONGLONG totalBytes = 0;
+    VL_IO_STATUS_BLOCK rIosb;
+    VL_IO_STATUS_BLOCK wIosb;
 
     for (;;) {
-        VL_IO_STATUS_BLOCK rIosb = {};
+        ZeroMemory(&rIosb, sizeof(rIosb));
         st = Real_NtReadFile(hSrc, NULL, NULL, NULL, &rIosb,
-                              buf.data(), kBufSize, &offset, NULL);
+                              &buf[0], (ULONG)kBufSize, &offset, NULL);
         if (!NT_SUCCESS(st) || rIosb.Information == 0) break;
 
         ULONG chunk = (ULONG)rIosb.Information;
-        VL_IO_STATUS_BLOCK wIosb = {};
+        ZeroMemory(&wIosb, sizeof(wIosb));
         Real_NtWriteFile(hDst, NULL, NULL, NULL, &wIosb,
-                          buf.data(), chunk, &offset, NULL);
+                          &buf[0], chunk, &offset, NULL);
 
         offset.QuadPart += chunk;
         totalBytes      += chunk;
@@ -2610,7 +2627,7 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
             // Probe: does the virtual store already have this file?
             VL_UNICODE_STRING probe; MakeUStr(&probe, redPath);
             VL_OBJECT_ATTRIBUTES probeOa; MakeOA(&probeOa, &probe);
-            BYTE dummy[48] = {};
+            BYTE dummy[48] = {0};
             if (IsFsNotFound(Real_NtQueryAttributesFile(&probeOa, dummy)))
                 dispToUse = FILE_SUPERSEDE;  // create fresh; app overwrites anyway
         }
@@ -2678,7 +2695,7 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
     }
 
     // Does the real file exist?
-    BYTE basicBuf[48] = {};
+    BYTE basicBuf[48] = {0};
     NTSTATUS realCheck = Real_NtQueryAttributesFile(ObjectAttributes, basicBuf);
     if (IsFsNotFound(realCheck)) {
         VL_DBG(L"Hook_NtCreateFile: real also not found, returning 0x%08X", (ULONG)st);
@@ -2758,7 +2775,7 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
     }
 
     // Check real.
-    BYTE dummy[48] = {};
+    BYTE dummy[48] = {0};
     if (IsFsNotFound(Real_NtQueryAttributesFile(ObjectAttributes, dummy))) {
         VL_DBG(L"Hook_NtOpenFile: real also not found");
         return st;
@@ -2947,7 +2964,7 @@ static NTSTATUS NTAPI Hook_NtDeleteFile(PVL_OBJECT_ATTRIBUTES ObjectAttributes)
     if (!IsFsNotFound(st)) return st;   // unexpected error (e.g. sharing violation)
 
     // Virtual doesn't have it — check whether real does.
-    BYTE dummy[48] = {};
+    BYTE dummy[48] = {0};
     NTSTATUS realCheck = Real_NtQueryAttributesFile(ObjectAttributes, dummy);
     if (IsFsNotFound(realCheck)) return st;  // doesn't exist anywhere
 
@@ -3158,12 +3175,12 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
     ULONG newNameBytes = (ULONG)(redName.size() * sizeof(WCHAR));
     ULONG newLength    = RENAME_INFO_NAME_OFFSET + newNameBytes;
     std::vector<BYTE> buf(newLength, 0);
-    memcpy(buf.data(), p, RENAME_INFO_NAME_OFFSET);
-    *(ULONG*)(buf.data() + RENAME_INFO_NAMELEN_OFFSET) = newNameBytes;
-    memcpy(buf.data() + RENAME_INFO_NAME_OFFSET, redName.c_str(), newNameBytes);
+    memcpy(&buf[0], p, RENAME_INFO_NAME_OFFSET);
+    *(ULONG*)(&buf[0] + RENAME_INFO_NAMELEN_OFFSET) = newNameBytes;
+    memcpy(&buf[0] + RENAME_INFO_NAME_OFFSET, redName.c_str(), newNameBytes);
 
     return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
-                                      buf.data(), newLength,
+                                      &buf[0], newLength,
                                       FileInformationClass);
 }
 
