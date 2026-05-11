@@ -714,6 +714,17 @@ static std::wstring DevicePathToDosPath(const std::wstring& devicePath) {
 
 static std::wstring GetHandleLogicalPath(HANDLE h) {
     if (!h) return L"";
+    
+    // Fast path 1: filesystem handle tracked by our hook
+    // Fix BUG1: The Relative Path Bug: GetHandleLogicalPath never checks g_FileMap
+    {
+        VirtFileEntry fe;
+        if (GetFileEntry(h, fe) && !fe.logPath.empty()) {
+            VL_DBG(L"GetHandleLogicalPath: tracked FS -> %s", fe.logPath.c_str());
+            return fe.logPath;
+        }
+    }
+
     // Fast path 2: registry handle tracked by our hook
     VirtKeyEntry e;
     if (GetEntry(h, e)) {
@@ -2618,6 +2629,16 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
            ntPath.c_str(), redPath.c_str(), CreateDisposition, DesiredAccess, (int)isDir);
 
     // ----------------------------------------------------------------
+    // Fix BUG1: The Relative Path Bug: GetHandleLogicalPath never checks g_FileMap
+    // Build a clean OA that always points to the REAL filesystem.
+    // This uses ntPath (the logical path, e.g. \??\C:\dir\file.txt)
+    // with RootDirectory=NULL so Real_Nt*File never follows a
+    // virtual-store handle that may be sitting in ObjectAttributes.
+    // ----------------------------------------------------------------
+    VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
+    VL_OBJECT_ATTRIBUTES realOa;  MakeOA(&realOa, &realName);
+
+    // ----------------------------------------------------------------
     // WRITE-ONLY / CREATE dispositions
     //   FILE_CREATE, FILE_SUPERSEDE, FILE_OVERWRITE, FILE_OVERWRITE_IF
     //
@@ -2664,17 +2685,12 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
             e.isRealOnly = false;
             // Try to open real dir shadow for future merge
             if (!e.isDir) {
-                // Try to open real dir for merging (in case this is a dir opened without flag)
-                VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
-                VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
                 VL_IO_STATUS_BLOCK iosb;
                 Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                 FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
                 if (e.hReal) e.isDir = true;
             } else {
-                VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
-                VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
                 VL_IO_STATUS_BLOCK iosb;
                 Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -2717,16 +2733,12 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
         e.isDir = isDir;
         e.isRealOnly = false;
         if (!e.isDir) {
-            VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
-            VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
             VL_IO_STATUS_BLOCK iosb;
             Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
             if (e.hReal) e.isDir = true;
         } else {
-            VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
-            VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
             VL_IO_STATUS_BLOCK iosb;
             Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -2748,8 +2760,12 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
     }
 
     // Does the real file exist?
+    // Fix BUG1: The Relative Path Bug: GetHandleLogicalPath never checks g_FileMap
+    // FIX: use realOa (built from ntPath, RootDirectory=NULL) instead of
+    // ObjectAttributes, which may carry a virtual-store RootDirectory handle
+    // that would make Real_NtQueryAttributesFile look inside the virtual store.
     BYTE basicBuf[48] = {0};
-    NTSTATUS realCheck = Real_NtQueryAttributesFile(ObjectAttributes, basicBuf);
+    NTSTATUS realCheck = Real_NtQueryAttributesFile(&realOa, basicBuf);
     if (IsFsNotFound(realCheck)) {
         VL_DBG(L"Hook_NtCreateFile: real also not found, returning 0x%08X", (ULONG)st);
         return st;
@@ -2757,8 +2773,12 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
 
     if (!isWrite) {
         // Read-only CoW: serve the real file directly; sandbox state unchanged.
+        // Fix BUG1: The Relative Path Bug: GetHandleLogicalPath never checks g_FileMap
+        // FIX: use realOa (RootDirectory=NULL, full ntPath) instead of
+        // ObjectAttributes so we open the REAL file, not a path relative to
+        // the virtual-store handle that may be in ObjectAttributes->RootDirectory.
         VL_DBG(L"Hook_NtCreateFile: read-only CoW fallback to real");
-        NTSTATUS stReal = Real_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
+        NTSTATUS stReal = Real_NtCreateFile(FileHandle, DesiredAccess, &realOa,
                                              IoStatusBlock, AllocationSize, FileAttributes,
                                              ShareAccess, CreateDisposition, CreateOptions,
                                              EaBuffer, EaLength);
@@ -2788,8 +2808,6 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
             e.logPath = ntPath;
             e.isDir = true;
             e.isRealOnly = false;
-            VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
-            VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
             VL_IO_STATUS_BLOCK iosb;
             Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -2853,6 +2871,16 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
     VL_DBG(L"Hook_NtOpenFile: %s -> %s dir=%d write=%d",
            ntPath.c_str(), redPath.c_str(), (int)isDir, (int)isWrite);
 
+    // ----------------------------------------------------------------
+    // Fix BUG1: The Relative Path Bug: GetHandleLogicalPath never checks g_FileMap
+    // Build a clean OA that always points to the REAL filesystem.
+    // This uses ntPath (the logical path, e.g. \??\C:\dir\file.txt)
+    // with RootDirectory=NULL so Real_Nt*File never follows a
+    // virtual-store handle that may be sitting in ObjectAttributes.
+    // ----------------------------------------------------------------
+    VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
+    VL_OBJECT_ATTRIBUTES realOa;  MakeOA(&realOa, &realName);
+
     // Try virtual first.
     NTSTATUS st = Real_NtOpenFile(FileHandle, DesiredAccess, &newOa,
                                    IoStatusBlock, ShareAccess, OpenOptions);
@@ -2863,16 +2891,12 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
         e.isDir = isDir;
         e.isRealOnly = false;
         if (!isDir) {
-            VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
-            VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
             VL_IO_STATUS_BLOCK iosb;
             Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
             if (e.hReal) e.isDir = true;
         } else {
-            VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
-            VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
             VL_IO_STATUS_BLOCK iosb;
             Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -2894,16 +2918,24 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
     }
 
     // Does the real file exist?
+    // Fix BUG1: The Relative Path Bug: GetHandleLogicalPath never checks g_FileMap
+    // FIX: use realOa (built from ntPath, RootDirectory=NULL) instead of
+    // ObjectAttributes, which may carry a virtual-store RootDirectory handle
+    // that would make Real_NtQueryAttributesFile look inside the virtual store.
     BYTE basicBuf[48] = {0};
-    if (IsFsNotFound(Real_NtQueryAttributesFile(ObjectAttributes, basicBuf))) {
+    if (IsFsNotFound(Real_NtQueryAttributesFile(&realOa, basicBuf))) {
         VL_DBG(L"Hook_NtOpenFile: real also not found, returning 0x%08X", (ULONG)st);
         return st;
     }
 
     if (!isWrite) {
         // Read-only CoW: serve real directly; sandbox unchanged.
+        // Fix BUG1: The Relative Path Bug: GetHandleLogicalPath never checks g_FileMap
+        // FIX: use realOa (RootDirectory=NULL, full ntPath) instead of
+        // ObjectAttributes so we open the REAL file, not a path relative to
+        // the virtual-store handle that may be in ObjectAttributes->RootDirectory.
         VL_DBG(L"Hook_NtOpenFile: read-only CoW fallback to real");
-        NTSTATUS stReal = Real_NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes,
+        NTSTATUS stReal = Real_NtOpenFile(FileHandle, DesiredAccess, &realOa,
                                            IoStatusBlock, ShareAccess, OpenOptions);
         if (NT_SUCCESS(stReal)) {
             VirtFileEntry e;
@@ -2930,8 +2962,6 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
             e.logPath = ntPath;
             e.isDir = true;
             e.isRealOnly = false;
-            VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
-            VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
             VL_IO_STATUS_BLOCK iosb;
             Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,

@@ -39,19 +39,6 @@ echo ============================================================
 echo  VirtLauncher Injection Test Suite
 echo ============================================================
 
-
-@rem VirtLauncher64.exe -r HKEY_CURRENT_USER\VirtApp -f sandbox  cmd /c %cd%\sandbox\TE64.exe
-@rem VirtLauncher64.exe -r HKEY_CURRENT_USER\VirtApp -f sandbox -e cmd /c "F:\_bin\_src\_launcher_virtualization\__VirtLauncher\_claude\files\git\build\sandbox\TE64.exe"
-@rem VirtLauncher64.exe -r HKEY_CURRENT_USER\VirtApp -f F:\_bin\_src\_launcher_virtualization\__VirtLauncher\_claude\files\git\build\sandbox -e cmd /c "F:\_bin\_src\_launcher_virtualization\__VirtLauncher\_claude\files\git\build\sandbox\TE64.exe"
-
-@rem cannot find api ms win service code l1 1 0 dll
-@rem VirtLauncher64.exe -r HKEY_CURRENT_USER\VirtApp -f F:\_bin\_src\_launcher_virtualization\__VirtLauncher\_claude\files\git\build\sandbox -e "F:\_bin\_src\_launcher_virtualization\__VirtLauncher\_claude\files\git\build\sandbox\TE64.exe"
-
-@rem VirtLauncher64.exe -r HKEY_CURRENT_USER\VirtApp -f F:\_bin\_src\_launcher_virtualization\__VirtLauncher\_claude\files\git\build\sandbox -e %TEST64_PATH%"
-
-
-
-
 set "currdir=%CD%"
 @rem remove :
 set "currdir=%currdir::=%"
@@ -67,7 +54,7 @@ VirtLauncher64.exe -r -f -e cmd /c "mkdir c:\ccc & echo fff>c:\ccc\absolute"
 if exist "%CD%\VIRTL\c\ccc\absolute" (
     echo good 
 ) else (
-    echo bad
+    color 4F & echo bad
 )
 
 
@@ -76,41 +63,71 @@ VirtLauncher64.exe -r -f -e cmd /c "mkdir ccc & echo fff>ccc\relative"
 if exist "%CD%\VIRTL\%currdir%\ccc\relative" (
     echo good 
 ) else (
-    echo bad
+    color 4F & echo bad
 )
 
 
 echo ______read from relative path
 echo bad>rrr
 echo good> "%CD%\VIRTL\%currdir%\rrr"
-VirtLauncher64.exe -r -f -e cmd /c "type rrr"
+VirtLauncher64.exe -r -f -e cmd /c "type rrr" | findstr good >nul
+if %ERRORLEVEL% EQU 0 (
+    echo good
+) else (
+    color 4F & echo bad
+)
+del rrr
+
+
+echo ______read from relative path 2
+echo good>rrr
+VirtLauncher64.exe -r -f -e cmd /c "type rrr" | findstr good >nul
+if %ERRORLEVEL% EQU 0 (
+    echo good
+) else (
+    color 4F & echo bad
+)
 del rrr
 
 
 echo ______merged view
-mkdir "%CD%\VIRTL\c"
+mkdir "%CD%\VIRTL\c" 2>nul
 echo zzz>"%CD%\VIRTL\c\virtttt"
-VirtLauncher64.exe -r -f -e cmd /c "dir /B c:\ " | findstr Windows
+VirtLauncher64.exe -r -f -e cmd /c "dir /B c:\ " | findstr Windows >nul
 if %ERRORLEVEL% EQU 0 (
     echo good
 ) else (
-    echo bad
+    color 4F & echo bad
 )
 
 
-echo ______tombstone
+echo ______tombstone (delete aaa create aaa.vl_deleted)
 mkdir c:\ccc 2>nul
 echo real>c:\ccc\delll
 VirtLauncher64.exe -r -f -e cmd /c "echo virttt>c:\ccc\delll & del c:\ccc\delll"
 if exist "%CD%\VIRTL\c\ccc\delll.vl_deleted" (
     echo good 
 ) else (
-    echo bad
+    color 4F & echo bad
+)
+
+echo ______tombstone file vl_deleted must be hidden inside virt store
+VirtLauncher64.exe -r -f -e cmd /c "dir /b c:\ccc" | findstr delll.vl_deleted >nul
+if %ERRORLEVEL% EQU 0 (
+    @rem bad, my dll do not hide the tombstone
+    color 4F & echo bad
+) else (
+    echo good
 )
 
 
-pause
+echo.
+echo.
 echo ______merged view using TablacusExplorer
+echo press Enter to run TablacusExplorer to test Merged View: 
+echo create a folder in c:\ then refresh c:\ you must see the usual c:\ files + our new folder, if you see only the new folder then Merged View have a Bug
+echo.
+pause
 VirtLauncher64.exe -r -f -e "%TEST64_PATH%"
 
 
