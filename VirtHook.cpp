@@ -497,6 +497,13 @@ struct VirtKeyEntry {
 static std::map<HANDLE, VirtKeyEntry> g_KeyMap;
 static CRITICAL_SECTION g_KeyMapLock;
 
+// Case-insensitive comparator for filename sets (NTFS is case-insensitive)
+struct CiLess {
+    bool operator()(const std::wstring& a, const std::wstring& b) const {
+        return _wcsicmp(a.c_str(), b.c_str()) < 0;
+    }
+};
+
 // File-system handle tracking (COW + merged dirs)
 struct VirtFileEntry {
     HANDLE       hVirt;
@@ -508,7 +515,17 @@ struct VirtFileEntry {
     bool         virtEnumDone;
     bool         realEnumDone;
     bool         realRestartPending;
-    std::set<std::wstring> virtNames;
+    bool         hasCachedFileName;  // true once FileName pattern has been saved
+    std::set<std::wstring, CiLess> virtNames;
+    std::wstring cachedFileName;     // saved FileName search pattern for 1st real call
+
+    // Zero-initialize all scalar fields so stack garbage never causes bugs
+    VirtFileEntry()
+        : hVirt(NULL), hReal(NULL),
+          isDir(false), isRealOnly(false),
+          virtEnumDone(false), realEnumDone(false),
+          realRestartPending(false), hasCachedFileName(false)
+    {}
 };
 static std::map<HANDLE, VirtFileEntry> g_FileMap;
 static CRITICAL_SECTION g_FileMapLock;
@@ -1107,6 +1124,97 @@ static std::wstring ExtractDirFileName(PVOID info, ULONG infoClass) {
         }
     }
     return L"";
+}
+
+// ============================================================
+// Merged-view buffer helpers
+// ============================================================
+
+// Check whether a real-directory entry (by filename) has a tombstone
+// in the virtual layer, meaning the file was deleted inside the sandbox.
+static bool FileHasTombstoneInVirtDir(const std::wstring& virtDirPath,
+                                       const std::wstring& fileName)
+{
+    if (virtDirPath.empty() || fileName.empty()) return false;
+    std::wstring tp = virtDirPath + L"\\" + fileName + L".vl_deleted";
+    VL_UNICODE_STRING us; MakeUStr(&us, tp);
+    VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
+    BYTE dummy[48] = {0};
+    return NT_SUCCESS(Real_NtQueryAttributesFile(&oa, dummy));
+}
+
+// Return true if the filename ends with the tombstone suffix ".vl_deleted".
+static inline bool IsTombstoneName(const std::wstring& name) {
+    static const wchar_t kSuffix[] = L".vl_deleted";
+    static const size_t  kSuffixLen = 11;
+    return name.size() > kSuffixLen &&
+           _wcsicmp(name.c_str() + name.size() - kSuffixLen, kSuffix) == 0;
+}
+
+// Filter a raw NtQueryDirectoryFile output buffer in-place.
+//   skipNames   – names already seen in the virtual layer (dedup); may be NULL.
+//   virtDirPath – virtual path of the directory, used for tombstone probing;
+//                 empty string disables tombstone probe.
+// Returns the new valid byte count (0 means the buffer is now empty).
+static ULONG FilterDirBuffer(
+    PVOID  buf,
+    ULONG  len,
+    ULONG  infoClass,
+    const std::set<std::wstring, CiLess>* skipNames,
+    const std::wstring& virtDirPath)
+{
+    if (!buf || len == 0) return 0;
+
+    BYTE*  base         = (BYTE*)buf;
+    ULONG  readOff      = 0;
+    ULONG  writeOff     = 0;
+    ULONG  prevWriteOff = (ULONG)-1; // position of the last KEPT entry
+
+    while (readOff < len) {
+        BYTE*  entry     = base + readOff;
+        ULONG  nextOff   = *(ULONG*)entry;       // NextEntryOffset is always first field
+        ULONG  entrySize = (nextOff > 0) ? nextOff : (len - readOff);
+
+        std::wstring name = ExtractDirFileName(entry, infoClass);
+
+        bool skip = false;
+
+        // Always hide .vl_deleted tombstone marker files from callers
+        if (!skip && IsTombstoneName(name)) skip = true;
+
+        // Hide entries that exist in the virtual layer (virtual wins, no dups)
+        if (!skip && skipNames && !name.empty() && skipNames->count(name))
+            skip = true;
+
+        // Hide real entries that were deleted inside the sandbox (tombstone exists)
+        if (!skip && !virtDirPath.empty() && !name.empty()) {
+            SetReentrant(true);
+            skip = FileHasTombstoneInVirtDir(virtDirPath, name);
+            SetReentrant(false);
+        }
+
+        if (!skip) {
+            if (writeOff != readOff)
+                memmove(base + writeOff, entry, entrySize);
+
+            // Fix up the previous kept entry's NextEntryOffset to point here
+            if (prevWriteOff != (ULONG)-1)
+                *(ULONG*)(base + prevWriteOff) = writeOff - prevWriteOff;
+
+            prevWriteOff = writeOff;
+            writeOff    += entrySize;
+        }
+
+        if (nextOff == 0) break;
+        readOff += nextOff;
+    }
+
+    // Mark the last kept entry as the final one
+    if (prevWriteOff != (ULONG)-1) {
+        *(ULONG*)(base + prevWriteOff) = 0;
+        return writeOff;
+    }
+    return 0; // every entry was filtered
 }
 
 // ============================================================
@@ -2237,7 +2345,7 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
                 VL_IO_STATUS_BLOCK iosb;
                 Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                FILE_DIRECTORY_FILE);
+                                FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
                 if (e.hReal) e.isDir = true;
             } else {
                 VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
@@ -2245,7 +2353,7 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
                 VL_IO_STATUS_BLOCK iosb;
                 Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                FILE_DIRECTORY_FILE);
+                                FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
             }
             TrackFileHandle(*FileHandle, e);
         }
@@ -2277,7 +2385,7 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
             VL_IO_STATUS_BLOCK iosb;
             Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                            FILE_DIRECTORY_FILE);
+                            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
             if (e.hReal) e.isDir = true;
         } else {
             VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
@@ -2285,7 +2393,7 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
             VL_IO_STATUS_BLOCK iosb;
             Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                            FILE_DIRECTORY_FILE);
+                            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
         }
         TrackFileHandle(*FileHandle, e);
         return st;
@@ -2348,7 +2456,7 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
             VL_IO_STATUS_BLOCK iosb;
             Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                            FILE_DIRECTORY_FILE);
+                            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
             TrackFileHandle(*FileHandle, e);
         }
         return st;
@@ -2418,7 +2526,7 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
             VL_IO_STATUS_BLOCK iosb;
             Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                            FILE_DIRECTORY_FILE);
+                            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
             if (e.hReal) e.isDir = true;
         } else {
             VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
@@ -2426,7 +2534,7 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
             VL_IO_STATUS_BLOCK iosb;
             Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                            FILE_DIRECTORY_FILE);
+                            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
         }
         TrackFileHandle(*FileHandle, e);
         return st;
@@ -2481,7 +2589,7 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
             VL_IO_STATUS_BLOCK iosb;
             Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                            FILE_DIRECTORY_FILE);
+                            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
             TrackFileHandle(*FileHandle, e);
         }
         return st;
@@ -2724,7 +2832,7 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
         VL_IO_STATUS_BLOCK iosb;
         Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                        FILE_DIRECTORY_FILE);
+                        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
         if (e.hReal) {
             UpdateFileEntry(FileHandle, e);
             VL_DBG(L"Hook_NtQueryDirectoryFile: on-demand opened real h=%p for %s",
@@ -2739,110 +2847,203 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
         }
     }
 
+    // Save the search pattern on the very first call so we can replay it
+    // when we open real-side enumeration later.
+    if (RestartScan || !e.hasCachedFileName) {
+        e.cachedFileName    = FileName ? FromUStr(FileName) : L"";
+        e.hasCachedFileName = true;
+    }
+
     if (RestartScan) {
-        e.virtEnumDone = false;
-        e.realEnumDone = false;
+        e.virtEnumDone       = false;
+        e.realEnumDone       = false;
         e.realRestartPending = true;
         e.virtNames.clear();
-        UpdateFileEntry(FileHandle, e);
     }
+    UpdateFileEntry(FileHandle, e);
 
-    // If the caller requested multiple entries in one go, just pass through
-    // to virtual (shadowing real).  Full buffer merging is extremely complex;
-    // FindFirstFile/FindNextFile always use ReturnSingleEntry=TRUE.
+    // Virtual dir path used for tombstone probing during real enumeration
+    const std::wstring virtDirPath = ApplyFsRedirect(e.logPath);
+
+    // ---------------------------------------------------------------
+    // Multi-entry path  (!ReturnSingleEntry)
+    // ---------------------------------------------------------------
     if (!ReturnSingleEntry) {
-        if (!e.virtEnumDone) {
-            NTSTATUS st = Real_NtQueryDirectoryFile(e.hVirt, Event, ApcRoutine, ApcContext,
-                                                      IoStatusBlock, FileInformation, Length,
-                                                      FileInformationClass, FALSE,
-                                                      FileName, RestartScan);
+        BOOLEAN virtRestart              = RestartScan;
+        BOOLEAN localFileName_consumed   = FALSE;
+
+        while (!e.virtEnumDone) {
+            NTSTATUS st = Real_NtQueryDirectoryFile(
+                e.hVirt, Event, ApcRoutine, ApcContext,
+                IoStatusBlock, FileInformation, Length,
+                FileInformationClass, FALSE,
+                localFileName_consumed ? NULL : FileName, virtRestart);
+            virtRestart            = FALSE;
+            localFileName_consumed = TRUE;
+
             if (NT_SUCCESS(st)) {
-                // Remember names so future real enumerations can filter
-                // (best-effort: we only see the first returned buffer)
-                BYTE* p = (BYTE*)FileInformation;
-                while (p) {
-                    std::wstring name = ExtractDirFileName(p, FileInformationClass);
-                    if (!name.empty()) e.virtNames.insert(name);
-                    ULONG next = 0;
-                    switch (FileInformationClass) {
-                        case 1: next = ((VL_FILE_DIRECTORY_INFORMATION*)p)->NextEntryOffset; break;
-                        case 2: next = ((VL_FILE_FULL_DIR_INFORMATION*)p)->NextEntryOffset; break;
-                        case 3: next = ((VL_FILE_BOTH_DIR_INFORMATION*)p)->NextEntryOffset; break;
-                        case 12: next = ((VL_FILE_NAMES_INFORMATION*)p)->NextEntryOffset; break;
-                        case 37: next = ((VL_FILE_ID_BOTH_DIR_INFORMATION*)p)->NextEntryOffset; break;
-                        case 38: next = ((VL_FILE_ID_FULL_DIR_INFORMATION*)p)->NextEntryOffset; break;
+                // Record all names for real-side dedup
+                {
+                    BYTE* p = (BYTE*)FileInformation;
+                    while (p) {
+                        std::wstring nm = ExtractDirFileName(p, FileInformationClass);
+                        if (!nm.empty()) e.virtNames.insert(nm);
+                        ULONG nx = *(ULONG*)p;
+                        if (nx == 0) break;
+                        p += nx;
                     }
-                    if (next == 0) break;
-                    p += next;
                 }
-                UpdateFileEntry(FileHandle, e);
-                return st;
+                // Filter .vl_deleted marker files from the virtual buffer
+                ULONG newLen = FilterDirBuffer(
+                    FileInformation, (ULONG)IoStatusBlock->Information,
+                    FileInformationClass, nullptr, L"");
+                if (newLen > 0) {
+                    IoStatusBlock->Information = newLen;
+                    UpdateFileEntry(FileHandle, e);
+                    return st;
+                }
+                // Entire buffer was tombstone markers — query again
+                continue;
             }
-            if (st == VL_STATUS_NO_MORE_ENTRIES) {
-                e.virtEnumDone = true;
+            // FIX: recognise both end-of-dir status codes
+            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES) {
+                e.virtEnumDone       = true;
+                e.realRestartPending = true;
                 UpdateFileEntry(FileHandle, e);
-            } else {
-                return st;
+                break;
             }
+            return st;
         }
-        // Virtual exhausted -> pass through real (duplicates may appear, but
-        // this path is rare for typical shell usage).
-        return Real_NtQueryDirectoryFile(e.hReal, Event, ApcRoutine, ApcContext,
-                                          IoStatusBlock, FileInformation, Length,
-                                          FileInformationClass, FALSE,
-                                          FileName, RestartScan);
+
+        // Real-side multi-entry phase
+        BOOLEAN realRestart = e.realRestartPending ? TRUE : FALSE;
+        VL_UNICODE_STRING realFnUs;
+        PVL_UNICODE_STRING pRealFn = NULL;
+        if (realRestart && !e.cachedFileName.empty()) {
+            MakeUStr(&realFnUs, e.cachedFileName);
+            pRealFn = &realFnUs;
+        }
+
+        while (!e.realEnumDone) {
+            NTSTATUS st = Real_NtQueryDirectoryFile(
+                e.hReal, Event, ApcRoutine, ApcContext,
+                IoStatusBlock, FileInformation, Length,
+                FileInformationClass, FALSE,
+                pRealFn, realRestart);
+            realRestart = FALSE;
+            pRealFn     = NULL;
+
+            if (NT_SUCCESS(st)) {
+                ULONG newLen = FilterDirBuffer(
+                    FileInformation, (ULONG)IoStatusBlock->Information,
+                    FileInformationClass, &e.virtNames, virtDirPath);
+                if (newLen > 0) {
+                    e.realRestartPending = false;
+                    IoStatusBlock->Information = newLen;
+                    UpdateFileEntry(FileHandle, e);
+                    return st;
+                }
+                continue; // all filtered; query again
+            }
+            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES) {
+                e.realEnumDone = true;
+                UpdateFileEntry(FileHandle, e);
+                return VL_STATUS_NO_MORE_FILES;
+            }
+            return st;
+        }
+
+        return VL_STATUS_NO_MORE_FILES;
     }
 
-    // --- ReturnSingleEntry = TRUE  (FindFirstFile / FindNextFile) ---
+    // ---------------------------------------------------------------
+    // Single-entry path  (ReturnSingleEntry = TRUE)
+    // Used by FindFirstFile / FindNextFile — this is the hot path.
+    // ---------------------------------------------------------------
     BOOLEAN restartVirt = RestartScan;
     BOOLEAN restartReal = e.realRestartPending ? TRUE : FALSE;
 
+    // Prepare real-side FileName pointer for the first real query
+    VL_UNICODE_STRING realFnUs;
+    PVL_UNICODE_STRING pRealFileName = NULL;
+    if (restartReal && !e.cachedFileName.empty()) {
+        MakeUStr(&realFnUs, e.cachedFileName);
+        pRealFileName = &realFnUs;
+    }
+
     while (true) {
+        // --- Virtual side ---
         if (!e.virtEnumDone) {
-            NTSTATUS st = Real_NtQueryDirectoryFile(e.hVirt, Event, ApcRoutine, ApcContext,
-                                                      IoStatusBlock, FileInformation, Length,
-                                                      FileInformationClass, TRUE,
-                                                      FileName, restartVirt);
+            NTSTATUS st = Real_NtQueryDirectoryFile(
+                e.hVirt, Event, ApcRoutine, ApcContext,
+                IoStatusBlock, FileInformation, Length,
+                FileInformationClass, TRUE,
+                FileName, restartVirt);
+            restartVirt = FALSE;
+
             if (NT_SUCCESS(st)) {
                 std::wstring name = ExtractDirFileName(FileInformation, FileInformationClass);
+                // Hide tombstone marker files (.vl_deleted) from callers
+                if (IsTombstoneName(name)) continue;
                 if (!name.empty()) e.virtNames.insert(name);
                 UpdateFileEntry(FileHandle, e);
                 return st;
             }
-            if (st == VL_STATUS_NO_MORE_ENTRIES) {
-                e.virtEnumDone = true;
-                if (restartVirt) e.realRestartPending = true;
+            // FIX: accept STATUS_NO_MORE_FILES from the virtual handle too
+            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES) {
+                e.virtEnumDone       = true;
+                e.realRestartPending = true;
+                // Build real FileName pointer if not already set
+                if (!pRealFileName && !e.cachedFileName.empty()) {
+                    MakeUStr(&realFnUs, e.cachedFileName);
+                    pRealFileName = &realFnUs;
+                    restartReal   = TRUE;
+                } else {
+                    restartReal = TRUE;
+                }
                 UpdateFileEntry(FileHandle, e);
-                restartVirt = FALSE;
                 continue;
             }
             return st;
         }
 
+        // --- Real side ---
         if (!e.realEnumDone) {
-            NTSTATUS st = Real_NtQueryDirectoryFile(e.hReal, Event, ApcRoutine, ApcContext,
-                                                      IoStatusBlock, FileInformation, Length,
-                                                      FileInformationClass, TRUE,
-                                                      FileName, restartReal);
+            NTSTATUS st = Real_NtQueryDirectoryFile(
+                e.hReal, Event, ApcRoutine, ApcContext,
+                IoStatusBlock, FileInformation, Length,
+                FileInformationClass, TRUE,
+                pRealFileName, restartReal);
+            restartReal   = FALSE;
+            pRealFileName = NULL; // only pass on first real call
+
             if (NT_SUCCESS(st)) {
                 std::wstring name = ExtractDirFileName(FileInformation, FileInformationClass);
-                if (!name.empty() && e.virtNames.find(name) != e.virtNames.end()) {
-                    restartReal = FALSE;
-                    continue; // skip duplicate
+                // FIX: case-insensitive duplicate check (virtNames uses CiLess)
+                if (!name.empty() && e.virtNames.count(name))
+                    continue;
+                // FIX: tombstone check — file was deleted inside the sandbox
+                if (!name.empty() && !virtDirPath.empty()) {
+                    SetReentrant(true);
+                    bool tomb = FileHasTombstoneInVirtDir(virtDirPath, name);
+                    SetReentrant(false);
+                    if (tomb) continue;
                 }
                 e.realRestartPending = false;
                 UpdateFileEntry(FileHandle, e);
                 return st;
             }
-            if (st == VL_STATUS_NO_MORE_ENTRIES) {
+            // FIX: recognise both end-of-dir codes from the real handle
+            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES) {
                 e.realEnumDone = true;
                 UpdateFileEntry(FileHandle, e);
-                return st;
+                return VL_STATUS_NO_MORE_FILES;
             }
             return st;
         }
 
-        return VL_STATUS_NO_MORE_ENTRIES;
+        // FIX: both exhausted — return the code callers (FindNextFile) expect
+        return VL_STATUS_NO_MORE_FILES;
     }
 }
 
@@ -2872,7 +3073,7 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
         VL_IO_STATUS_BLOCK iosb;
         Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                        FILE_DIRECTORY_FILE);
+                        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
         if (e.hReal) {
             UpdateFileEntry(FileHandle, e);
             VL_DBG(L"Hook_NtQueryDirectoryFileEx: on-demand opened real h=%p for %s",
@@ -2886,73 +3087,128 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
         }
     }
 
-    BOOLEAN restartScan = (QueryFlags & 0x01) ? TRUE : FALSE;
+    BOOLEAN restartScan  = (QueryFlags & 0x01) ? TRUE : FALSE;
     BOOLEAN returnSingle = (QueryFlags & 0x02) ? TRUE : FALSE;
 
+    // Save search pattern and reset state on restart
+    if (restartScan || !e.hasCachedFileName) {
+        // NtQueryDirectoryFileEx has no FileName parameter; pattern comes from QueryFlags
+        // (there is no FileName arg in this variant). Cache empty string.
+        e.cachedFileName    = L"";
+        e.hasCachedFileName = true;
+    }
+
     if (restartScan) {
-        e.virtEnumDone = false;
-        e.realEnumDone = false;
+        e.virtEnumDone       = false;
+        e.realEnumDone       = false;
         e.realRestartPending = true;
         e.virtNames.clear();
-        UpdateFileEntry(FileHandle, e);
     }
+    UpdateFileEntry(FileHandle, e);
 
+    const std::wstring virtDirPath = ApplyFsRedirect(e.logPath);
+
+    // ---------------------------------------------------------------
+    // Multi-entry path
+    // ---------------------------------------------------------------
     if (!returnSingle) {
-        if (!e.virtEnumDone) {
+        ULONG flagsVirt = QueryFlags;
+
+        while (!e.virtEnumDone) {
             NTSTATUS st = Real_NtQueryDirectoryFileEx(e.hVirt, Event, ApcRoutine, ApcContext,
                                                         IoStatusBlock, FileInformation, Length,
-                                                        FileInformationClass, QueryFlags);
+                                                        FileInformationClass, flagsVirt);
+            flagsVirt &= ~0x01u; // clear restart bit after first call
+
             if (NT_SUCCESS(st)) {
-                BYTE* p = (BYTE*)FileInformation;
-                while (p) {
-                    std::wstring name = ExtractDirFileName(p, FileInformationClass);
-                    if (!name.empty()) e.virtNames.insert(name);
-                    ULONG next = 0;
-                    switch (FileInformationClass) {
-                        case 1: next = ((VL_FILE_DIRECTORY_INFORMATION*)p)->NextEntryOffset; break;
-                        case 2: next = ((VL_FILE_FULL_DIR_INFORMATION*)p)->NextEntryOffset; break;
-                        case 3: next = ((VL_FILE_BOTH_DIR_INFORMATION*)p)->NextEntryOffset; break;
-                        case 12: next = ((VL_FILE_NAMES_INFORMATION*)p)->NextEntryOffset; break;
-                        case 37: next = ((VL_FILE_ID_BOTH_DIR_INFORMATION*)p)->NextEntryOffset; break;
-                        case 38: next = ((VL_FILE_ID_FULL_DIR_INFORMATION*)p)->NextEntryOffset; break;
+                {
+                    BYTE* p = (BYTE*)FileInformation;
+                    while (p) {
+                        std::wstring nm = ExtractDirFileName(p, FileInformationClass);
+                        if (!nm.empty()) e.virtNames.insert(nm);
+                        ULONG nx = *(ULONG*)p;
+                        if (nx == 0) break;
+                        p += nx;
                     }
-                    if (next == 0) break;
-                    p += next;
                 }
-                UpdateFileEntry(FileHandle, e);
-                return st;
+                ULONG newLen = FilterDirBuffer(
+                    FileInformation, (ULONG)IoStatusBlock->Information,
+                    FileInformationClass, nullptr, L"");
+                if (newLen > 0) {
+                    IoStatusBlock->Information = newLen;
+                    UpdateFileEntry(FileHandle, e);
+                    return st;
+                }
+                continue; // all filtered
             }
-            if (st == VL_STATUS_NO_MORE_ENTRIES) {
-                e.virtEnumDone = true;
+            // FIX: accept both end-of-dir codes
+            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES) {
+                e.virtEnumDone       = true;
+                e.realRestartPending = true;
                 UpdateFileEntry(FileHandle, e);
-            } else {
-                return st;
+                break;
             }
+            return st;
         }
-        return Real_NtQueryDirectoryFileEx(e.hReal, Event, ApcRoutine, ApcContext,
-                                            IoStatusBlock, FileInformation, Length,
-                                            FileInformationClass, QueryFlags);
+
+        // Real-side multi-entry
+        ULONG flagsReal = e.realRestartPending ? (QueryFlags | 0x01u) : (QueryFlags & ~0x01u);
+
+        while (!e.realEnumDone) {
+            NTSTATUS st = Real_NtQueryDirectoryFileEx(e.hReal, Event, ApcRoutine, ApcContext,
+                                                        IoStatusBlock, FileInformation, Length,
+                                                        FileInformationClass, flagsReal);
+            flagsReal &= ~0x01u;
+
+            if (NT_SUCCESS(st)) {
+                ULONG newLen = FilterDirBuffer(
+                    FileInformation, (ULONG)IoStatusBlock->Information,
+                    FileInformationClass, &e.virtNames, virtDirPath);
+                if (newLen > 0) {
+                    e.realRestartPending = false;
+                    IoStatusBlock->Information = newLen;
+                    UpdateFileEntry(FileHandle, e);
+                    return st;
+                }
+                continue;
+            }
+            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES) {
+                e.realEnumDone = true;
+                UpdateFileEntry(FileHandle, e);
+                return VL_STATUS_NO_MORE_FILES;
+            }
+            return st;
+        }
+
+        return VL_STATUS_NO_MORE_FILES;
     }
 
+    // ---------------------------------------------------------------
+    // Single-entry path
+    // ---------------------------------------------------------------
     ULONG flagsVirt = QueryFlags;
-    ULONG flagsReal = (e.realRestartPending ? (QueryFlags | 0x01) : QueryFlags);
+    ULONG flagsReal = e.realRestartPending ? (QueryFlags | 0x01u) : (QueryFlags & ~0x01u);
 
     while (true) {
         if (!e.virtEnumDone) {
             NTSTATUS st = Real_NtQueryDirectoryFileEx(e.hVirt, Event, ApcRoutine, ApcContext,
                                                         IoStatusBlock, FileInformation, Length,
                                                         FileInformationClass, flagsVirt);
+            flagsVirt &= ~0x01u; // clear restart after first call
+
             if (NT_SUCCESS(st)) {
                 std::wstring name = ExtractDirFileName(FileInformation, FileInformationClass);
+                if (IsTombstoneName(name)) continue;
                 if (!name.empty()) e.virtNames.insert(name);
                 UpdateFileEntry(FileHandle, e);
                 return st;
             }
-            if (st == VL_STATUS_NO_MORE_ENTRIES) {
-                e.virtEnumDone = true;
-                if (restartScan) e.realRestartPending = true;
+            // FIX: accept both end-of-dir codes
+            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES) {
+                e.virtEnumDone       = true;
+                e.realRestartPending = true;
+                flagsReal            = (QueryFlags & ~0x01u) | 0x01u; // restart real
                 UpdateFileEntry(FileHandle, e);
-                flagsVirt &= ~0x01;
                 continue;
             }
             return st;
@@ -2962,25 +3218,34 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
             NTSTATUS st = Real_NtQueryDirectoryFileEx(e.hReal, Event, ApcRoutine, ApcContext,
                                                         IoStatusBlock, FileInformation, Length,
                                                         FileInformationClass, flagsReal);
+            flagsReal &= ~0x01u;
+
             if (NT_SUCCESS(st)) {
                 std::wstring name = ExtractDirFileName(FileInformation, FileInformationClass);
-                if (!name.empty() && e.virtNames.find(name) != e.virtNames.end()) {
-                    flagsReal &= ~0x01;
+                // FIX: case-insensitive dedup (CiLess)
+                if (!name.empty() && e.virtNames.count(name))
                     continue;
+                // FIX: tombstone check
+                if (!name.empty() && !virtDirPath.empty()) {
+                    SetReentrant(true);
+                    bool tomb = FileHasTombstoneInVirtDir(virtDirPath, name);
+                    SetReentrant(false);
+                    if (tomb) continue;
                 }
                 e.realRestartPending = false;
                 UpdateFileEntry(FileHandle, e);
                 return st;
             }
-            if (st == VL_STATUS_NO_MORE_ENTRIES) {
+            // FIX: accept both end-of-dir codes
+            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES) {
                 e.realEnumDone = true;
                 UpdateFileEntry(FileHandle, e);
-                return st;
+                return VL_STATUS_NO_MORE_FILES;
             }
             return st;
         }
 
-        return VL_STATUS_NO_MORE_ENTRIES;
+        return VL_STATUS_NO_MORE_FILES;
     }
 }
 
