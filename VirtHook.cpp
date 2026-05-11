@@ -125,17 +125,20 @@ typedef LONG NTSTATUS;
 #  define NT_SUCCESS(s)  (((NTSTATUS)(s)) >= 0)
 #endif
 
-#define VL_STATUS_SUCCESS              ((NTSTATUS)0x00000000L)
-#define VL_STATUS_NO_MORE_ENTRIES      ((NTSTATUS)0x8000001AL)
-#define VL_STATUS_NO_MORE_FILES        ((NTSTATUS)0x80000006L)
-#define VL_STATUS_BUFFER_TOO_SMALL     ((NTSTATUS)0xC0000023L)
-#define VL_STATUS_BUFFER_OVERFLOW      ((NTSTATUS)0x80000005L)
+#define VL_STATUS_SUCCESS                ((NTSTATUS)0x00000000L)
+#define VL_STATUS_NO_MORE_ENTRIES        ((NTSTATUS)0x8000001AL)
+#define VL_STATUS_NO_MORE_FILES          ((NTSTATUS)0x80000006L)
+#define VL_STATUS_BUFFER_TOO_SMALL       ((NTSTATUS)0xC0000023L)
+#define VL_STATUS_BUFFER_OVERFLOW        ((NTSTATUS)0x80000005L)
 #define VL_STATUS_OBJECT_NAME_NOT_FOUND  ((NTSTATUS)0xC0000034L)
-#define VL_STATUS_OBJECT_PATH_NOT_FOUND ((NTSTATUS)0xC000003AL)
+#define VL_STATUS_OBJECT_PATH_NOT_FOUND  ((NTSTATUS)0xC000003AL)
 #define VL_STATUS_NO_SUCH_FILE           ((NTSTATUS)0xC000000FL)
-#define VL_STATUS_ACCESS_DENIED        ((NTSTATUS)0xC0000022L)
-#define VL_STATUS_INVALID_HANDLE       ((NTSTATUS)0xC0000008L)
-#define VL_STATUS_END_OF_FILE          ((NTSTATUS)0xC0000011L)
+#define VL_STATUS_ACCESS_DENIED          ((NTSTATUS)0xC0000022L)
+#define VL_STATUS_INVALID_HANDLE         ((NTSTATUS)0xC0000008L)
+#define VL_STATUS_END_OF_FILE            ((NTSTATUS)0xC0000011L)
+
+// Compatibility alias used by older registry code
+#define VL_STATUS_OBJECT_NOT_FOUND       VL_STATUS_OBJECT_NAME_NOT_FOUND
 
 #ifndef OBJ_CASE_INSENSITIVE
 #  define OBJ_CASE_INSENSITIVE 0x00000040UL
@@ -168,9 +171,6 @@ typedef LONG NTSTATUS;
 #endif
 #ifndef SYNCHRONIZE
 #  define SYNCHRONIZE                   0x00100000
-#endif
-#ifndef SL_RETURN_SINGLE_ENTRY
-#  define SL_RETURN_SINGLE_ENTRY        0x00000002
 #endif
 
 typedef struct _VL_UNICODE_STRING {
@@ -269,7 +269,7 @@ typedef struct _VL_KEY_VALUE_ENTRY {
 } VL_KEY_VALUE_ENTRY, *PVL_KEY_VALUE_ENTRY;
 #pragma pack(pop)
 
-// Directory enumeration structures (natural alignment)
+// Directory enumeration structures (natural alignment, canonical field names)
 struct VL_FILE_DIRECTORY_INFORMATION {
     ULONG NextEntryOffset;
     ULONG FileIndex;
@@ -649,7 +649,9 @@ static std::wstring DevicePathToDosPath(const std::wstring& devicePath) {
             }
         }
     }
-    for (auto it = s_devToDos.begin(); it != s_devToDos.end(); ++it) {
+    for (std::map<std::wstring, std::wstring>::iterator it = s_devToDos.begin();
+         it != s_devToDos.end(); ++it)
+    {
         if (devicePath.size() >= it->first.size() &&
             _wcsnicmp(devicePath.c_str(), it->first.c_str(), it->first.size()) == 0) {
             if (devicePath.size() == it->first.size() || devicePath[it->first.size()] == L'\\') {
@@ -662,7 +664,6 @@ static std::wstring DevicePathToDosPath(const std::wstring& devicePath) {
 
 static std::wstring GetHandleLogicalPath(HANDLE h) {
     if (!h) return L"";
-
     VirtKeyEntry e;
     if (GetEntry(h, e)) {
         VL_DBG(L"GetHandleLogicalPath: tracked -> %s", e.logPath.c_str());
@@ -712,7 +713,6 @@ static std::wstring GetHandleLogicalPath(HANDLE h) {
             }
         }
     }
-
     VL_DBG(L"GetHandleLogicalPath: FAILED for handle %p", h);
     return L"";
 }
@@ -728,34 +728,27 @@ static std::wstring GetFullNtPath(PVL_OBJECT_ATTRIBUTES oa) {
 }
 
 // Compute virtual NT path from logical path.
-static bool LogicalToVirtual(const std::wstring& logical,
-                               std::wstring& virt)
-{
+static bool LogicalToVirtual(const std::wstring& logical, std::wstring& virt) {
     if (!g_RegEnabled) return false;
-
     if (!StartsWithI(logical, g_RealNtBase)) {
         VL_DBG(L"LogicalToVirtual: SKIP (not under RealNtBase) path=%s base=%s",
                logical.c_str(), g_RealNtBase.c_str());
         return false;
     }
-
     size_t baseLen = g_RealNtBase.size();
     if (logical.size() > baseLen && logical[baseLen] != L'\\') {
         VL_DBG(L"LogicalToVirtual: SKIP (boundary mismatch) path=%s", logical.c_str());
         return false;
     }
-
     if (StartsWithI(logical, g_VirtNtBase)) {
         VL_DBG(L"LogicalToVirtual: SKIP (already under VirtNtBase) %s", logical.c_str());
         return false;
     }
-
     std::wstring sub = logical.substr(baseLen);
     if (sub.empty()) {
         VL_DBG(L"LogicalToVirtual: SKIP (hive root itself)");
         return false;
     }
-
     virt = g_VirtNtBase + sub;
     VL_DBG(L"LogicalToVirtual: REDIRECT %s -> %s", logical.c_str(), virt.c_str());
     return true;
@@ -764,10 +757,8 @@ static bool LogicalToVirtual(const std::wstring& logical,
 // Ensure every component of virtPath exists (creates missing keys)
 static void EnsureVirtualPath(const std::wstring& virtPath) {
     if (!StartsWithI(virtPath, g_VirtNtBase)) return;
-
     std::wstring remaining = virtPath.substr(g_VirtNtBase.size());
     std::wstring current   = g_VirtNtBase;
-
     while (!remaining.empty()) {
         size_t start = (remaining[0] == L'\\') ? 1u : 0u;
         size_t slash = remaining.find(L'\\', start);
@@ -781,7 +772,6 @@ static void EnsureVirtualPath(const std::wstring& virtPath) {
         }
         if (seg.empty()) continue;
         current += L"\\" + seg;
-
         VL_UNICODE_STRING us; MakeUStr(&us, current);
         VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
         HANDLE h = NULL; ULONG disp = 0;
@@ -832,21 +822,18 @@ static std::wstring ApplyFsRedirect(const std::wstring& ntPath) {
         std::wstring rest = (ntPath.size() > 6) ? ntPath.substr(6) : L"";
         return g_FsDirNtBase + driveStr + rest;
     }
-
     return ntPath;
 }
 
 // Reverse of ApplyFsRedirect: physical -> logical
 static std::wstring ReverseApplyFsRedirect(const std::wstring& ntPath) {
     if (!g_FsEnabled) return ntPath;
-
     for (size_t i = 0; i < g_FsRedirects.size(); ++i) {
         const std::wstring& from = g_FsRedirects[i].first;
         const std::wstring& to   = g_FsRedirects[i].second;
         if (StartsWithI(ntPath, to))
             return from + ntPath.substr(to.size());
     }
-
     if (!g_FsDirNtBase.empty() && StartsWithI(ntPath, g_FsDirNtBase)) {
         std::wstring tail = ntPath.substr(g_FsDirNtBase.size());
         if (tail.size() >= 2 && tail[0] == L'\\' && iswalpha(tail[1])) {
@@ -855,7 +842,6 @@ static std::wstring ReverseApplyFsRedirect(const std::wstring& ntPath) {
             return std::wstring(L"\\??\\") + drive + L':' + rest;
         }
     }
-
     return ntPath;
 }
 
@@ -1207,7 +1193,6 @@ static void LoadConfig() {
         strncpy(g_DllPathA32, g_DllPathA, MAX_PATH - 1);
     if (!g_DllPathA64[0] && g_DllPathA[0])
         strncpy(g_DllPathA64, g_DllPathA, MAX_PATH - 1);
-
     VL_DBG(L"LoadConfig: DebugEnabled=%d", (int)g_DebugEnabled);
     VL_DBG(L"LoadConfig: RegEnabled=%d  VirtNtBase=%s",
            (int)g_RegEnabled, g_VirtNtBase.c_str());
@@ -1289,19 +1274,15 @@ static NTSTATUS DoVirtOpen(
 {
     std::wstring fullPath = GetFullNtPath(OrigOA);
     std::wstring virtPath;
-
     if (!LogicalToVirtual(fullPath, virtPath)) {
         return VL_STATUS_OBJECT_NOT_FOUND;
     }
-
     VL_DBG(L"DoVirtOpen: fullPath=%s  isCreate=%d", fullPath.c_str(), (int)isCreate);
-
     if (isCreate) {
         EnsureVirtualPath(virtPath);
         VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
         VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
             OrigOA->Attributes | OBJ_CASE_INSENSITIVE);
-
         HANDLE hVirt = NULL;
         NTSTATUS st = Real_NtCreateKey(&hVirt, DesiredAccess, &voa,
                                         TitleIndex, Class, CreateOptions, Disposition);
@@ -1321,20 +1302,16 @@ static NTSTATUS DoVirtOpen(
     VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
     VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
         OrigOA->Attributes | OBJ_CASE_INSENSITIVE);
-
     HANDLE hVirt = NULL;
     NTSTATUS stV = Real_NtOpenKey(&hVirt, DesiredAccess, &voa);
-
     HANDLE hReal = NULL;
     Real_NtOpenKey(&hReal, KEY_READ, OrigOA);
-
     if (NT_SUCCESS(stV)) {
         *KeyHandle = hVirt;
         TrackHandle(hVirt, hVirt, hReal, fullPath);
         VL_DBG(L"DoVirtOpen: OPEN virtual hVirt=%p hReal=%p", hVirt, hReal);
         return VL_STATUS_SUCCESS;
     }
-
     if (!hReal) {
         if (hVirt) Real_NtClose(hVirt);
         VL_DBG(L"DoVirtOpen: OPEN neither exists -> NOT_FOUND");
@@ -1356,7 +1333,6 @@ static NTSTATUS DoVirtOpen(
         VL_DBG(L"DoVirtOpen: OPEN CoW hVirt=%p hReal=%p", hVirtNew, hReal);
         return VL_STATUS_SUCCESS;
     }
-
     VL_DBG(L"DoVirtOpen: OPEN CoW FAILED st=0x%08X -- using real untracked", (ULONG)stC);
     if (hVirtNew) Real_NtClose(hVirtNew);
     if (hReal) {
@@ -1376,10 +1352,8 @@ static NTSTATUS NTAPI Hook_NtOpenKey(
     VL_DBG(L"Hook_NtOpenKey: path=%s",
            (ObjectAttributes && ObjectAttributes->ObjectName)
            ? FromUStr(ObjectAttributes->ObjectName).c_str() : L"(null)");
-
     if (!g_RegEnabled || IsReentrant() || !ObjectAttributes)
         return Real_NtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
-
     SetReentrant(true);
     NTSTATUS st = DoVirtOpen(ObjectAttributes, DesiredAccess, KeyHandle,
                               false, 0, NULL, 0, NULL);
@@ -1395,15 +1369,12 @@ static NTSTATUS NTAPI Hook_NtOpenKeyEx(
     VL_DBG(L"Hook_NtOpenKeyEx: opts=0x%X path=%s", OpenOptions,
            (ObjectAttributes && ObjectAttributes->ObjectName)
            ? FromUStr(ObjectAttributes->ObjectName).c_str() : L"(null)");
-
     if (!g_RegEnabled || IsReentrant() || !ObjectAttributes)
         return Real_NtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
-
     SetReentrant(true);
     NTSTATUS st = DoVirtOpen(ObjectAttributes, DesiredAccess, KeyHandle,
                               false, 0, NULL, 0, NULL);
     SetReentrant(false);
-
     if (st == VL_STATUS_OBJECT_NOT_FOUND)
         return Real_NtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
     return st;
@@ -1921,6 +1892,56 @@ static NTSTATUS NTAPI Hook_NtLoadKey3(
 }
 
 // ============================================================
+// NtClose -- handles BOTH registry and file tracked handles
+// ============================================================
+
+static NTSTATUS NTAPI Hook_NtClose(HANDLE Handle) {
+    // Try registry first
+    VirtKeyEntry ke;
+    if (GetEntry(Handle, ke)) {
+        VL_DBG(L"Hook_NtClose: tracked REG handle=%p hVirt=%p hReal=%p",
+               Handle, ke.hVirt, ke.hReal);
+        UntrackHandle(Handle);
+        NTSTATUS st = VL_STATUS_SUCCESS;
+        if (ke.hVirt == Handle) {
+            st = Real_NtClose(Handle);
+            if (ke.hReal && ke.hReal != Handle) Real_NtClose(ke.hReal);
+        } else if (ke.hReal == Handle) {
+            st = Real_NtClose(Handle);
+            if (ke.hVirt && ke.hVirt != Handle) Real_NtClose(ke.hVirt);
+        } else {
+            if (ke.hVirt) Real_NtClose(ke.hVirt);
+            if (ke.hReal) Real_NtClose(ke.hReal);
+            st = Real_NtClose(Handle);
+        }
+        return st;
+    }
+
+    // Try files
+    VirtFileEntry fe;
+    if (GetFileEntry(Handle, fe)) {
+        VL_DBG(L"Hook_NtClose: tracked FS handle=%p hVirt=%p hReal=%p",
+               Handle, fe.hVirt, fe.hReal);
+        UntrackFileHandle(Handle);
+        NTSTATUS st = VL_STATUS_SUCCESS;
+        if (fe.hVirt == Handle) {
+            st = Real_NtClose(Handle);
+            if (fe.hReal && fe.hReal != Handle) Real_NtClose(fe.hReal);
+        } else if (fe.hReal == Handle) {
+            st = Real_NtClose(Handle);
+            if (fe.hVirt && fe.hVirt != Handle) Real_NtClose(fe.hVirt);
+        } else {
+            if (fe.hVirt) Real_NtClose(fe.hVirt);
+            if (fe.hReal) Real_NtClose(fe.hReal);
+            st = Real_NtClose(Handle);
+        }
+        return st;
+    }
+
+    return Real_NtClose(Handle);
+}
+
+// ============================================================
 // REPARSE POINT HOOK
 // ============================================================
 
@@ -2203,7 +2224,8 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
             e.logPath = ntPath;
             e.isDir = isDir;
             e.isRealOnly = false;
-            if (!isDir) {
+            // Try to open real dir shadow for future merge
+            if (!e.isDir) {
                 // Try to open real dir for merging (in case this is a dir opened without flag)
                 VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
                 VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
@@ -2244,7 +2266,7 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
         e.logPath = ntPath;
         e.isDir = isDir;
         e.isRealOnly = false;
-        if (!isDir) {
+        if (!e.isDir) {
             VL_UNICODE_STRING realName; MakeUStr(&realName, ntPath);
             VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
             VL_IO_STATUS_BLOCK iosb;
@@ -2665,7 +2687,10 @@ static NTSTATUS NTAPI Hook_NtQueryInformationByName(
                                           FileInformationClass);
 }
 
-// ---- NtQueryDirectoryFile -- merged view ----
+// ============================================================
+// Merged directory enumeration
+// ============================================================
+
 static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
     HANDLE FileHandle,
     HANDLE Event,
@@ -2680,11 +2705,33 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
     BOOLEAN RestartScan)
 {
     VirtFileEntry e;
-    if (!g_FsEnabled || !GetFileEntry(FileHandle, e) || !e.isDir || e.isRealOnly || !e.hReal) {
+    if (!g_FsEnabled || !GetFileEntry(FileHandle, e) || !e.isDir || e.isRealOnly) {
         return Real_NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
                                           IoStatusBlock, FileInformation, Length,
                                           FileInformationClass, ReturnSingleEntry,
                                           FileName, RestartScan);
+    }
+
+    // On-demand open of real shadow handle if missing
+    if (!e.hReal && !e.logPath.empty()) {
+        VL_UNICODE_STRING realName; MakeUStr(&realName, e.logPath);
+        VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
+        VL_IO_STATUS_BLOCK iosb;
+        Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        FILE_DIRECTORY_FILE);
+        if (e.hReal) {
+            UpdateFileEntry(FileHandle, e);
+            VL_DBG(L"Hook_NtQueryDirectoryFile: on-demand opened real h=%p for %s",
+                   e.hReal, e.logPath.c_str());
+        } else {
+            VL_DBG(L"Hook_NtQueryDirectoryFile: on-demand real open FAILED for %s",
+                   e.logPath.c_str());
+            return Real_NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                              IoStatusBlock, FileInformation, Length,
+                                              FileInformationClass, ReturnSingleEntry,
+                                              FileName, RestartScan);
+        }
     }
 
     if (RestartScan) {
@@ -2695,6 +2742,53 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
         UpdateFileEntry(FileHandle, e);
     }
 
+    // If the caller requested multiple entries in one go, just pass through
+    // to virtual (shadowing real).  Full buffer merging is extremely complex;
+    // FindFirstFile/FindNextFile always use ReturnSingleEntry=TRUE.
+    if (!ReturnSingleEntry) {
+        if (!e.virtEnumDone) {
+            NTSTATUS st = Real_NtQueryDirectoryFile(e.hVirt, Event, ApcRoutine, ApcContext,
+                                                      IoStatusBlock, FileInformation, Length,
+                                                      FileInformationClass, FALSE,
+                                                      FileName, RestartScan);
+            if (NT_SUCCESS(st)) {
+                // Remember names so future real enumerations can filter
+                // (best-effort: we only see the first returned buffer)
+                BYTE* p = (BYTE*)FileInformation;
+                while (p) {
+                    std::wstring name = ExtractDirFileName(p, FileInformationClass);
+                    if (!name.empty()) e.virtNames.insert(name);
+                    ULONG next = 0;
+                    switch (FileInformationClass) {
+                        case 1: next = ((VL_FILE_DIRECTORY_INFORMATION*)p)->NextEntryOffset; break;
+                        case 2: next = ((VL_FILE_FULL_DIR_INFORMATION*)p)->NextEntryOffset; break;
+                        case 3: next = ((VL_FILE_BOTH_DIR_INFORMATION*)p)->NextEntryOffset; break;
+                        case 12: next = ((VL_FILE_NAMES_INFORMATION*)p)->NextEntryOffset; break;
+                        case 37: next = ((VL_FILE_ID_BOTH_DIR_INFORMATION*)p)->NextEntryOffset; break;
+                        case 38: next = ((VL_FILE_ID_FULL_DIR_INFORMATION*)p)->NextEntryOffset; break;
+                    }
+                    if (next == 0) break;
+                    p += next;
+                }
+                UpdateFileEntry(FileHandle, e);
+                return st;
+            }
+            if (st == VL_STATUS_NO_MORE_ENTRIES) {
+                e.virtEnumDone = true;
+                UpdateFileEntry(FileHandle, e);
+            } else {
+                return st;
+            }
+        }
+        // Virtual exhausted -> pass through real (duplicates may appear, but
+        // this path is rare for typical shell usage).
+        return Real_NtQueryDirectoryFile(e.hReal, Event, ApcRoutine, ApcContext,
+                                          IoStatusBlock, FileInformation, Length,
+                                          FileInformationClass, FALSE,
+                                          FileName, RestartScan);
+    }
+
+    // --- ReturnSingleEntry = TRUE  (FindFirstFile / FindNextFile) ---
     BOOLEAN restartVirt = RestartScan;
     BOOLEAN restartReal = e.realRestartPending ? TRUE : FALSE;
 
@@ -2729,7 +2823,7 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
                 std::wstring name = ExtractDirFileName(FileInformation, FileInformationClass);
                 if (!name.empty() && e.virtNames.find(name) != e.virtNames.end()) {
                     restartReal = FALSE;
-                    continue;
+                    continue; // skip duplicate
                 }
                 e.realRestartPending = false;
                 UpdateFileEntry(FileHandle, e);
@@ -2760,13 +2854,36 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
     ULONG QueryFlags)
 {
     VirtFileEntry e;
-    if (!g_FsEnabled || !GetFileEntry(FileHandle, e) || !e.isDir || e.isRealOnly || !e.hReal) {
+    if (!g_FsEnabled || !GetFileEntry(FileHandle, e) || !e.isDir || e.isRealOnly) {
         return Real_NtQueryDirectoryFileEx(FileHandle, Event, ApcRoutine, ApcContext,
                                             IoStatusBlock, FileInformation, Length,
                                             FileInformationClass, QueryFlags);
     }
 
+    // On-demand open of real shadow handle if missing
+    if (!e.hReal && !e.logPath.empty()) {
+        VL_UNICODE_STRING realName; MakeUStr(&realName, e.logPath);
+        VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
+        VL_IO_STATUS_BLOCK iosb;
+        Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        FILE_DIRECTORY_FILE);
+        if (e.hReal) {
+            UpdateFileEntry(FileHandle, e);
+            VL_DBG(L"Hook_NtQueryDirectoryFileEx: on-demand opened real h=%p for %s",
+                   e.hReal, e.logPath.c_str());
+        } else {
+            VL_DBG(L"Hook_NtQueryDirectoryFileEx: on-demand real open FAILED for %s",
+                   e.logPath.c_str());
+            return Real_NtQueryDirectoryFileEx(FileHandle, Event, ApcRoutine, ApcContext,
+                                                IoStatusBlock, FileInformation, Length,
+                                                FileInformationClass, QueryFlags);
+        }
+    }
+
     BOOLEAN restartScan = (QueryFlags & 0x01) ? TRUE : FALSE;
+    BOOLEAN returnSingle = (QueryFlags & 0x02) ? TRUE : FALSE;
+
     if (restartScan) {
         e.virtEnumDone = false;
         e.realEnumDone = false;
@@ -2775,8 +2892,45 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
         UpdateFileEntry(FileHandle, e);
     }
 
-    ULONG flagsVirt = QueryFlags | SL_RETURN_SINGLE_ENTRY;
-    ULONG flagsReal = (e.realRestartPending ? (QueryFlags | 0x01) : QueryFlags) | SL_RETURN_SINGLE_ENTRY;
+    if (!returnSingle) {
+        if (!e.virtEnumDone) {
+            NTSTATUS st = Real_NtQueryDirectoryFileEx(e.hVirt, Event, ApcRoutine, ApcContext,
+                                                        IoStatusBlock, FileInformation, Length,
+                                                        FileInformationClass, QueryFlags);
+            if (NT_SUCCESS(st)) {
+                BYTE* p = (BYTE*)FileInformation;
+                while (p) {
+                    std::wstring name = ExtractDirFileName(p, FileInformationClass);
+                    if (!name.empty()) e.virtNames.insert(name);
+                    ULONG next = 0;
+                    switch (FileInformationClass) {
+                        case 1: next = ((VL_FILE_DIRECTORY_INFORMATION*)p)->NextEntryOffset; break;
+                        case 2: next = ((VL_FILE_FULL_DIR_INFORMATION*)p)->NextEntryOffset; break;
+                        case 3: next = ((VL_FILE_BOTH_DIR_INFORMATION*)p)->NextEntryOffset; break;
+                        case 12: next = ((VL_FILE_NAMES_INFORMATION*)p)->NextEntryOffset; break;
+                        case 37: next = ((VL_FILE_ID_BOTH_DIR_INFORMATION*)p)->NextEntryOffset; break;
+                        case 38: next = ((VL_FILE_ID_FULL_DIR_INFORMATION*)p)->NextEntryOffset; break;
+                    }
+                    if (next == 0) break;
+                    p += next;
+                }
+                UpdateFileEntry(FileHandle, e);
+                return st;
+            }
+            if (st == VL_STATUS_NO_MORE_ENTRIES) {
+                e.virtEnumDone = true;
+                UpdateFileEntry(FileHandle, e);
+            } else {
+                return st;
+            }
+        }
+        return Real_NtQueryDirectoryFileEx(e.hReal, Event, ApcRoutine, ApcContext,
+                                            IoStatusBlock, FileInformation, Length,
+                                            FileInformationClass, QueryFlags);
+    }
+
+    ULONG flagsVirt = QueryFlags;
+    ULONG flagsReal = (e.realRestartPending ? (QueryFlags | 0x01) : QueryFlags);
 
     while (true) {
         if (!e.virtEnumDone) {
