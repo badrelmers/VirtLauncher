@@ -83,9 +83,17 @@
 // ============================================================
 // Debug logging -- output visible in Sysinternals DebugView
 // (run DebugView as admin before launching VirtLauncher).
+//
+// Controlled at runtime by the VLAUNCHER_DEBUG env var, which
+// VirtLauncher.exe sets when --debug / -d is passed or when
+// VLAUNCHER_DEBUG=1 is present in the environment.
+//
+// VL_DEBUG=1 compiles the logging code in; g_DebugEnabled guards
+// actual output so there is zero overhead when debugging is off.
 // ============================================================
 #define VL_DEBUG 1
 
+// Initialized to false; set to true by LoadConfig() when VLAUNCHER_DEBUG=1.
 static bool g_DebugEnabled = false;
 
 #if VL_DEBUG
@@ -117,17 +125,17 @@ typedef LONG NTSTATUS;
 #  define NT_SUCCESS(s)  (((NTSTATUS)(s)) >= 0)
 #endif
 
-#define VL_STATUS_SUCCESS                ((NTSTATUS)0x00000000L)
-#define VL_STATUS_NO_MORE_ENTRIES        ((NTSTATUS)0x8000001AL)
-#define VL_STATUS_NO_MORE_FILES          ((NTSTATUS)0x80000006L)
-#define VL_STATUS_BUFFER_TOO_SMALL       ((NTSTATUS)0xC0000023L)
-#define VL_STATUS_BUFFER_OVERFLOW        ((NTSTATUS)0x80000005L)
+#define VL_STATUS_SUCCESS              ((NTSTATUS)0x00000000L)
+#define VL_STATUS_NO_MORE_ENTRIES      ((NTSTATUS)0x8000001AL)
+#define VL_STATUS_NO_MORE_FILES        ((NTSTATUS)0x80000006L)
+#define VL_STATUS_BUFFER_TOO_SMALL     ((NTSTATUS)0xC0000023L)
+#define VL_STATUS_BUFFER_OVERFLOW      ((NTSTATUS)0x80000005L)
 #define VL_STATUS_OBJECT_NAME_NOT_FOUND  ((NTSTATUS)0xC0000034L)
-#define VL_STATUS_OBJECT_PATH_NOT_FOUND  ((NTSTATUS)0xC000003AL)
+#define VL_STATUS_OBJECT_PATH_NOT_FOUND ((NTSTATUS)0xC000003AL)
 #define VL_STATUS_NO_SUCH_FILE           ((NTSTATUS)0xC000000FL)
-#define VL_STATUS_ACCESS_DENIED          ((NTSTATUS)0xC0000022L)
-#define VL_STATUS_INVALID_HANDLE         ((NTSTATUS)0xC0000008L)
-#define VL_STATUS_END_OF_FILE            ((NTSTATUS)0xC0000011L)
+#define VL_STATUS_ACCESS_DENIED        ((NTSTATUS)0xC0000022L)
+#define VL_STATUS_INVALID_HANDLE       ((NTSTATUS)0xC0000008L)
+#define VL_STATUS_END_OF_FILE          ((NTSTATUS)0xC0000011L)
 
 #ifndef OBJ_CASE_INSENSITIVE
 #  define OBJ_CASE_INSENSITIVE 0x00000040UL
@@ -252,6 +260,7 @@ typedef struct _VL_KEY_VALUE_PARTIAL_INFORMATION {
     UCHAR Data[1];
 } VL_KEY_VALUE_PARTIAL_INFORMATION;
 
+// KEY_VALUE_ENTRY for NtQueryMultipleValueKey
 typedef struct _VL_KEY_VALUE_ENTRY {
     PVL_UNICODE_STRING ValueName;
     ULONG              DataLength;
@@ -463,12 +472,20 @@ static PfnNtQueryDirectoryFileEx    Real_NtQueryDirectoryFileEx;
 static PfnCreateProcessW  Real_CreateProcessW;
 static PfnCreateProcessA  Real_CreateProcessA;
 
+// Config flags
 static bool g_RegEnabled = false;
 static bool g_FsEnabled  = false;
 
+// Registry virtualisation:
+//   g_VirtNtBase = e.g.  \Registry\User\S-1-5-21-x\VirtApp
+//   g_RealNtBase = parent e.g. \Registry\User\S-1-5-21-x
 static std::wstring g_VirtNtBase;
 static std::wstring g_RealNtBase;
+
+// FS redirections from --config INI: vector of (nt_from_prefix, nt_to_prefix).
 static std::vector< std::pair<std::wstring,std::wstring> > g_FsRedirects;
+
+// FS catch-all virtual store root from --filesystem (VIRTLAUNCHER_FSDIR).
 static std::wstring g_FsDirNtBase;
 
 // Tracked virtual registry handles
@@ -487,6 +504,7 @@ struct VirtFileEntry {
     std::wstring logPath;
     bool         isDir;
     bool         isRealOnly;
+    // Directory enumeration state
     bool         virtEnumDone;
     bool         realEnumDone;
     bool         realRestartPending;
@@ -495,7 +513,10 @@ struct VirtFileEntry {
 static std::map<HANDLE, VirtFileEntry> g_FileMap;
 static CRITICAL_SECTION g_FileMapLock;
 
+// TLS index for reentrancy guard
 static DWORD g_TlsIdx = TLS_OUT_OF_INDEXES;
+
+// DLL paths (ANSI) for child process injection.
 static char g_DllPathA[MAX_PATH];
 static char g_DllPathA32[MAX_PATH];
 static char g_DllPathA64[MAX_PATH];
@@ -641,11 +662,14 @@ static std::wstring DevicePathToDosPath(const std::wstring& devicePath) {
 
 static std::wstring GetHandleLogicalPath(HANDLE h) {
     if (!h) return L"";
+
     VirtKeyEntry e;
     if (GetEntry(h, e)) {
         VL_DBG(L"GetHandleLogicalPath: tracked -> %s", e.logPath.c_str());
         return e.logPath;
     }
+
+    // NtQueryObject(ObjectNameInformation = class 1)
     if (Real_NtQueryObject) {
         std::vector<BYTE> buf(2048, 0);
         ULONG resultLen = 0;
@@ -666,6 +690,8 @@ static std::wstring GetHandleLogicalPath(HANDLE h) {
             }
         }
     }
+
+    // NtQueryKey(KeyNameInformation = class 3, Vista+)
     if (Real_NtQueryKey) {
         std::vector<BYTE> buf(4096, 0);
         ULONG resultLen = 0;
@@ -686,10 +712,12 @@ static std::wstring GetHandleLogicalPath(HANDLE h) {
             }
         }
     }
+
     VL_DBG(L"GetHandleLogicalPath: FAILED for handle %p", h);
     return L"";
 }
 
+// Build the full NT path from an OBJECT_ATTRIBUTES
 static std::wstring GetFullNtPath(PVL_OBJECT_ATTRIBUTES oa) {
     if (!oa) return L"";
     std::wstring name = FromUStr(oa->ObjectName);
@@ -699,36 +727,47 @@ static std::wstring GetFullNtPath(PVL_OBJECT_ATTRIBUTES oa) {
     return parentPath + L"\\" + name;
 }
 
-static bool LogicalToVirtual(const std::wstring& logical, std::wstring& virt) {
+// Compute virtual NT path from logical path.
+static bool LogicalToVirtual(const std::wstring& logical,
+                               std::wstring& virt)
+{
     if (!g_RegEnabled) return false;
+
     if (!StartsWithI(logical, g_RealNtBase)) {
         VL_DBG(L"LogicalToVirtual: SKIP (not under RealNtBase) path=%s base=%s",
                logical.c_str(), g_RealNtBase.c_str());
         return false;
     }
+
     size_t baseLen = g_RealNtBase.size();
     if (logical.size() > baseLen && logical[baseLen] != L'\\') {
         VL_DBG(L"LogicalToVirtual: SKIP (boundary mismatch) path=%s", logical.c_str());
         return false;
     }
+
     if (StartsWithI(logical, g_VirtNtBase)) {
         VL_DBG(L"LogicalToVirtual: SKIP (already under VirtNtBase) %s", logical.c_str());
         return false;
     }
+
     std::wstring sub = logical.substr(baseLen);
     if (sub.empty()) {
         VL_DBG(L"LogicalToVirtual: SKIP (hive root itself)");
         return false;
     }
+
     virt = g_VirtNtBase + sub;
     VL_DBG(L"LogicalToVirtual: REDIRECT %s -> %s", logical.c_str(), virt.c_str());
     return true;
 }
 
+// Ensure every component of virtPath exists (creates missing keys)
 static void EnsureVirtualPath(const std::wstring& virtPath) {
     if (!StartsWithI(virtPath, g_VirtNtBase)) return;
+
     std::wstring remaining = virtPath.substr(g_VirtNtBase.size());
     std::wstring current   = g_VirtNtBase;
+
     while (!remaining.empty()) {
         size_t start = (remaining[0] == L'\\') ? 1u : 0u;
         size_t slash = remaining.find(L'\\', start);
@@ -742,6 +781,7 @@ static void EnsureVirtualPath(const std::wstring& virtPath) {
         }
         if (seg.empty()) continue;
         current += L"\\" + seg;
+
         VL_UNICODE_STRING us; MakeUStr(&us, current);
         VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
         HANDLE h = NULL; ULONG disp = 0;
@@ -755,6 +795,7 @@ static void EnsureVirtualPath(const std::wstring& virtPath) {
 // FS Path Helpers
 // ============================================================
 
+// Convert Win32 path "C:\foo" -> NT path "\??\C:\foo"
 static std::wstring Win32ToNtPath(const std::wstring& win32) {
     if (StartsWithI(win32, L"\\??\\") ||
         StartsWithI(win32, L"\\\\?\\") ||
@@ -766,8 +807,11 @@ static std::wstring Win32ToNtPath(const std::wstring& win32) {
     return win32;
 }
 
+// Apply FS redirections to an NT path.
 static std::wstring ApplyFsRedirect(const std::wstring& ntPath) {
     if (!g_FsEnabled) return ntPath;
+
+    // --- 1. Config-based rules (take precedence) ---
     for (size_t i = 0; i < g_FsRedirects.size(); ++i) {
         const std::wstring& from = g_FsRedirects[i].first;
         const std::wstring& to   = g_FsRedirects[i].second;
@@ -775,6 +819,8 @@ static std::wstring ApplyFsRedirect(const std::wstring& ntPath) {
             return to + ntPath.substr(from.size());
         }
     }
+
+    // --- 2. FSDIR catch-all ---
     if (!g_FsDirNtBase.empty() &&
         ntPath.size() >= 6 &&
         StartsWithI(ntPath, L"\\??\\") &&
@@ -786,17 +832,21 @@ static std::wstring ApplyFsRedirect(const std::wstring& ntPath) {
         std::wstring rest = (ntPath.size() > 6) ? ntPath.substr(6) : L"";
         return g_FsDirNtBase + driveStr + rest;
     }
+
     return ntPath;
 }
 
+// Reverse of ApplyFsRedirect: physical -> logical
 static std::wstring ReverseApplyFsRedirect(const std::wstring& ntPath) {
     if (!g_FsEnabled) return ntPath;
+
     for (size_t i = 0; i < g_FsRedirects.size(); ++i) {
         const std::wstring& from = g_FsRedirects[i].first;
         const std::wstring& to   = g_FsRedirects[i].second;
         if (StartsWithI(ntPath, to))
             return from + ntPath.substr(to.size());
     }
+
     if (!g_FsDirNtBase.empty() && StartsWithI(ntPath, g_FsDirNtBase)) {
         std::wstring tail = ntPath.substr(g_FsDirNtBase.size());
         if (tail.size() >= 2 && tail[0] == L'\\' && iswalpha(tail[1])) {
@@ -805,9 +855,11 @@ static std::wstring ReverseApplyFsRedirect(const std::wstring& ntPath) {
             return std::wstring(L"\\??\\") + drive + L':' + rest;
         }
     }
+
     return ntPath;
 }
 
+// Redirect a reparse-point path that may be in NT form or Win32 form.
 static std::wstring RedirectSymlinkPath(const std::wstring& path) {
     if (path.empty()) return path;
     std::wstring red = ApplyFsRedirect(path);
@@ -840,6 +892,7 @@ static std::wstring ReverseRedirectSymlinkPath(const std::wstring& path) {
     return path;
 }
 
+// If true, caller should use newOa / newName instead of the original OA.
 static bool RedirectFileOA(PVL_OBJECT_ATTRIBUTES oa,
                              VL_UNICODE_STRING& newName,
                              VL_OBJECT_ATTRIBUTES& newOa,
@@ -848,7 +901,7 @@ static bool RedirectFileOA(PVL_OBJECT_ATTRIBUTES oa,
 {
     if (!g_FsEnabled || !oa || !oa->ObjectName || IsReentrant()) return false;
     ntPath  = GetFullNtPath(oa);
-    ntPath  = Win32ToNtPath(ntPath);
+    ntPath  = Win32ToNtPath(ntPath);   // ensure NT format
     redPath = ApplyFsRedirect(ntPath);
     if (redPath == ntPath) return false;
     MakeUStr(&newName, redPath);
@@ -1110,10 +1163,14 @@ static void LoadFsConfig(const std::wstring& path) {
 
 static void LoadConfig() {
     wchar_t buf[2048] = {};
+
+    // ---- Read the debug flag FIRST ----
     if (GetEnvironmentVariableW(L"VLAUNCHER_DEBUG", buf, 2047) > 0)
         g_DebugEnabled = (_wcsicmp(buf, L"1")    == 0 ||
                           _wcsicmp(buf, L"true") == 0 ||
                           _wcsicmp(buf, L"yes")  == 0);
+
+    // ---- Registry virtualisation ----
     if (GetEnvironmentVariableW(L"VIRTLAUNCHER_REG", buf, 2047) > 0) {
         g_VirtNtBase = buf;
         size_t sl = g_VirtNtBase.rfind(L'\\');
@@ -1122,11 +1179,15 @@ static void LoadConfig() {
         if (!g_VirtNtBase.empty() && !g_RealNtBase.empty())
             g_RegEnabled = true;
     }
+
+    // ---- FS redirect config file ----
     if (GetEnvironmentVariableW(L"VIRTLAUNCHER_FS", buf, 2047) > 0) {
         LoadFsConfig(buf);
         if (!g_FsRedirects.empty())
             g_FsEnabled = true;
     }
+
+    // ---- FS virtual store folder ----
     if (GetEnvironmentVariableW(L"VIRTLAUNCHER_FSDIR", buf, 2047) > 0 && buf[0]) {
         std::wstring fsdir = buf;
         if (fsdir.size() >= 2 && iswalpha(fsdir[0]) && fsdir[1] == L':')
@@ -1137,6 +1198,8 @@ static void LoadConfig() {
         g_FsEnabled   = true;
         VL_DBG(L"LoadConfig: FsDirNtBase=%s", g_FsDirNtBase.c_str());
     }
+
+    // ---- DLL paths for child-process injection ----
     GetEnvironmentVariableA("VIRTLAUNCHER_DLL",   g_DllPathA,   MAX_PATH);
     GetEnvironmentVariableA("VIRTLAUNCHER_DLL32", g_DllPathA32, MAX_PATH);
     GetEnvironmentVariableA("VIRTLAUNCHER_DLL64", g_DllPathA64, MAX_PATH);
@@ -1144,6 +1207,7 @@ static void LoadConfig() {
         strncpy(g_DllPathA32, g_DllPathA, MAX_PATH - 1);
     if (!g_DllPathA64[0] && g_DllPathA[0])
         strncpy(g_DllPathA64, g_DllPathA, MAX_PATH - 1);
+
     VL_DBG(L"LoadConfig: DebugEnabled=%d", (int)g_DebugEnabled);
     VL_DBG(L"LoadConfig: RegEnabled=%d  VirtNtBase=%s",
            (int)g_RegEnabled, g_VirtNtBase.c_str());
@@ -1154,6 +1218,7 @@ static void LoadConfig() {
 
 // ============================================================
 // Registry enumeration helpers
+// Collect subkey/value names from a handle (for merge enumeration)
 // ============================================================
 
 static std::vector<std::wstring> CollectSubkeyNames(HANDLE h) {
@@ -1224,15 +1289,19 @@ static NTSTATUS DoVirtOpen(
 {
     std::wstring fullPath = GetFullNtPath(OrigOA);
     std::wstring virtPath;
+
     if (!LogicalToVirtual(fullPath, virtPath)) {
         return VL_STATUS_OBJECT_NOT_FOUND;
     }
+
     VL_DBG(L"DoVirtOpen: fullPath=%s  isCreate=%d", fullPath.c_str(), (int)isCreate);
+
     if (isCreate) {
         EnsureVirtualPath(virtPath);
         VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
         VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
             OrigOA->Attributes | OBJ_CASE_INSENSITIVE);
+
         HANDLE hVirt = NULL;
         NTSTATUS st = Real_NtCreateKey(&hVirt, DesiredAccess, &voa,
                                         TitleIndex, Class, CreateOptions, Disposition);
@@ -1247,24 +1316,32 @@ static NTSTATUS DoVirtOpen(
         VL_DBG(L"DoVirtOpen: CREATE FAILED st=0x%08X", (ULONG)st);
         return st;
     }
+
+    // Open path: try virtual first
     VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
     VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
         OrigOA->Attributes | OBJ_CASE_INSENSITIVE);
+
     HANDLE hVirt = NULL;
     NTSTATUS stV = Real_NtOpenKey(&hVirt, DesiredAccess, &voa);
+
     HANDLE hReal = NULL;
     Real_NtOpenKey(&hReal, KEY_READ, OrigOA);
+
     if (NT_SUCCESS(stV)) {
         *KeyHandle = hVirt;
         TrackHandle(hVirt, hVirt, hReal, fullPath);
         VL_DBG(L"DoVirtOpen: OPEN virtual hVirt=%p hReal=%p", hVirt, hReal);
         return VL_STATUS_SUCCESS;
     }
+
     if (!hReal) {
         if (hVirt) Real_NtClose(hVirt);
         VL_DBG(L"DoVirtOpen: OPEN neither exists -> NOT_FOUND");
         return VL_STATUS_OBJECT_NOT_FOUND;
     }
+
+    // Copy-on-write
     HANDLE hVirtNew = NULL;
     ULONG disp = 0;
     EnsureVirtualPath(virtPath);
@@ -1279,6 +1356,7 @@ static NTSTATUS DoVirtOpen(
         VL_DBG(L"DoVirtOpen: OPEN CoW hVirt=%p hReal=%p", hVirtNew, hReal);
         return VL_STATUS_SUCCESS;
     }
+
     VL_DBG(L"DoVirtOpen: OPEN CoW FAILED st=0x%08X -- using real untracked", (ULONG)stC);
     if (hVirtNew) Real_NtClose(hVirtNew);
     if (hReal) {
@@ -1298,8 +1376,10 @@ static NTSTATUS NTAPI Hook_NtOpenKey(
     VL_DBG(L"Hook_NtOpenKey: path=%s",
            (ObjectAttributes && ObjectAttributes->ObjectName)
            ? FromUStr(ObjectAttributes->ObjectName).c_str() : L"(null)");
+
     if (!g_RegEnabled || IsReentrant() || !ObjectAttributes)
         return Real_NtOpenKey(KeyHandle, DesiredAccess, ObjectAttributes);
+
     SetReentrant(true);
     NTSTATUS st = DoVirtOpen(ObjectAttributes, DesiredAccess, KeyHandle,
                               false, 0, NULL, 0, NULL);
@@ -1315,12 +1395,15 @@ static NTSTATUS NTAPI Hook_NtOpenKeyEx(
     VL_DBG(L"Hook_NtOpenKeyEx: opts=0x%X path=%s", OpenOptions,
            (ObjectAttributes && ObjectAttributes->ObjectName)
            ? FromUStr(ObjectAttributes->ObjectName).c_str() : L"(null)");
+
     if (!g_RegEnabled || IsReentrant() || !ObjectAttributes)
         return Real_NtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
+
     SetReentrant(true);
     NTSTATUS st = DoVirtOpen(ObjectAttributes, DesiredAccess, KeyHandle,
                               false, 0, NULL, 0, NULL);
     SetReentrant(false);
+
     if (st == VL_STATUS_OBJECT_NOT_FOUND)
         return Real_NtOpenKeyEx(KeyHandle, DesiredAccess, ObjectAttributes, OpenOptions);
     return st;
@@ -1886,6 +1969,7 @@ static NTSTATUS NTAPI Hook_NtFsControlFile(
                                      InputBuffer, InputBufferLength,
                                      OutputBuffer, OutputBufferLength);
 
+    // FSCTL_GET_REPARSE_POINT -- reverse-translate
     if (FsControlCode == VL_FSCTL_GET_REPARSE_POINT) {
         NTSTATUS st = Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
                                             IoStatusBlock, FsControlCode,
@@ -1943,6 +2027,7 @@ static NTSTATUS NTAPI Hook_NtFsControlFile(
         return st;
     }
 
+    // FSCTL_SET_REPARSE_POINT -- redirect embedded paths
     if (FsControlCode != VL_FSCTL_SET_REPARSE_POINT ||
         !InputBuffer || InputBufferLength < VL_REPARSE_HDR_SIZE)
         return Real_NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext,
@@ -2549,6 +2634,7 @@ static NTSTATUS NTAPI Hook_NtQueryFullAttributesFile(
     return Real_NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
 }
 
+// ---- NtQueryInformationByName (Win10+) ----
 static NTSTATUS NTAPI Hook_NtQueryInformationByName(
     PVL_OBJECT_ATTRIBUTES ObjectAttributes,
     PVL_IO_STATUS_BLOCK   IoStatusBlock,
@@ -2579,6 +2665,7 @@ static NTSTATUS NTAPI Hook_NtQueryInformationByName(
                                           FileInformationClass);
 }
 
+// ---- NtQueryDirectoryFile -- merged view ----
 static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
     HANDLE FileHandle,
     HANDLE Event,
@@ -2660,6 +2747,7 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
     }
 }
 
+// ---- NtQueryDirectoryFileEx -- merged view ----
 static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
     HANDLE FileHandle,
     HANDLE Event,
@@ -2737,6 +2825,7 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
     }
 }
 
+// ---- NtQueryInformationFile -- reverse-translate filename ----
 static NTSTATUS NTAPI Hook_NtQueryInformationFile(
     HANDLE FileHandle,
     PVL_IO_STATUS_BLOCK IoStatusBlock,
