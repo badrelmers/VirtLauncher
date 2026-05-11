@@ -58,15 +58,24 @@ cl /nologo /EHsc /O2 /MD /W3 test_bug1.c /Fe:test_bug1.exe /link /SUBSYSTEM:CONS
 if errorlevel 1 ( echo FAILED: x86. & goto :err )
 echo   OK: x86
 
+
+echo [x86] Building test_bug2.exe ...
+cl /nologo /EHsc /O2 /MD /W3 test_bug2.c /Fe:test_bug2.exe /link /SUBSYSTEM:CONSOLE /OUT:test_bug2.exe   shlwapi.lib advapi32.lib
+
+if errorlevel 1 ( echo FAILED: x86. & goto :err )
+echo   OK: x86
+
 del /Q *.obj 2>nul
 
 echo ============================================================
 
 move /y test_bug1.exe tests
+move /y test_bug2.exe tests
 
 echo.
 echo  Build complete!  Files in: %SRCDIR%
 echo    test_bug1.exe
+echo    test_bug2.exe
 echo.
 pause
 exit /b 0

@@ -3245,14 +3245,64 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
     BOOLEAN RestartScan)
 {
     VirtFileEntry e;
-    if (!g_FsEnabled || !GetFileEntry(FileHandle, e) || !e.isDir || e.isRealOnly) {
+    // Bug 2 fix: removed || e.isRealOnly -- isRealOnly dirs now enter the
+    // body so we can attempt an on-demand upgrade to merged view.
+    if (!g_FsEnabled || !GetFileEntry(FileHandle, e) || !e.isDir) {
         return Real_NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
                                           IoStatusBlock, FileInformation, Length,
                                           FileInformationClass, ReturnSingleEntry,
                                           FileName, RestartScan);
     }
 
-    // On-demand open of real shadow handle if missing
+    // ----------------------------------------------------------------
+    // Bug 2 fix: isRealOnly directory upgrade.
+    //
+    // When this handle was opened, the virtual store had no counterpart
+    // directory so we set isRealOnly=true and handed the caller the real
+    // handle. Since then a write may have created VIRTL\...\<dir>\.
+    // Try to open a virtual handle now; if it succeeds, upgrade the
+    // entry to a full merged pair and reset enumeration state.
+    // If it still fails, fall back to real-only pass-through.
+    // ----------------------------------------------------------------
+    if (e.isRealOnly) {
+        std::wstring virtPath = ApplyFsRedirect(e.logPath);
+        HANDLE hNewVirt = NULL;
+        if (!virtPath.empty()) {
+            VL_UNICODE_STRING virtName; MakeUStr(&virtName, virtPath);
+            VL_OBJECT_ATTRIBUTES virtOa;  MakeOA(&virtOa, &virtName);
+            VL_IO_STATUS_BLOCK iosb;
+            Real_NtOpenFile(&hNewVirt, FILE_LIST_DIRECTORY | SYNCHRONIZE,
+                            &virtOa, &iosb,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+        }
+        if (!hNewVirt) {
+            // Virtual dir still doesn't exist - nothing to merge.
+            VL_DBG(L"Hook_NtQueryDirectoryFile: isRealOnly dir, no virtual counterpart yet: %s",
+                   e.logPath.c_str());
+            return Real_NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                              IoStatusBlock, FileInformation, Length,
+                                              FileInformationClass, ReturnSingleEntry,
+                                              FileName, RestartScan);
+        }
+        // Virtual dir now exists - upgrade to merged view.
+        // FileHandle IS the real handle (hVirt==hReal==FileHandle for isRealOnly).
+        // hVirt becomes the new virtual handle; hReal stays as FileHandle.
+        // Reset enumeration state so the merged view starts cleanly.
+        VL_DBG(L"Hook_NtQueryDirectoryFile: upgrading isRealOnly dir to merged view: %s",
+               e.logPath.c_str());
+        e.hVirt              = hNewVirt;
+        e.hReal              = FileHandle;
+        e.isRealOnly         = false;
+        e.virtEnumDone       = false;
+        e.realEnumDone       = false;
+        e.realRestartPending = true;
+        e.virtNames.clear();
+        e.hasCachedFileName  = false;
+        UpdateFileEntry(FileHandle, e);
+    }
+
+    // On-demand open of real shadow handle if missing (non-isRealOnly path).
     if (!e.hReal && !e.logPath.empty()) {
         VL_UNICODE_STRING realName; MakeUStr(&realName, e.logPath);
         VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
@@ -3487,10 +3537,46 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
     ULONG QueryFlags)
 {
     VirtFileEntry e;
-    if (!g_FsEnabled || !GetFileEntry(FileHandle, e) || !e.isDir || e.isRealOnly) {
+    // Bug 2 fix: removed || e.isRealOnly -- same reasoning as above.
+    if (!g_FsEnabled || !GetFileEntry(FileHandle, e) || !e.isDir) {
         return Real_NtQueryDirectoryFileEx(FileHandle, Event, ApcRoutine, ApcContext,
                                             IoStatusBlock, FileInformation, Length,
                                             FileInformationClass, QueryFlags);
+    }
+
+    // ----------------------------------------------------------------
+    // Bug 2 fix: isRealOnly directory upgrade (same logic as above).
+    // ----------------------------------------------------------------
+    if (e.isRealOnly) {
+        std::wstring virtPath = ApplyFsRedirect(e.logPath);
+        HANDLE hNewVirt = NULL;
+        if (!virtPath.empty()) {
+            VL_UNICODE_STRING virtName; MakeUStr(&virtName, virtPath);
+            VL_OBJECT_ATTRIBUTES virtOa;  MakeOA(&virtOa, &virtName);
+            VL_IO_STATUS_BLOCK iosb;
+            Real_NtOpenFile(&hNewVirt, FILE_LIST_DIRECTORY | SYNCHRONIZE,
+                            &virtOa, &iosb,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+        }
+        if (!hNewVirt) {
+            VL_DBG(L"Hook_NtQueryDirectoryFileEx: isRealOnly dir, no virtual counterpart yet: %s",
+                   e.logPath.c_str());
+            return Real_NtQueryDirectoryFileEx(FileHandle, Event, ApcRoutine, ApcContext,
+                                                IoStatusBlock, FileInformation, Length,
+                                                FileInformationClass, QueryFlags);
+        }
+        VL_DBG(L"Hook_NtQueryDirectoryFileEx: upgrading isRealOnly dir to merged view: %s",
+               e.logPath.c_str());
+        e.hVirt              = hNewVirt;
+        e.hReal              = FileHandle;
+        e.isRealOnly         = false;
+        e.virtEnumDone       = false;
+        e.realEnumDone       = false;
+        e.realRestartPending = true;
+        e.virtNames.clear();
+        e.hasCachedFileName  = false;
+        UpdateFileEntry(FileHandle, e);
     }
 
     // On-demand open of real shadow handle if missing
