@@ -3,7 +3,7 @@ SETLOCAL
 CD /D "%~dp0"
 
 ::_______________________________________________
- set VLAUNCHER_VERBOSE=true
+ @rem set VLAUNCHER_VERBOSE=true
  set VLAUNCHER_DEBUG=true
 
 
@@ -53,10 +53,20 @@ rmdir /Q /S VIRTL || (echo error & pause & exit)
 @rem echo e:\=d:\z3>>redir.ini
 @rem echo f:\=d:\z4>>redir.ini
 
-echo c:\=d:\z1\>redir.ini
-echo d:\=d:\z2\>>redir.ini
-echo e:\=d:\z3\>>redir.ini
-echo f:\=d:\z4\>>redir.ini
+@rem echo c:\=d:\z1\>redir.ini
+@rem echo d:\=d:\z2\>>redir.ini
+@rem echo e:\=d:\z3\>>redir.ini
+@rem echo f:\=d:\z4\>>redir.ini
+
+@rem echo c:\=d:\z>redir.ini
+@rem echo d:\=d:\z>>redir.ini
+@rem echo e:\=d:\z>>redir.ini
+@rem echo f:\=d:\z>>redir.ini
+
+echo c:\=d:\z\>redir.ini
+echo d:\=d:\z\>>redir.ini
+echo e:\=d:\z\>>redir.ini
+echo f:\=d:\z\>>redir.ini
 VirtLauncher64.exe -r -c redir.ini -e "%TEST64_PATH%"
 
 

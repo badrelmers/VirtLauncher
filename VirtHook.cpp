@@ -987,10 +987,18 @@ static std::wstring ApplyFsRedirect(const std::wstring& ntPath) {
     }
 
     // --- 1. Config-based rules (take precedence) ---
+    // Both 'from' and 'to' are normalized in LoadFsConfig to have NO trailing
+    // backslash (e.g. \??\c:  and  \??\d:\z1).  The suffix therefore either:
+    //   - is empty    (ntPath == from, i.e. the root itself was opened), or
+    //   - starts with '\'  (e.g. \ccc for \??\c:\ccc).
+    // Concatenating to + suffix always produces a correctly separated path.
+    // The component-boundary guard prevents \??\c:  matching  \??\c:_other.
     for (size_t i = 0; i < g_FsRedirects.size(); ++i) {
         const std::wstring& from = g_FsRedirects[i].first;
         const std::wstring& to   = g_FsRedirects[i].second;
-        if (StartsWithI(ntPath, from)) {
+        if (StartsWithI(ntPath, from) &&
+            (ntPath.size() == from.size() || ntPath[from.size()] == L'\\'))
+        {
             return to + ntPath.substr(from.size());
         }
     }
@@ -1024,10 +1032,14 @@ static std::wstring ReverseApplyFsRedirect(const std::wstring& ntPath) {
     if (!g_FsEnabled) return ntPath;
 
     // --- 1. Reverse config-based rules ---
+    // Mirror of the forward check: 'to' has no trailing backslash after
+    // normalization, so the suffix is either empty or starts with '\'.
+    // The component-boundary guard prevents partial-component false-matches.
     for (size_t i = 0; i < g_FsRedirects.size(); ++i) {
         const std::wstring& from = g_FsRedirects[i].first;
         const std::wstring& to   = g_FsRedirects[i].second;
-        if (StartsWithI(ntPath, to))
+        if (StartsWithI(ntPath, to) &&
+            (ntPath.size() == to.size() || ntPath[to.size()] == L'\\'))
             return from + ntPath.substr(to.size());
     }
 
@@ -1144,8 +1156,27 @@ static void EnsureVirtualFsPath(const std::wstring& virtualNtFilePath) {
         virtRoot = g_FsDirNtBase;
     }
     if (virtRoot.empty()) return;
-    std::wstring remaining = dirPath.substr(virtRoot.size());
-    std::wstring current   = virtRoot;
+
+    // Anchor the directory-creation walk at the NT drive root (\??\X:) rather
+    // than at virtRoot.  This guarantees that every intermediate folder is
+    // created even when it does not yet exist on disk.  Without this, a
+    // config rule like  c:\=d:\z1  produces virtRoot=\??\d:\z1, but
+    // d:\z1 itself may be absent, so FILE_OPEN_IF on \??\d:\z1\subdir
+    // immediately fails with STATUS_OBJECT_PATH_NOT_FOUND.
+    //
+    // We strip virtRoot back to just \??\X: (6 chars) so the walk starts
+    // one level below the drive root and visits every folder on the way.
+    // virtRoot is already normalised (no trailing backslash) by LoadFsConfig.
+    std::wstring anchor = virtRoot;
+    if (anchor.size() >= 6 &&
+        StartsWithI(anchor, L"\\??\\") &&
+        iswalpha(anchor[4]) && anchor[5] == L':')
+    {
+        anchor = anchor.substr(0, 6); // e.g. \??\d:
+    }
+
+    std::wstring remaining = dirPath.substr(anchor.size());
+    std::wstring current   = anchor;
     while (!remaining.empty()) {
         size_t start = (remaining[0] == L'\\') ? 1u : 0u;
         size_t slash  = remaining.find(L'\\', start);
@@ -1455,8 +1486,18 @@ static void LoadFsConfig(const std::wstring& path) {
         while (!dst.empty() && dst[0]   == L' ') dst = dst.substr(1);
         if (src.empty() || dst.empty()) continue;
 
-        g_FsRedirects.push_back(
-            std::make_pair(Win32ToNtPath(src), Win32ToNtPath(dst)));
+        {
+            std::wstring from = Win32ToNtPath(src);
+            std::wstring to   = Win32ToNtPath(dst);
+            // Normalize: strip trailing backslashes so separator insertion is
+            // consistent regardless of whether the caller wrote
+            //   "c:\=d:\z1"   or   "c:\=d:\z1\"
+            // in the config file.  The loop preserves the mandatory \??\ prefix
+            // (4 chars) so we never strip into the device namespace marker.
+            while (from.size() > 4 && from.back() == L'\\') from.resize(from.size() - 1);
+            while (to.size()   > 4 && to.back()   == L'\\') to.resize(to.size() - 1);
+            g_FsRedirects.push_back(std::make_pair(from, to));
+        }
     }
 }
 
