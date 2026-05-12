@@ -879,6 +879,92 @@ static std::wstring Win32ToNtPath(const std::wstring& win32) {
     return win32;
 }
 
+// Convert an NT path (\??\C:\foo) to a Win32 extended path (\\?\C:\foo)
+// suitable for direct Win32 API calls (CopyFileExW, DeleteFileW, etc.).
+// Handles both the \\?\\ and \?\\ NT prefixes.
+static std::wstring NtPathToWin32(const std::wstring& ntPath) {
+    // \??\X:\...  ->  \\?\X:\...
+    if (ntPath.size() >= 4 &&
+        ntPath[0] == L'\\' && ntPath[1] == L'?' &&
+        ntPath[2] == L'?' && ntPath[3] == L'\\')
+    {
+        return L"\\\\?\\" + ntPath.substr(4);
+    }
+    // Already \\?\... form
+    if (ntPath.size() >= 4 &&
+        ntPath[0] == L'\\' && ntPath[1] == L'\\' &&
+        ntPath[2] == L'?' && ntPath[3] == L'\\')
+    {
+        return ntPath;
+    }
+    return ntPath;   // unrecognised form: pass through unchanged
+}
+
+// ============================================================
+// Recycle Bin path detection
+// ============================================================
+//
+// Returns true if the NT path (\\??\X:\...) contains a Windows Recycle
+// Bin folder component.  Three folder names are checked to cover all
+// Windows versions:
+//
+//   $RECYCLE.BIN  -- Vista and later (NTFS)
+//   RECYCLER       -- Windows XP / 2000 (NTFS)
+//   RECYCLED       -- Windows 9x / FAT
+//
+// The check is case-insensitive and does a substring scan, so it
+// matches:
+//   \\??\C:\$RECYCLE.BIN
+//   \\??\C:\$RECYCLE.BIN\S-1-5-...\$RXXX.txt
+//   \\??\D:\RECYCLER\S-1-5-...
+//   (and so on for any depth)
+//
+// WHY:  When --filesystem virtualisation is active, ApplyFsRedirect
+// redirects every drive-letter path into the virtual store, including
+// $RECYCLE.BIN.  That causes two problems:
+//
+//   1.  Deleted files land in <VirtStore>\X\$RECYCLE.BIN, not in the
+//       real Windows Recycle Bin.  The Recycle Bin UI and "restore"
+//       functionality are therefore bypassed entirely.
+//
+//   2.  The $I metadata files written by the Shell contain the original
+//       logical path (e.g. C:\foo.txt), but that path is itself subject
+//       to redirection, producing deeply nested corruption such as:
+//         VirtStore\F\$RECYCLE.BIN\...\$R..\VirtStore\F\...
+//
+// FIX:  Recycle Bin paths are exempt from redirection.  Files opened or
+// created inside $RECYCLE.BIN go directly to the real filesystem so the
+// Shell's recycle mechanism works normally.  Cross-volume renames (when
+// the source file was CoW-copied into the virtual store but the recycle
+// destination is on the original drive) are handled separately in
+// Hook_NtSetInformationFile.
+static bool IsRecycleBinPath(const std::wstring& ntPath) {
+    // We search for the folder name surrounded by backslashes (or at
+    // the very end) to avoid false-positives on names that merely
+    // contain the substring (e.g. "not_a_$RECYCLE.BIN_folder").
+    static const wchar_t* const kBinFolders[] = {
+        L"\\$RECYCLE.BIN",   // Vista+
+        L"\\RECYCLER",        // XP / 2000
+        L"\\RECYCLED",        // Win9x / FAT
+    };
+    for (size_t i = 0; i < sizeof(kBinFolders)/sizeof(kBinFolders[0]); ++i) {
+        const wchar_t* folder = kBinFolders[i];
+        size_t flen = wcslen(folder);
+        // Case-insensitive scan
+        size_t pathLen = ntPath.size();
+        if (pathLen < flen) continue;
+        for (size_t pos = 0; pos <= pathLen - flen; ++pos) {
+            if (_wcsnicmp(ntPath.c_str() + pos, folder, flen) == 0) {
+                // Must be at end OR followed by a backslash
+                size_t after = pos + flen;
+                if (after == pathLen || ntPath[after] == L'\\')
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
 // Apply FS redirections to an NT path.
 // Priority order:
 //   1. Explicit rules from --config INI (g_FsRedirects), checked in order.
@@ -886,6 +972,19 @@ static std::wstring Win32ToNtPath(const std::wstring& win32) {
 //      matched and not already located inside the virtual store itself.
 static std::wstring ApplyFsRedirect(const std::wstring& ntPath) {
     if (!g_FsEnabled) return ntPath;
+
+    // --- 0. Recycle Bin bypass ---
+    // Never redirect paths inside $RECYCLE.BIN / RECYCLER / RECYCLED.
+    // This lets the real Windows Recycle Bin handle deletions from the
+    // virtualised app, avoiding virtual-store corruption and the deeply
+    // nested paths produced when the $I metadata files contain paths
+    // that are themselves subject to redirection.
+    // Cross-volume rename edge cases (source in virtual store, destination
+    // in the real Recycle Bin) are handled in Hook_NtSetInformationFile.
+    if (IsRecycleBinPath(ntPath)) {
+        VL_DBG(L"ApplyFsRedirect: recycle bin bypass -> %s", ntPath.c_str());
+        return ntPath;
+    }
 
     // --- 1. Config-based rules (take precedence) ---
     for (size_t i = 0; i < g_FsRedirects.size(); ++i) {
@@ -3944,6 +4043,97 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
     targetLogicalPath = Win32ToNtPath(targetLogicalPath);
     std::wstring redName = ApplyFsRedirect(targetLogicalPath);
     if (redName == targetLogicalPath) {
+        // No FS redirect for destination.  Check for the cross-volume Recycle
+        // Bin edge case:
+        //
+        // When a virtualised app (or the Explorer Shell on its behalf) recycles
+        // a file that was CoW-promoted into the virtual store, the source handle
+        // points to a file inside the virtual store (e.g. D:\VirtStore\C\foo.txt)
+        // while the rename destination is the real $RECYCLE.BIN on the original
+        // drive (e.g. C:\$RECYCLE.BIN\<SID>\$RXXX.txt).  Because the two paths
+        // are on DIFFERENT volumes, the NT rename would fail with
+        // STATUS_NOT_SAME_DEVICE.
+        //
+        // We handle this by manually copying the virtual-store file to the
+        // recycle bin destination, then deleting it from the virtual store and
+        // creating a tombstone so the logical source path appears deleted.
+        //
+        // Only applies to:
+        //   - rename (not hardlink) operations
+        //   - destination paths inside $RECYCLE.BIN / RECYCLER / RECYCLED
+        //   - source handles that are tracked as non-real-only virtual files
+        //     (real-only files are still on the original drive and can be
+        //     renamed cross-path natively, but only when they are on the same
+        //     volume as the recycle bin — the native call below handles that)
+        if (!isLink && IsRecycleBinPath(targetLogicalPath)) {
+            VirtFileEntry srcEntry;
+            if (GetFileEntry(FileHandle, srcEntry) &&
+                !srcEntry.isRealOnly &&
+                !srcEntry.logPath.empty())
+            {
+                // Physical location of the file in the virtual store
+                std::wstring physSrc = ApplyFsRedirect(srcEntry.logPath);
+                std::wstring win32Src = NtPathToWin32(physSrc);
+                std::wstring win32Dst = NtPathToWin32(targetLogicalPath);
+
+                VL_DBG(L"Hook_NtSetInformationFile: cross-volume recycle "
+                       L"src=%s dst=%s", win32Src.c_str(), win32Dst.c_str());
+
+                // Ensure the destination $RECYCLE.BIN\<SID> directory exists.
+                // It is normally already present; CreateDirectoryW is a no-op
+                // when it does.  We only create one level up from the file.
+                {
+                    std::wstring dstDir = win32Dst;
+                    size_t sl = dstDir.rfind(L'\\');
+                    if (sl != std::wstring::npos) {
+                        dstDir.resize(sl);
+                        // CreateDirectory is idempotent — ignore failure
+                        SetReentrant(true);
+                        CreateDirectoryW(dstDir.c_str(), NULL);
+                        SetReentrant(false);
+                    }
+                }
+
+                // Copy the file from the virtual store to the real Recycle Bin.
+                SetReentrant(true);
+                BOOL copied = CopyFileExW(
+                    win32Src.c_str(),
+                    win32Dst.c_str(),
+                    NULL, NULL, NULL,
+                    COPY_FILE_ALLOW_DECRYPTED_DESTINATION |
+                    COPY_FILE_COPY_SYMLINK);
+                if (copied) {
+                    // Remove from the virtual store (the recycle bin now owns it).
+                    DeleteFileW(win32Src.c_str());
+                    SetReentrant(false);
+
+                    // Create a tombstone so the logical source path appears deleted
+                    // in the sandbox (prevents the real file from reappearing on
+                    // the next read or enumeration).
+                    EnsureVirtualFsPath(physSrc);
+                    CreateTombstone(physSrc);
+
+                    // Remove the stale tracking entry; the handle is no longer valid
+                    // against the file we just deleted.
+                    UntrackFileHandle(FileHandle);
+
+                    VL_DBG(L"Hook_NtSetInformationFile: cross-volume recycle OK");
+                    if (IoStatusBlock) {
+                        IoStatusBlock->Status      = VL_STATUS_SUCCESS;
+                        IoStatusBlock->Information = 0;
+                    }
+                    return VL_STATUS_SUCCESS;
+                }
+                SetReentrant(false);
+                // Copy failed — fall through and let the native rename attempt
+                // run (it will fail with STATUS_NOT_SAME_DEVICE, which the Shell
+                // treats as "delete permanently without recycle").
+                VL_DBG(L"Hook_NtSetInformationFile: cross-volume recycle FAILED "
+                       L"err=%u -- falling through to native rename",
+                       GetLastError());
+            }
+        }
+
         VL_DBG(L"Hook_NtSetInformationFile: no redirect for %s dest",
                isLink ? L"hardlink" : L"rename");
         return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
