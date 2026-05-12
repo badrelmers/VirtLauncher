@@ -1,5 +1,5 @@
 // ============================================================
-// VirtHook.cpp  - VirtLauncher Hook DLL  (v11 - COW FS + merged dirs + tombstones)
+// VirtHook.cpp  - VirtLauncher Hook DLL  (v12 - console title fix)
 // Injected into target process by VirtLauncher.exe via Detours
 //
 // Virtualizes:
@@ -34,7 +34,18 @@
 //     NtQueryDirectoryFile, NtQueryDirectoryFileEx   (merged view)
 //     NtQueryInformationFile                           (path reverse-translate)
 //
-//   CHILDREN: CreateProcessW/A (propagate injection)
+//   CHILDREN: CreateProcessW/A (propagate injection + prefix child lpTitle)
+//
+//   WINDOW TITLE PREFIXING (@ marker, same concept as Sandboxie's #):
+//     SetWindowTextW/A      — GUI app title changes
+//     CreateWindowExW/A     — GUI app window creation
+//     SetConsoleTitleW/A    — console apps (cmd, PowerShell, etc.)
+//                             cmd.exe calls SetConsoleTitleW (kernel32), NOT
+//                             SetWindowTextW. conhost.exe owns the HWND; our
+//                             SetWindowTextW hook is invisible to it.
+//     Initial title fix     — conhost sets the title before DLL injection;
+//                             DllMain re-prefixes it right after hooks go live.
+//     STARTUPINFO.lpTitle   — child console windows start pre-titled.
 //
 // NOTE: NtQueryVolumeInformationFile, NtDeviceIoControlFile,
 //       NtReadFile, NtWriteFile are NOT hooked.
@@ -425,6 +436,11 @@ typedef BOOL  (WINAPI *PfnSetWindowTextW)(HWND, LPCWSTR);
 typedef BOOL  (WINAPI *PfnSetWindowTextA)(HWND, LPCSTR);
 typedef HWND  (WINAPI *PfnCreateWindowExW)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
 typedef HWND  (WINAPI *PfnCreateWindowExA)(DWORD, LPCSTR,  LPCSTR,  DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
+// Console title prefixing — cmd.exe calls SetConsoleTitleW (kernel32), not SetWindowTextW.
+// conhost.exe owns the actual window; our SetWindowTextW hook is invisible to it.
+// Hooking SetConsoleTitleW/A in the target process is the correct interception layer.
+typedef BOOL  (WINAPI *PfnSetConsoleTitleW)(LPCWSTR);
+typedef BOOL  (WINAPI *PfnSetConsoleTitleA)(LPCSTR);
 
 // ============================================================
 // Global State
@@ -490,6 +506,9 @@ static PfnSetWindowTextW  Real_SetWindowTextW;
 static PfnSetWindowTextA  Real_SetWindowTextA;
 static PfnCreateWindowExW Real_CreateWindowExW;
 static PfnCreateWindowExA Real_CreateWindowExA;
+// Console title (kernel32) — needed for cmd.exe / PowerShell / any console app
+static PfnSetConsoleTitleW Real_SetConsoleTitleW;
+static PfnSetConsoleTitleA Real_SetConsoleTitleA;
 
 // Config flags
 static bool g_RegEnabled = false;
@@ -4295,6 +4314,39 @@ static BOOL WINAPI Hook_CreateProcessW(
     }
     VL_DBG(L"Hook_CreateProcessW: injecting dll=%S", dllPath);
 
+    // ---------------------------------------------------------------
+    // Prefix STARTUPINFO.lpTitle so the child console window starts
+    // with the "@" marker from its very first moment — no un-prefixed
+    // flash even before the child's DLL injection fires.
+    //
+    // CRITICAL SAFETY GUARD: when EXTENDED_STARTUPINFO_PRESENT is set
+    // the caller passes a STARTUPINFOEXW* cast to LPSTARTUPINFOW.
+    // Doing `modifiedSIW = *lpStartupInfo` would copy only
+    // sizeof(STARTUPINFOW) bytes, silently dropping the
+    // lpAttributeList pointer that lives immediately after it.
+    // Windows would then read garbage as the attribute list and crash.
+    // When the extended flag is present we leave lpStartupInfo
+    // completely untouched; the child still gets the DLL injected and
+    // Hook_SetConsoleTitleW will prefix its title on the first call.
+    // ---------------------------------------------------------------
+    STARTUPINFOW modifiedSIW;
+    std::wstring  titledStartupW;
+    LPSTARTUPINFOW pSIW = lpStartupInfo;
+    if (!(dwCreationFlags & EXTENDED_STARTUPINFO_PRESENT) &&
+        lpStartupInfo && lpStartupInfo->lpTitle &&
+        lpStartupInfo->lpTitle[0] != L'\0' &&
+        lpStartupInfo->lpTitle[0] != L'@')
+    {
+        modifiedSIW           = *lpStartupInfo;
+        titledStartupW        = std::wstring(L"@ ") + lpStartupInfo->lpTitle;
+        modifiedSIW.lpTitle   = const_cast<LPWSTR>(titledStartupW.c_str());
+        pSIW                  = &modifiedSIW;
+        VL_DBG(L"Hook_CreateProcessW: prefixed lpTitle -> %s", modifiedSIW.lpTitle);
+    }
+    else if (dwCreationFlags & EXTENDED_STARTUPINFO_PRESENT) {
+        VL_DBG(L"Hook_CreateProcessW: EXTENDED_STARTUPINFO_PRESENT -- skipping lpTitle patch (safe)");
+    }
+
     // Disable WOW64 FS redirection so Detours finds the correct (same-bitness)
     // rundll32.exe in System32 when it needs a cross-arch helper process.
     // Safe no-op in the 64-bit build.
@@ -4305,7 +4357,7 @@ static BOOL WINAPI Hook_CreateProcessW(
         lpApplicationName, lpCommandLine,
         lpProcessAttributes, lpThreadAttributes,
         bInheritHandles, dwCreationFlags, lpEnvironment,
-        lpCurrentDirectory, lpStartupInfo, lpProcessInformation,
+        lpCurrentDirectory, pSIW, lpProcessInformation,
         1, dlls,
         Real_CreateProcessW);  // bypass our hook; avoids re-entrancy
 
@@ -4341,6 +4393,27 @@ static BOOL WINAPI Hook_CreateProcessA(
                                    lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     }
     VL_DBG(L"Hook_CreateProcessA: injecting dll=%S", dllPath);
+
+    // Prefix STARTUPINFO.lpTitle for the child console window (ANSI version).
+    // Same EXTENDED_STARTUPINFO_PRESENT guard as the W variant — see above.
+    STARTUPINFOA modifiedSIA;
+    std::string   titledStartupA;
+    LPSTARTUPINFOA pSIA = lpStartupInfo;
+    if (!(dwCreationFlags & EXTENDED_STARTUPINFO_PRESENT) &&
+        lpStartupInfo && lpStartupInfo->lpTitle &&
+        lpStartupInfo->lpTitle[0] != '\0' &&
+        lpStartupInfo->lpTitle[0] != '@')
+    {
+        modifiedSIA           = *lpStartupInfo;
+        titledStartupA        = std::string("@ ") + lpStartupInfo->lpTitle;
+        modifiedSIA.lpTitle   = const_cast<LPSTR>(titledStartupA.c_str());
+        pSIA                  = &modifiedSIA;
+        VL_DBG(L"Hook_CreateProcessA: prefixed lpTitle -> %S", modifiedSIA.lpTitle);
+    }
+    else if (dwCreationFlags & EXTENDED_STARTUPINFO_PRESENT) {
+        VL_DBG(L"Hook_CreateProcessA: EXTENDED_STARTUPINFO_PRESENT -- skipping lpTitle patch (safe)");
+    }
+
     PVOID wow64Old = NULL;
     bool  wow64Off = DisableWow64Redir(&wow64Old);
     const char* dlls[1] = { dllPath };
@@ -4348,7 +4421,7 @@ static BOOL WINAPI Hook_CreateProcessA(
         lpApplicationName, lpCommandLine,
         lpProcessAttributes, lpThreadAttributes,
         bInheritHandles, dwCreationFlags, lpEnvironment,
-        lpCurrentDirectory, lpStartupInfo, lpProcessInformation,
+        lpCurrentDirectory, pSIA, lpProcessInformation,
         1, dlls,
         Real_CreateProcessA);  // bypass our hook; avoids re-entrancy
 
@@ -4385,14 +4458,31 @@ static BOOL WINAPI Hook_CreateProcessA(
 // tell it is running sandboxed — the same visual cue Sandboxie uses
 // (which prefixes "#").
 //
-// We hook four entry points:
-//   SetWindowTextW / SetWindowTextA  — title changes after creation
-//   CreateWindowExW / CreateWindowExA — initial title at creation time
+// We hook SIX entry points:
+//   SetWindowTextW / SetWindowTextA    — title changes after creation (GUI apps)
+//   CreateWindowExW / CreateWindowExA  — initial title at creation time (GUI apps)
+//   SetConsoleTitleW / SetConsoleTitleA — console title changes (cmd, PowerShell, etc.)
 //
-// Rules:
+// Why SetConsoleTitle* is required:
+//   cmd.exe never calls SetWindowTextW. Its console window is owned by
+//   conhost.exe (a separate process). cmd.exe calls SetConsoleTitleW in
+//   kernel32, which serialises the title into an undocumented LPC message
+//   sent to conhost via NtRequestWaitReplyPort; conhost then calls
+//   SetWindowTextW in *its own* process — where our hooks are invisible.
+//   Hooking SetConsoleTitleW/A in kernel32 is the correct interception layer.
+//
+// Three-part strategy for full console coverage:
+//   1. Hook SetConsoleTitleW/A  — catches all dynamic title changes.
+//   2. Fix initial title in DllMain after InstallHooks() — conhost may have
+//      already set the window title before our DLL was injected.
+//   3. Prefix STARTUPINFO.lpTitle in Hook_CreateProcessW/A — child console
+//      processes inherit the prefixed title from the very first moment,
+//      eliminating any un-prefixed flash.
+//
+// Rules (apply to all six hooks equally):
 //   • NULL or empty title  → pass through unchanged (no bare "@" title)
 //   • title already starts with '@' → pass through (avoid double-prefix)
-//   • otherwise → prepend "@" and a space for readability
+//   • otherwise → prepend "@ " for readability
 // ============================================================
 
 static BOOL WINAPI Hook_SetWindowTextW(HWND hWnd, LPCWSTR lpString) {
@@ -4443,6 +4533,30 @@ static HWND WINAPI Hook_CreateWindowExA(
                                 hWndParent, hMenu, hInstance, lpParam);
 }
 
+// ---- Console title hooks (kernel32) ----
+// cmd.exe, PowerShell, and any console application call SetConsoleTitleW/A
+// (not SetWindowTextW) to change their window title.  conhost.exe owns the
+// actual HWND, so our SetWindowTextW hook never fires for those callers.
+// These hooks intercept the kernel32 call before it reaches conhost.
+
+static BOOL WINAPI Hook_SetConsoleTitleW(LPCWSTR lpConsoleTitle) {
+    VL_DBG(L"Hook_SetConsoleTitleW: title=%s", lpConsoleTitle ? lpConsoleTitle : L"(null)");
+    if (lpConsoleTitle && lpConsoleTitle[0] != L'\0' && lpConsoleTitle[0] != L'@') {
+        std::wstring titled = std::wstring(L"@ ") + lpConsoleTitle;
+        return Real_SetConsoleTitleW(titled.c_str());
+    }
+    return Real_SetConsoleTitleW(lpConsoleTitle);
+}
+
+static BOOL WINAPI Hook_SetConsoleTitleA(LPCSTR lpConsoleTitle) {
+    VL_DBG(L"Hook_SetConsoleTitleA: title=%S", lpConsoleTitle ? lpConsoleTitle : "(null)");
+    if (lpConsoleTitle && lpConsoleTitle[0] != '\0' && lpConsoleTitle[0] != '@') {
+        std::string titled = std::string("@ ") + lpConsoleTitle;
+        return Real_SetConsoleTitleA(titled.c_str());
+    }
+    return Real_SetConsoleTitleA(lpConsoleTitle);
+}
+
 static void InstallHooks() {
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
     HMODULE k32   = GetModuleHandleA("kernel32.dll");
@@ -4465,6 +4579,10 @@ static void InstallHooks() {
             VL_GETPROC(u32, CreateWindowExA);
         }
     }
+    // Console title prefixing — kernel32.dll (always loaded, no NULL check needed)
+    // SetConsoleTitleW/A are present on all supported Windows versions.
+    VL_GETPROC(k32, SetConsoleTitleW);
+    VL_GETPROC(k32, SetConsoleTitleA);
 
     // Internal raw pointers (not hooked, used for CoW copy / merge)
     VL_GETPROC(ntdll, NtReadFile);
@@ -4576,6 +4694,9 @@ static void InstallHooks() {
     if (Real_SetWindowTextA)  VL_ATTACH(SetWindowTextA);
     if (Real_CreateWindowExW) VL_ATTACH(CreateWindowExW);
     if (Real_CreateWindowExA) VL_ATTACH(CreateWindowExA);
+    // Console title prefixing (cmd.exe, PowerShell, any console app)
+    if (Real_SetConsoleTitleW) VL_ATTACH(SetConsoleTitleW);
+    if (Real_SetConsoleTitleA) VL_ATTACH(SetConsoleTitleA);
 
     // Registry
     if (g_RegEnabled) {
@@ -4645,6 +4766,9 @@ static void UninstallHooks() {
     if (Real_SetWindowTextA)  VL_DETACH(SetWindowTextA);
     if (Real_CreateWindowExW) VL_DETACH(CreateWindowExW);
     if (Real_CreateWindowExA) VL_DETACH(CreateWindowExA);
+    // Console title prefixing
+    if (Real_SetConsoleTitleW) VL_DETACH(SetConsoleTitleW);
+    if (Real_SetConsoleTitleA) VL_DETACH(SetConsoleTitleA);
 
     if (g_RegEnabled) {
         VL_DETACH(NtOpenKey);
@@ -4714,10 +4838,37 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
         InitializeCriticalSectionAndSpinCount(&g_KeyMapLock, 4000);
         InitializeCriticalSectionAndSpinCount(&g_FileMapLock, 4000);
 
-        VL_DBG(L"DllMain: DLL_PROCESS_ATTACH -- VirtHook loading (v11 COW FS)");
+        VL_DBG(L"DllMain: DLL_PROCESS_ATTACH -- VirtHook loading (v12 console title fix)");
 
         LoadConfig();
         InstallHooks();
+
+        // ---------------------------------------------------------------
+        // Fix the initial console title.
+        //
+        // conhost.exe sets the window title from STARTUPINFO.lpTitle (or
+        // the executable name) *before* our DLL is injected.  By the time
+        // DllMain runs the title is already visible without the "@" prefix.
+        // Read whatever conhost put there and re-set it through our now-
+        // active hook so the prefix is applied immediately.
+        //
+        // GetConsoleTitle returns 0 for non-console (GUI-only) processes,
+        // so this block is a safe no-op for them.
+        // ---------------------------------------------------------------
+        {
+            wchar_t existingTitle[1024] = {0};
+            DWORD titleLen = GetConsoleTitleW(existingTitle, 1024);
+            if (titleLen > 0 && existingTitle[0] != L'\0' && existingTitle[0] != L'@') {
+                std::wstring prefixed = std::wstring(L"@ ") + existingTitle;
+                // Call through the trampoline (Real_) so we don't re-enter
+                // the hook; the title we pass already carries the prefix.
+                if (Real_SetConsoleTitleW)
+                    Real_SetConsoleTitleW(prefixed.c_str());
+                else
+                    SetConsoleTitleW(prefixed.c_str());
+                VL_DBG(L"DllMain: fixed initial console title -> %s", prefixed.c_str());
+            }
+        }
 
         VL_DBG(L"DllMain: hooks installed OK");
     }
