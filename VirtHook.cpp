@@ -420,6 +420,12 @@ typedef NTSTATUS (NTAPI *PfnNtQueryDirectoryFileEx)(HANDLE, HANDLE, VL_PIO_APC_R
 typedef BOOL (WINAPI *PfnCreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
 typedef BOOL (WINAPI *PfnCreateProcessA)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
 
+// Window title prefixing (@)
+typedef BOOL  (WINAPI *PfnSetWindowTextW)(HWND, LPCWSTR);
+typedef BOOL  (WINAPI *PfnSetWindowTextA)(HWND, LPCSTR);
+typedef HWND  (WINAPI *PfnCreateWindowExW)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
+typedef HWND  (WINAPI *PfnCreateWindowExA)(DWORD, LPCSTR,  LPCSTR,  DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
+
 // ============================================================
 // Global State
 // ============================================================
@@ -478,6 +484,12 @@ static PfnNtQueryDirectoryFileEx    Real_NtQueryDirectoryFileEx;
 // ----- Children -----
 static PfnCreateProcessW  Real_CreateProcessW;
 static PfnCreateProcessA  Real_CreateProcessA;
+
+// ----- Window title prefixing -----
+static PfnSetWindowTextW  Real_SetWindowTextW;
+static PfnSetWindowTextA  Real_SetWindowTextA;
+static PfnCreateWindowExW Real_CreateWindowExW;
+static PfnCreateWindowExA Real_CreateWindowExA;
 
 // Config flags
 static bool g_RegEnabled = false;
@@ -4365,6 +4377,72 @@ static BOOL WINAPI Hook_CreateProcessA(
 #define VL_DETACH(fn) \
     if (Real_##fn) DetourDetach(reinterpret_cast<PVOID*>(&Real_##fn), Hook_##fn)
 
+// ============================================================
+// Window title prefixing
+//
+// Every top-level window created or renamed inside the virtualized
+// process gets its title prefixed with "@" so the user can instantly
+// tell it is running sandboxed — the same visual cue Sandboxie uses
+// (which prefixes "#").
+//
+// We hook four entry points:
+//   SetWindowTextW / SetWindowTextA  — title changes after creation
+//   CreateWindowExW / CreateWindowExA — initial title at creation time
+//
+// Rules:
+//   • NULL or empty title  → pass through unchanged (no bare "@" title)
+//   • title already starts with '@' → pass through (avoid double-prefix)
+//   • otherwise → prepend "@" and a space for readability
+// ============================================================
+
+static BOOL WINAPI Hook_SetWindowTextW(HWND hWnd, LPCWSTR lpString) {
+    if (lpString && lpString[0] != L'\0' && lpString[0] != L'@') {
+        std::wstring titled = std::wstring(L"@ ") + lpString;
+        return Real_SetWindowTextW(hWnd, titled.c_str());
+    }
+    return Real_SetWindowTextW(hWnd, lpString);
+}
+
+static BOOL WINAPI Hook_SetWindowTextA(HWND hWnd, LPCSTR lpString) {
+    if (lpString && lpString[0] != '\0' && lpString[0] != '@') {
+        std::string titled = std::string("@ ") + lpString;
+        return Real_SetWindowTextA(hWnd, titled.c_str());
+    }
+    return Real_SetWindowTextA(hWnd, lpString);
+}
+
+static HWND WINAPI Hook_CreateWindowExW(
+    DWORD dwExStyle, LPCWSTR lpClassName, LPCWSTR lpWindowName,
+    DWORD dwStyle, int X, int Y, int nWidth, int nHeight,
+    HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam)
+{
+    if (lpWindowName && lpWindowName[0] != L'\0' && lpWindowName[0] != L'@') {
+        std::wstring titled = std::wstring(L"@ ") + lpWindowName;
+        return Real_CreateWindowExW(dwExStyle, lpClassName, titled.c_str(),
+                                    dwStyle, X, Y, nWidth, nHeight,
+                                    hWndParent, hMenu, hInstance, lpParam);
+    }
+    return Real_CreateWindowExW(dwExStyle, lpClassName, lpWindowName,
+                                dwStyle, X, Y, nWidth, nHeight,
+                                hWndParent, hMenu, hInstance, lpParam);
+}
+
+static HWND WINAPI Hook_CreateWindowExA(
+    DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName,
+    DWORD dwStyle, int X, int Y, int nWidth, int nHeight,
+    HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam)
+{
+    if (lpWindowName && lpWindowName[0] != '\0' && lpWindowName[0] != '@') {
+        std::string titled = std::string("@ ") + lpWindowName;
+        return Real_CreateWindowExA(dwExStyle, lpClassName, titled.c_str(),
+                                    dwStyle, X, Y, nWidth, nHeight,
+                                    hWndParent, hMenu, hInstance, lpParam);
+    }
+    return Real_CreateWindowExA(dwExStyle, lpClassName, lpWindowName,
+                                dwStyle, X, Y, nWidth, nHeight,
+                                hWndParent, hMenu, hInstance, lpParam);
+}
+
 static void InstallHooks() {
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
     HMODULE k32   = GetModuleHandleA("kernel32.dll");
@@ -4375,6 +4453,18 @@ static void InstallHooks() {
     VL_GETPROC(ntdll, NtQueryObject);
     VL_GETPROC(k32,   CreateProcessW);
     VL_GETPROC(k32,   CreateProcessA);
+
+    // Window title prefixing — user32.dll
+    {
+        HMODULE u32 = GetModuleHandleA("user32.dll");
+        if (!u32) u32 = LoadLibraryA("user32.dll");
+        if (u32) {
+            VL_GETPROC(u32, SetWindowTextW);
+            VL_GETPROC(u32, SetWindowTextA);
+            VL_GETPROC(u32, CreateWindowExW);
+            VL_GETPROC(u32, CreateWindowExA);
+        }
+    }
 
     // Internal raw pointers (not hooked, used for CoW copy / merge)
     VL_GETPROC(ntdll, NtReadFile);
@@ -4481,6 +4571,12 @@ static void InstallHooks() {
     VL_ATTACH(CreateProcessW);
     VL_ATTACH(CreateProcessA);
 
+    // Window title prefixing
+    if (Real_SetWindowTextW)  VL_ATTACH(SetWindowTextW);
+    if (Real_SetWindowTextA)  VL_ATTACH(SetWindowTextA);
+    if (Real_CreateWindowExW) VL_ATTACH(CreateWindowExW);
+    if (Real_CreateWindowExA) VL_ATTACH(CreateWindowExA);
+
     // Registry
     if (g_RegEnabled) {
         VL_ATTACH(NtOpenKey);
@@ -4543,6 +4639,12 @@ static void UninstallHooks() {
     VL_DETACH(NtClose);
     VL_DETACH(CreateProcessW);
     VL_DETACH(CreateProcessA);
+
+    // Window title prefixing
+    if (Real_SetWindowTextW)  VL_DETACH(SetWindowTextW);
+    if (Real_SetWindowTextA)  VL_DETACH(SetWindowTextA);
+    if (Real_CreateWindowExW) VL_DETACH(CreateWindowExW);
+    if (Real_CreateWindowExA) VL_DETACH(CreateWindowExA);
 
     if (g_RegEnabled) {
         VL_DETACH(NtOpenKey);
