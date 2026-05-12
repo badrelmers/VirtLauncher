@@ -67,6 +67,9 @@ echo c:\=d:\z\>redir.ini
 echo d:\=d:\z\>>redir.ini
 echo e:\=d:\z\>>redir.ini
 echo f:\=d:\z\>>redir.ini
+echo [exclude]>>redir.ini
+echo C:\ccc\excluded>>redir.ini
+mkdir C:\ccc\excluded
 VirtLauncher64.exe -r -c redir.ini -e "%TEST64_PATH%"
 
 

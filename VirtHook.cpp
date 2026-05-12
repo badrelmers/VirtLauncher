@@ -531,6 +531,16 @@ static std::vector< std::pair<std::wstring,std::wstring> > g_FsRedirects;
 //   \??\X:\rest  ->  \??\<g_FsDirNtBase>\X\rest
 static std::wstring g_FsDirNtBase;
 
+// FS exclude prefixes from the [exclude] section of the --config INI file.
+// Stored in NT form with no trailing backslash (e.g. \??\C:\Windows).
+// If an NT path starts with any of these prefixes (with a component-boundary
+// check so \??\C:\Win does not accidentally match \??\C:\Windows), that path
+// is NEVER redirected -- all reads and writes go directly to the real file.
+// Exclusions are evaluated after the Recycle Bin bypass and before any
+// config-based or FSDIR catch-all redirect rules fire, so they take the
+// highest priority among user-visible settings.
+static std::vector<std::wstring> g_FsExcludes;
+
 // Tracked virtual registry handles
 struct VirtKeyEntry {
     HANDLE       hVirt;   // handle to VirtNtBase\X  (NULL if none)
@@ -996,8 +1006,25 @@ static bool IsRecycleBinPath(const std::wstring& ntPath) {
     return false;
 }
 
+// Returns true if ntPath is covered by one of the user-defined [exclude]
+// prefixes.  Uses the same case-insensitive prefix + component-boundary
+// guard used throughout this file, so  \??\C:\Win  never matches
+// \??\C:\Windows  even though it is a prefix string.
+static bool IsExcludedPath(const std::wstring& ntPath) {
+    for (size_t i = 0; i < g_FsExcludes.size(); ++i) {
+        const std::wstring& excl = g_FsExcludes[i];
+        if (StartsWithI(ntPath, excl) &&
+            (ntPath.size() == excl.size() || ntPath[excl.size()] == L'\\'))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Apply FS redirections to an NT path.
 // Priority order:
+//   0. [exclude] rules -- path is returned unchanged (no redirection at all).
 //   1. Explicit rules from --config INI (g_FsRedirects), checked in order.
 //   2. FSDIR catch-all (g_FsDirNtBase) for any drive-letter path not yet
 //      matched and not already located inside the virtual store itself.
@@ -1014,6 +1041,17 @@ static std::wstring ApplyFsRedirect(const std::wstring& ntPath) {
     // in the real Recycle Bin) are handled in Hook_NtSetInformationFile.
     if (IsRecycleBinPath(ntPath)) {
         VL_DBG(L"ApplyFsRedirect: recycle bin bypass -> %s", ntPath.c_str());
+        return ntPath;
+    }
+
+    // --- 0b. User-defined [exclude] bypass ---
+    // Paths listed in the [exclude] section of the --config INI are never
+    // redirected: reads and writes pass straight through to the real file
+    // system.  This check runs before both the config redirect rules and the
+    // FSDIR catch-all so that e.g. virtualising C:\ while excluding
+    // C:\Windows results in C:\Windows always hitting the real folder.
+    if (IsExcludedPath(ntPath)) {
+        VL_DBG(L"ApplyFsRedirect: excluded path bypass -> %s", ntPath.c_str());
         return ntPath;
     }
 
@@ -1493,6 +1531,15 @@ static void LoadFsConfig(const std::wstring& path) {
     std::wstring content(wlen + 1, L'\0');
     MultiByteToWideChar(CP_ACP, 0, &raw[0], -1, &content[0], wlen);
 
+    // Track which INI section we are currently inside.
+    // SEC_REDIRECT  -> lines are  source=destination  path pairs (legacy default).
+    // SEC_EXCLUDE   -> lines are plain paths that must NEVER be redirected.
+    // SEC_UNKNOWN   -> lines inside an unrecognised section are ignored.
+    // SEC_NONE      -> lines before any section header are treated as SEC_REDIRECT
+    //                  for backward compatibility with config files that omit the
+    //                  [redirect] header entirely.
+    enum Section { SEC_NONE, SEC_REDIRECT, SEC_EXCLUDE, SEC_UNKNOWN } section = SEC_NONE;
+
     size_t pos = 0;
     while (pos < content.size()) {
         size_t nl = content.find(L'\n', pos);
@@ -1500,14 +1547,53 @@ static void LoadFsConfig(const std::wstring& path) {
                             ? content.substr(pos, nl - pos)
                             : content.substr(pos);
         pos = (nl != std::wstring::npos) ? nl + 1 : content.size();
+        // Strip trailing CR and spaces, then leading spaces
         while (!line.empty() && (line[line.size()-1] == L'\r' || line[line.size()-1] == L' '))
             line.resize(line.size() - 1);
         while (!line.empty() && line[0] == L' ')
             line = line.substr(1);
 
         if (line.empty() || line[0] == L'#' || line[0] == L';') continue;
-        if (line[0] == L'[') continue;
 
+        // ---- Section header ----
+        if (line[0] == L'[') {
+            // Extract the header name between [ and ] (or end of string).
+            std::wstring hdr = line.substr(1);
+            size_t close = hdr.find(L']');
+            if (close != std::wstring::npos) hdr = hdr.substr(0, close);
+            // Trim spaces inside the header
+            while (!hdr.empty() && hdr[0]         == L' ') hdr = hdr.substr(1);
+            while (!hdr.empty() && hdr[hdr.size()-1] == L' ') hdr.resize(hdr.size() - 1);
+
+            if (_wcsicmp(hdr.c_str(), L"redirect") == 0)
+                section = SEC_REDIRECT;
+            else if (_wcsicmp(hdr.c_str(), L"exclude") == 0)
+                section = SEC_EXCLUDE;
+            else
+                section = SEC_UNKNOWN;
+            continue;
+        }
+
+        // ---- Lines inside [exclude] ----
+        // Each non-blank, non-comment line is a single path to be excluded from
+        // all virtualisation.  The path may be a Win32 path (C:\Windows) or an
+        // NT path (\??\C:\Windows); both forms are accepted.
+        if (section == SEC_EXCLUDE) {
+            std::wstring excl = Win32ToNtPath(line);
+            // Normalise: strip trailing backslashes (same rule as redirect 'from')
+            while (excl.size() > 4 && excl.back() == L'\\') excl.resize(excl.size() - 1);
+            if (!excl.empty()) {
+                g_FsExcludes.push_back(excl);
+                VL_DBG(L"LoadFsConfig: exclude  %s", excl.c_str());
+            }
+            continue;
+        }
+
+        // ---- Lines inside [redirect] (or before any section header) ----
+        // Unrecognised sections are silently skipped.
+        if (section == SEC_UNKNOWN) continue;
+
+        // SEC_NONE / SEC_REDIRECT: expect  source=destination  pairs.
         size_t eq = line.find(L'=');
         if (eq == std::wstring::npos) continue;
 
@@ -1528,6 +1614,7 @@ static void LoadFsConfig(const std::wstring& path) {
             while (from.size() > 4 && from.back() == L'\\') from.resize(from.size() - 1);
             while (to.size()   > 4 && to.back()   == L'\\') to.resize(to.size() - 1);
             g_FsRedirects.push_back(std::make_pair(from, to));
+            VL_DBG(L"LoadFsConfig: redirect %s -> %s", from.c_str(), to.c_str());
         }
     }
 }
@@ -1589,8 +1676,9 @@ static void LoadConfig() {
     VL_DBG(L"LoadConfig: RegEnabled=%d  VirtNtBase=%s",
            (int)g_RegEnabled, g_VirtNtBase.c_str());
     VL_DBG(L"LoadConfig:             RealNtBase=%s", g_RealNtBase.c_str());
-    VL_DBG(L"LoadConfig: FsEnabled=%d  redirects=%u  FsDirNtBase=%s",
-           (int)g_FsEnabled, (unsigned)g_FsRedirects.size(), g_FsDirNtBase.c_str());
+    VL_DBG(L"LoadConfig: FsEnabled=%d  redirects=%u  excludes=%u  FsDirNtBase=%s",
+           (int)g_FsEnabled, (unsigned)g_FsRedirects.size(),
+           (unsigned)g_FsExcludes.size(), g_FsDirNtBase.c_str());
 }
 
 // ============================================================

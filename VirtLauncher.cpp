@@ -68,8 +68,16 @@
 //   C:\OriginalPath=D:\RedirectedPath
 //   C:\Program Files\MyApp=E:\Portable\MyApp
 //
+//   [exclude]
+//   C:\Windows
+//   C:\Program Files\CommonApp
+//
 //   Rules:
 //    - One redirect per line, format:  source=destination
+//    - [exclude] entries are plain paths (no '='); those paths are NEVER
+//      virtualised -- reads and writes go directly to the real file system
+//      even when --filesystem or a [redirect] rule would otherwise cover them.
+//      Exclusions are checked before all redirect rules and the FSDIR catch-all.
 //    - Paths are Win32 absolute paths
 //    - Matching is case-insensitive prefix match on NT paths
 //    - Longer/more-specific rules should come first
@@ -363,10 +371,16 @@ static void PrintUsage(const wchar_t* self) {
     wprintf(L"  [redirect]\n");
     wprintf(L"  C:\\OldPath=D:\\NewPath\n");
     wprintf(L"  C:\\Program Files\\MyApp=E:\\Portable\\MyApp\n\n");
+    wprintf(L"  [exclude]\n");
+    wprintf(L"  C:\\Windows\n");
+    wprintf(L"  C:\\Program Files\\CommonApp\n\n");
     wprintf(L"  Rules:\n");
     wprintf(L"    - One redirect per line: source=destination (Win32 absolute paths)\n");
     wprintf(L"    - Matching is case-insensitive prefix match on NT paths\n");
-    wprintf(L"    - List more-specific rules before less-specific ones\n\n");
+    wprintf(L"    - List more-specific rules before less-specific ones\n");
+    wprintf(L"    - [exclude] paths are never virtualised; reads and writes always\n");
+    wprintf(L"      go to the real folder even when --filesystem or [redirect] would\n");
+    wprintf(L"      otherwise cover them. Exclusions take priority over all redirects.\n\n");
 
     wprintf(L"Architecture:\n");
     wprintf(L"  VirtLauncher32.exe + VirtHook32.dll  -> for 32-bit target apps\n");
