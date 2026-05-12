@@ -11,7 +11,7 @@ REM set VLAUNCHER_DEBUG=true
 
 
 ::_______________________________________________
-
+color 2F
 cd ..\build
 echo C:\ccc=D:\vvv> redirectstest.ini
 

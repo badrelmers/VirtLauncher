@@ -2,6 +2,13 @@
 SETLOCAL
 CD /D "%~dp0"
 
+::_______________________________________________
+ @rem set VLAUNCHER_VERBOSE=true
+ set VLAUNCHER_DEBUG=true
+
+
+::_______________________________________________
+color 2F
 set "BUILD_DIR=..\build"
 copy /y test_bug2.exe "%BUILD_DIR%" >nul 2>&1
 cd "%BUILD_DIR%"

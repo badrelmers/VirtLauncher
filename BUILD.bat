@@ -99,21 +99,23 @@ echo --- Ordinal 1 export check (must show DetourFinishHelperProcess) ---
 echo ============================================================
 
 if not exist build mkdir build
-move /y VirtLauncher32.exe build
-move /y VirtHook32.dll build
-move /y VirtLauncher64.exe build
-move /y VirtHook64.dll build
-copy /y redirects.ini build
+move /y VirtLauncher32.exe build || goto :err
+move /y VirtHook32.dll build || goto :err
+move /y VirtLauncher64.exe build || goto :err
+move /y VirtHook64.dll build || goto :err
+copy /y redirects.ini build || goto :err
 
 echo.
 echo  Build complete!  Files in: %SRCDIR%
 echo    VirtLauncher32.exe + VirtHook32.dll  (for 32-bit apps)
 echo    VirtLauncher64.exe + VirtHook64.dll  (for 64-bit apps)
 echo.
+color 2F
 pause
 exit /b 0
 
 :err
+color 4F
 del /Q *.obj _build_x86.bat _build_x64.bat 2>nul
 echo.
 echo BUILD FAILED. See errors above.

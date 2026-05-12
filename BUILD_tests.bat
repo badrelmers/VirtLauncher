@@ -69,19 +69,21 @@ del /Q *.obj 2>nul
 
 echo ============================================================
 
-move /y test_bug1.exe tests
-move /y test_bug2.exe tests
+move /y test_bug1.exe tests || goto :err
+move /y test_bug2.exe tests || goto :err
 
 echo.
 echo  Build complete!  Files in: %SRCDIR%
 echo    test_bug1.exe
 echo    test_bug2.exe
 echo.
+color 2F
 pause
 exit /b 0
 
 
 :err
+color 4F
 del /Q *.obj 2>nul
 echo.
 echo BUILD FAILED. See errors above.

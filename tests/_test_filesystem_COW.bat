@@ -38,6 +38,7 @@ cd "%BUILD_DIR%"
 echo ============================================================
 echo  VirtLauncher Injection Test Suite
 echo ============================================================
+color 2F
 
 set "currdir=%CD%"
 @rem remove :

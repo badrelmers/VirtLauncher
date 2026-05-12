@@ -2,13 +2,13 @@
 SETLOCAL
 CD /D "%~dp0"
 
-REM check admin
-REM fltmc >nul 2>&1 || ( color 4F & echo. & echo RUNME AS ADMIN & echo. & pause & exit )
-
+::_______________________________________________
  @rem set VLAUNCHER_VERBOSE=true
  set VLAUNCHER_DEBUG=true
- 
- 
+
+
+::_______________________________________________
+color 2F
 set "BUILD_DIR=..\build"
 cd "%BUILD_DIR%"
 
