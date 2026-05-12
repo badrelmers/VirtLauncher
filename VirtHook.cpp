@@ -1281,9 +1281,7 @@ static ULONG FilterDirBuffer(
 
         // Hide real entries that were deleted inside the sandbox (tombstone exists)
         if (!skip && !virtDirPath.empty() && !name.empty()) {
-            SetReentrant(true);
             skip = FileHasTombstoneInVirtDir(virtDirPath, name);
-            SetReentrant(false);
         }
 
         if (!skip) {
@@ -2657,10 +2655,8 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
         CreateDisposition == FILE_OVERWRITE ||
         CreateDisposition == FILE_OVERWRITE_IF)
     {
-        SetReentrant(true);
         EnsureVirtualFsPath(redPath);
         DeleteTombstoneIfPresent(redPath);
-        SetReentrant(false);
 
         ULONG dispToUse = CreateDisposition;
         if ((CreateDisposition == FILE_OVERWRITE ||
@@ -2703,10 +2699,8 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
 
     // FILE_OPEN_IF + write: ensure dirs then fall through to CoW logic
     if (CreateDisposition == FILE_OPEN_IF && isWrite) {
-        SetReentrant(true);
         EnsureVirtualFsPath(redPath);
         DeleteTombstoneIfPresent(redPath);
-        SetReentrant(false);
     }
 
     // ----------------------------------------------------------------
@@ -2751,9 +2745,7 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
     if (!IsFsNotFound(st)) return st;
 
     // Tombstone check
-    SetReentrant(true);
     bool tombstoned = TombstoneExists(redPath);
-    SetReentrant(false);
     if (tombstoned) {
         VL_DBG(L"Hook_NtCreateFile: tombstone -> deleted in sandbox, NOT_FOUND");
         return VL_STATUS_OBJECT_NAME_NOT_FOUND;
@@ -2796,9 +2788,7 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
 
     // Write CoW on directory: create the virtual directory and open it.
     if (isDir) {
-        SetReentrant(true);
         EnsureVirtualFsPath(redPath);
-        SetReentrant(false);
         st = Real_NtCreateFile(FileHandle, DesiredAccess, &newOa, IoStatusBlock,
                                 AllocationSize, FileAttributes, ShareAccess,
                                 CreateDisposition, CreateOptions, EaBuffer, EaLength);
@@ -2818,9 +2808,7 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
     } else {
         // Write CoW on file: copy real -> virtual, then open the virtual copy.
         VL_DBG(L"Hook_NtCreateFile: write CoW, copying real->virtual");
-        SetReentrant(true);
         bool copied = CopyRealFileToVirtual(ntPath, redPath);
-        SetReentrant(false);
         if (!copied) {
             VL_DBG(L"Hook_NtCreateFile: CoW copy failed, returning 0x%08X", (ULONG)st);
             return st;
@@ -2909,9 +2897,7 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
     if (!IsFsNotFound(st)) return st;
 
     // Tombstone check.
-    SetReentrant(true);
     bool tombstoned = TombstoneExists(redPath);
-    SetReentrant(false);
     if (tombstoned) {
         VL_DBG(L"Hook_NtOpenFile: tombstone -> deleted in sandbox, NOT_FOUND");
         return VL_STATUS_OBJECT_NAME_NOT_FOUND;
@@ -2951,9 +2937,7 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
 
     // Write CoW on directory.
     if (isDir) {
-        SetReentrant(true);
         EnsureVirtualFsPath(redPath);
-        SetReentrant(false);
         st = Real_NtOpenFile(FileHandle, DesiredAccess, &newOa,
                               IoStatusBlock, ShareAccess, OpenOptions);
         if (NT_SUCCESS(st)) {
@@ -2972,9 +2956,7 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
     } else {
         // Write CoW on file: copy real -> virtual then open virtual.
         VL_DBG(L"Hook_NtOpenFile: write CoW, copying real->virtual");
-        SetReentrant(true);
         bool copied = CopyRealFileToVirtual(ntPath, redPath);
-        SetReentrant(false);
         if (!copied) {
             VL_DBG(L"Hook_NtOpenFile: CoW copy failed, returning 0x%08X", (ULONG)st);
             return st;
@@ -2993,10 +2975,41 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
     }
 }
 
+// ---- EnsureVirtualNamespaceDir ----
+// DIRECTORY_ALL_ACCESS is 0x000F000F in winnt.h; provide a fallback for
+// minimal-header build environments.
+#ifndef DIRECTORY_ALL_ACCESS
+#  define DIRECTORY_ALL_ACCESS 0x000F000F
+#endif
+// Recursively ensures every ancestor component of virtPath exists in the
+// virtual Object Manager namespace by calling Real_NtCreateDirectoryObject on
+// each segment.  This mirrors EnsureVirtualFsPath but operates on OM namespace
+// directories (in-memory kernel objects), not filesystem directories.
+// Failures on intermediate segments are silently ignored -- the segment may be
+// a real OM directory that requires elevated privilege to create; if it is
+// genuinely missing the final NtCreateDirectoryObject call will surface the
+// real error.
+static void EnsureVirtualNamespaceDir(const std::wstring& virtPath) {
+    if (!Real_NtCreateDirectoryObject) return;
+    size_t lastSlash = virtPath.rfind(L'\\');
+    if (lastSlash == std::wstring::npos || lastSlash == 0) return;
+
+    std::wstring dirPath = virtPath.substr(0, lastSlash);
+    // Recurse to ensure the grandparent exists first.
+    EnsureVirtualNamespaceDir(dirPath);
+
+    VL_UNICODE_STRING us; MakeUStr(&us, dirPath);
+    VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
+    HANDLE h = NULL;
+    NTSTATUS st = Real_NtCreateDirectoryObject(&h, DIRECTORY_ALL_ACCESS, &oa);
+    if (NT_SUCCESS(st) && h) Real_NtClose(h);
+}
+
 // ---- NtCreateDirectoryObject ----
 // Object-namespace directories (not filesystem directories).
 // Create always goes to virtual; namespace dirs are not on disk so no
-// tombstone or CoW copy is needed.
+// tombstone or CoW copy is needed.  We ensure virtual parent segments
+// exist before the final create to avoid STATUS_OBJECT_PATH_NOT_FOUND.
 static NTSTATUS NTAPI Hook_NtCreateDirectoryObject(
     PHANDLE DirectoryHandle, ULONG DesiredAccess, PVL_OBJECT_ATTRIBUTES ObjectAttributes)
 {
@@ -3008,11 +3021,12 @@ static NTSTATUS NTAPI Hook_NtCreateDirectoryObject(
     if (!redirected)
         return Real_NtCreateDirectoryObject(DirectoryHandle, DesiredAccess, ObjectAttributes);
     VL_DBG(L"Hook_NtCreateDirectoryObject: -> %s", redPath.c_str());
+    EnsureVirtualNamespaceDir(redPath);
     return Real_NtCreateDirectoryObject(DirectoryHandle, DesiredAccess, &newOa);
 }
 
 // ---- NtOpenDirectoryObject ----
-// Object-namespace directory open: try virtual, fall back to real.
+// Object-namespace directory open: try virtual, fall back to real on not-found.
 // No tombstone / CoW copy needed (namespace dirs are not on disk).
 static NTSTATUS NTAPI Hook_NtOpenDirectoryObject(
     PHANDLE DirectoryHandle, ULONG DesiredAccess, PVL_OBJECT_ATTRIBUTES ObjectAttributes)
@@ -3025,7 +3039,18 @@ static NTSTATUS NTAPI Hook_NtOpenDirectoryObject(
     if (!redirected)
         return Real_NtOpenDirectoryObject(DirectoryHandle, DesiredAccess, ObjectAttributes);
     VL_DBG(L"Hook_NtOpenDirectoryObject: -> %s", redPath.c_str());
-    return Real_NtOpenDirectoryObject(DirectoryHandle, DesiredAccess, &newOa);
+
+    // Try virtual namespace first.
+    NTSTATUS st = Real_NtOpenDirectoryObject(DirectoryHandle, DesiredAccess, &newOa);
+    if (NT_SUCCESS(st)) return st;
+
+    // If the virtual counterpart simply doesn't exist yet, fall back to the
+    // real object namespace so the sandboxed app can still open real objects
+    // (e.g. mutexes, events) that live only in the real namespace.
+    if (IsFsNotFound(st))
+        return Real_NtOpenDirectoryObject(DirectoryHandle, DesiredAccess, ObjectAttributes);
+
+    return st;
 }
 
 // ---- NtCreateMailslotFile ----
@@ -3099,16 +3124,23 @@ static NTSTATUS NTAPI Hook_NtDeleteFile(PVL_OBJECT_ATTRIBUTES ObjectAttributes)
     if (!redirected)
         return Real_NtDeleteFile(ObjectAttributes);
 
+    // Build a clean OA pointing at the real (logical) path with no root-directory
+    // handle.  ObjectAttributes may carry a RootDirectory that points into the
+    // virtual store; using it for a "does the real file exist?" probe would make
+    // Real_NtQueryAttributesFile look inside the virtual store instead of the
+    // real filesystem.  ntPath is already the fully-resolved absolute logical
+    // path produced by GetFullNtPath + Win32ToNtPath, so this is always safe.
+    VL_UNICODE_STRING realUs; MakeUStr(&realUs, ntPath);
+    VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realUs);
+
     // Try delete virtual
     NTSTATUS st = Real_NtDeleteFile(&newOa);
     if (NT_SUCCESS(st)) {
         // Virtual file deleted.  If real still exists at the same logical path,
         // create a tombstone so it doesn't reappear on the next read or query.
         BYTE basicBuf[48] = {0};
-        if (!IsFsNotFound(Real_NtQueryAttributesFile(ObjectAttributes, basicBuf))) {
-            SetReentrant(true);
+        if (!IsFsNotFound(Real_NtQueryAttributesFile(&realOa, basicBuf))) {
             CreateTombstone(redPath);
-            SetReentrant(false);
         } else {
             DeleteTombstoneIfPresent(redPath);
         }
@@ -3119,16 +3151,14 @@ static NTSTATUS NTAPI Hook_NtDeleteFile(PVL_OBJECT_ATTRIBUTES ObjectAttributes)
 
     // Virtual didn't exist. Does real exist?
     BYTE basicBuf[48] = {0};
-    if (IsFsNotFound(Real_NtQueryAttributesFile(ObjectAttributes, basicBuf))) {
+    if (IsFsNotFound(Real_NtQueryAttributesFile(&realOa, basicBuf))) {
         return st; // neither has it
     }
 
     // Real exists, virtual doesn't -> create tombstone to mask real
     VL_DBG(L"Hook_NtDeleteFile: real-only file, creating tombstone");
-    SetReentrant(true);
     EnsureVirtualFsPath(redPath);
     CreateTombstone(redPath);
-    SetReentrant(false);
 
     // Return success: as far as the sandboxed app is concerned the file is gone.
     return VL_STATUS_SUCCESS;
@@ -3501,9 +3531,7 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
                     continue;
                 // FIX: tombstone check — file was deleted inside the sandbox
                 if (!name.empty() && !virtDirPath.empty()) {
-                    SetReentrant(true);
                     bool tomb = FileHasTombstoneInVirtDir(virtDirPath, name);
-                    SetReentrant(false);
                     if (tomb) continue;
                 }
                 e.realRestartPending = false;
@@ -3740,9 +3768,7 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
                     continue;
                 // FIX: tombstone check
                 if (!name.empty() && !virtDirPath.empty()) {
-                    SetReentrant(true);
                     bool tomb = FileHasTombstoneInVirtDir(virtDirPath, name);
-                    SetReentrant(false);
                     if (tomb) continue;
                 }
                 e.realRestartPending = false;
@@ -3861,10 +3887,8 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
                 VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realUs);
                 BYTE basicBuf[48] = {0};
                 if (!IsFsNotFound(Real_NtQueryAttributesFile(&realOa, basicBuf))) {
-                    SetReentrant(true);
                     EnsureVirtualFsPath(redPath);
                     CreateTombstone(redPath);
-                    SetReentrant(false);
                 }
             }
         }
@@ -3890,6 +3914,7 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
 
     BYTE*  p           = (BYTE*)FileInformation;
     ULONG  nameByteLen = *(ULONG*)(p + RENAME_INFO_NAMELEN_OFFSET);
+    HANDLE hRoot       = *(HANDLE*)(p + RENAME_INFO_HANDLE_OFFSET);
 
     if (nameByteLen == 0 || Length < (ULONG)(RENAME_INFO_NAME_OFFSET + nameByteLen))
         return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
@@ -3901,11 +3926,24 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
 
     const bool isLink = (FileInformationClass == FileLinkInformation ||
                          FileInformationClass == FileLinkInformationEx);
-    VL_DBG(L"Hook_NtSetInformationFile: %s dest orig=%s",
-           isLink ? L"hardlink" : L"rename", origName.c_str());
+    VL_DBG(L"Hook_NtSetInformationFile: %s dest orig=%s hRoot=%p",
+           isLink ? L"hardlink" : L"rename", origName.c_str(), hRoot);
 
-    std::wstring redName = ApplyFsRedirect(origName);
-    if (redName == origName) {
+    // Resolve relative destination to absolute if the caller supplied a root handle.
+    // When hRoot is NULL and origName has no leading backslash the rename
+    // destination is malformed at the NT level (no CWD concept here), so we pass
+    // it through unchanged -- the kernel will reject it with the appropriate status.
+    std::wstring targetLogicalPath;
+    if (hRoot) {
+        std::wstring rootPath = GetHandleLogicalPath(hRoot);
+        targetLogicalPath = rootPath + L"\\" + origName;
+    } else {
+        targetLogicalPath = origName;
+    }
+
+    targetLogicalPath = Win32ToNtPath(targetLogicalPath);
+    std::wstring redName = ApplyFsRedirect(targetLogicalPath);
+    if (redName == targetLogicalPath) {
         VL_DBG(L"Hook_NtSetInformationFile: no redirect for %s dest",
                isLink ? L"hardlink" : L"rename");
         return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
@@ -3915,10 +3953,17 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
 
     VL_DBG(L"Hook_NtSetInformationFile: %s dest -> %s",
            isLink ? L"hardlink" : L"rename", redName.c_str());
+
+    // Ensure the virtual destination directory exists before the rename/link.
+    EnsureVirtualFsPath(redName);
+
     ULONG newNameBytes = (ULONG)(redName.size() * sizeof(WCHAR));
     ULONG newLength    = RENAME_INFO_NAME_OFFSET + newNameBytes;
     std::vector<BYTE> buf(newLength, 0);
     memcpy(&buf[0], p, RENAME_INFO_NAME_OFFSET);
+    // CRITICAL: clear RootDirectory -- our rewritten name is now absolute,
+    // so the kernel must not apply any root-directory anchor.
+    *(HANDLE*)(&buf[0] + RENAME_INFO_HANDLE_OFFSET) = NULL;
     *(ULONG*)(&buf[0] + RENAME_INFO_NAMELEN_OFFSET) = newNameBytes;
     memcpy(&buf[0] + RENAME_INFO_NAME_OFFSET, redName.c_str(), newNameBytes);
 
