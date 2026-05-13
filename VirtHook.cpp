@@ -2937,14 +2937,16 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
         // does and what the kernel itself would return for a real collision.
         // Explorer uses that status code to decide to append " - Copy"; cmd.exe
         // uses it to trigger the "Overwrite? (Yes/No/All)" prompt for move.
-        if (CreateDisposition == FILE_CREATE && !isDir) {
+        if (CreateDisposition == FILE_CREATE) {
             // Only probe the real store when there is no tombstone (tombstone
             // means the file was explicitly deleted inside the sandbox, so the
             // merged namespace correctly considers it absent).
+            // Applies to both files AND directories: "mkdir cc" should fail with
+            // COLLISION when cc already exists in the real store, just like Sandboxie.
             if (!TombstoneExists(redPath)) {
                 BYTE realCollBuf[48] = {0};
                 if (!IsFsNotFound(Real_NtQueryAttributesFile(&realOa, realCollBuf))) {
-                    VL_DBG(L"Hook_NtCreateFile: FILE_CREATE, file exists in real merged NS -> COLLISION");
+                    VL_DBG(L"Hook_NtCreateFile: FILE_CREATE, entry exists in real merged NS -> COLLISION");
                     return VL_STATUS_OBJECT_NAME_COLLISION;
                 }
             }
@@ -3056,6 +3058,22 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
     if (IsFsNotFound(realCheck)) {
         VL_DBG(L"Hook_NtCreateFile: real also not found, returning 0x%08X", (ULONG)st);
         return st;
+    }
+
+    // Upgrade isDir if the real entity has FILE_ATTRIBUTE_DIRECTORY set.
+    // This is necessary because callers (e.g. cmd.exe doing a rename/move)
+    // may open a directory WITHOUT FILE_DIRECTORY_FILE in CreateOptions, so
+    // isDir would be false even though the target is a directory.  Without
+    // this fix we would try CopyRealFileToVirtual on a directory, which
+    // fails with STATUS_FILE_IS_A_DIRECTORY -> caller sees "file not found".
+    // FILE_BASIC_INFORMATION layout: CreationTime(8)+LastAccessTime(8)+
+    //   LastWriteTime(8)+ChangeTime(8)+FileAttributes(4) -> offset 32.
+    {
+        ULONG realAttrs = *(ULONG*)(basicBuf + 32);
+        if (realAttrs & FILE_ATTRIBUTE_DIRECTORY) {
+            isDir = true;
+            VL_DBG(L"Hook_NtCreateFile: upgraded isDir=true from real FILE_ATTRIBUTE_DIRECTORY");
+        }
     }
 
     if (!isWrite) {
@@ -3207,6 +3225,23 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
     if (IsFsNotFound(Real_NtQueryAttributesFile(&realOa, basicBuf))) {
         VL_DBG(L"Hook_NtOpenFile: real also not found, returning 0x%08X", (ULONG)st);
         return st;
+    }
+
+    // Upgrade isDir if the real entity has FILE_ATTRIBUTE_DIRECTORY set.
+    // cmd.exe and other callers open a directory for rename/move WITHOUT
+    // FILE_DIRECTORY_FILE in OpenOptions, so isDir starts as false.
+    // Without this upgrade the hook falls into CopyRealFileToVirtual on a
+    // directory, which fails with STATUS_FILE_IS_A_DIRECTORY (0xC00000BA)
+    // and the caller sees "The system cannot find the file specified".
+    // FILE_BASIC_INFORMATION layout (NtQueryAttributesFile output):
+    //   CreationTime(8)+LastAccessTime(8)+LastWriteTime(8)+ChangeTime(8)
+    //   +FileAttributes(4)  -> FileAttributes is at byte offset 32.
+    {
+        ULONG realAttrs = *(ULONG*)(basicBuf + 32);
+        if (realAttrs & FILE_ATTRIBUTE_DIRECTORY) {
+            isDir = true;
+            VL_DBG(L"Hook_NtOpenFile: upgraded isDir=true from real FILE_ATTRIBUTE_DIRECTORY");
+        }
     }
 
     if (!isWrite) {
