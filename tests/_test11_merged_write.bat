@@ -108,6 +108,7 @@ echo __________________4
 
 rmdir /Q /S "%CD%\VIRTL" 2>nul
 rmdir /Q /S "%testdir%" 2>nul
+
 mkdir "%testdir%\cc"
 VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\cc" vvc
 if %ERRORLEVEL% EQU 0 (
@@ -116,6 +117,27 @@ if %ERRORLEVEL% EQU 0 (
     color 4F & echo bad
 )
 
+echo __________________5
+@rem The system cannot find the file specified
+
+rmdir /Q /S "%CD%\VIRTL" 2>nul
+rmdir /Q /S "%testdir%" 2>nul
+
+mkdir "%testdir%"
+echo sdfsdf>"%testdir%\fileee"
+VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\fileee" fileeerenamed
+if %ERRORLEVEL% EQU 0 (
+    echo good
+) else (
+    color 4F & echo bad
+)
+
+
+
+
+
+
+@rem _______________________________________________________
 
 rmdir /Q /S "%CD%\VIRTL" 2>nul
 rmdir /Q /S "%testdir%"

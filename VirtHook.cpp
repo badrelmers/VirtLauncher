@@ -4514,9 +4514,49 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
     *(ULONG*)(&buf[0] + RENAME_INFO_NAMELEN_OFFSET) = newNameBytes;
     memcpy(&buf[0] + RENAME_INFO_NAME_OFFSET, redName.c_str(), newNameBytes);
 
-    return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
-                                      &buf[0], newLength,
-                                      FileInformationClass);
+    NTSTATUS stRename = Real_NtSetInformationFile(FileHandle, IoStatusBlock,
+                                                   &buf[0], newLength,
+                                                   FileInformationClass);
+
+    // ---- Post-rename tombstone management (rename only, not hardlink) ----
+    //
+    // After a successful rename the virtual source entry no longer exists at
+    // its old name (it was atomically moved to the destination in the virtual
+    // store).  But if the source name also exists in the REAL store, it will
+    // re-emerge in the merged view immediately — cmd.exe then sees the entry
+    // still present, retries the rename, succeeds again (vvc now exists in
+    // virtual → collision on the 2nd try) and prints "A duplicate file name
+    // exists, or the file cannot be found." four times.
+    //
+    // Fix: place a tombstone for the source's virtual path so the real entry
+    // is hidden from the merged namespace.  Also clear any stale tombstone
+    // that might be blocking the destination (it now exists in virtual).
+    if (NT_SUCCESS(stRename) && !isLink) {
+        // Get the source's logical path from the handle.
+        std::wstring srcLogical = GetHandleLogicalPath(FileHandle);
+        if (!srcLogical.empty()) {
+            std::wstring redSrcPath = ApplyFsRedirect(srcLogical);
+            if (redSrcPath != srcLogical) {
+                // Does the source name still exist in the real store?
+                // (It always does for real-only entries; for virtual-only
+                // entries the real probe returns NOT_FOUND and we skip.)
+                VL_UNICODE_STRING realSrcUs; MakeUStr(&realSrcUs, srcLogical);
+                VL_OBJECT_ATTRIBUTES realSrcOa; MakeOA(&realSrcOa, &realSrcUs);
+                BYTE realSrcBuf[48] = {0};
+                if (!IsFsNotFound(Real_NtQueryAttributesFile(&realSrcOa, realSrcBuf))) {
+                    VL_DBG(L"Hook_NtSetInformationFile: rename OK, "
+                           L"tombstoning real source %s", redSrcPath.c_str());
+                    EnsureVirtualFsPath(redSrcPath);
+                    CreateTombstone(redSrcPath);
+                }
+                // Remove any stale tombstone on the destination — the
+                // virtual file now exists there.
+                DeleteTombstoneIfPresent(redName);
+            }
+        }
+    }
+
+    return stRename;
 }
 
 // ============================================================
