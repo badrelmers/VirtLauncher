@@ -3672,7 +3672,12 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
                 continue;
             }
             // FIX: recognise both end-of-dir status codes
-            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES) {
+            // FIX: also treat STATUS_NO_SUCH_FILE as "nothing in virtual" so we
+            // fall through to the real-side phase.  An empty virtual directory
+            // returns NO_SUCH_FILE (not NO_MORE_FILES) when a FileName filter is
+            // active and nothing matches — without this the real store is skipped.
+            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES ||
+                st == VL_STATUS_NO_SUCH_FILE) {
                 e.virtEnumDone       = true;
                 e.realRestartPending = true;
                 UpdateFileEntry(FileHandle, e);
@@ -3756,7 +3761,12 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
                 return st;
             }
             // FIX: accept STATUS_NO_MORE_FILES from the virtual handle too
-            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES) {
+            // FIX: also treat STATUS_NO_SUCH_FILE as "nothing in virtual" so we
+            // fall through to the real-side phase.  An empty virtual directory
+            // returns NO_SUCH_FILE (not NO_MORE_FILES) when a FileName filter is
+            // active and nothing matches — without this the real store is skipped.
+            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES ||
+                st == VL_STATUS_NO_SUCH_FILE) {
                 e.virtEnumDone       = true;
                 e.realRestartPending = true;
                 // Build real FileName pointer if not already set
@@ -3942,7 +3952,12 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
                 continue; // all filtered
             }
             // FIX: accept both end-of-dir codes
-            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES) {
+            // FIX: also treat STATUS_NO_SUCH_FILE as "nothing in virtual" so we
+            // fall through to the real-side phase.  An empty virtual directory
+            // returns NO_SUCH_FILE (not NO_MORE_FILES) when a FileName filter is
+            // active and nothing matches — without this the real store is skipped.
+            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES ||
+                st == VL_STATUS_NO_SUCH_FILE) {
                 e.virtEnumDone       = true;
                 e.realRestartPending = true;
                 UpdateFileEntry(FileHandle, e);
@@ -4004,7 +4019,12 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
                 return st;
             }
             // FIX: accept both end-of-dir codes
-            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES) {
+            // FIX: also treat STATUS_NO_SUCH_FILE as "nothing in virtual" so we
+            // fall through to the real-side phase.  An empty virtual directory
+            // returns NO_SUCH_FILE (not NO_MORE_FILES) when a FileName filter is
+            // active and nothing matches — without this the real store is skipped.
+            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES ||
+                st == VL_STATUS_NO_SUCH_FILE) {
                 e.virtEnumDone       = true;
                 e.realRestartPending = true;
                 flagsReal            = (QueryFlags & ~0x01u) | 0x01u; // restart real
