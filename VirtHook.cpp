@@ -144,6 +144,10 @@ typedef LONG NTSTATUS;
 #define VL_STATUS_BUFFER_OVERFLOW        ((NTSTATUS)0x80000005L)
 // STATUS_OBJECT_NAME_NOT_FOUND (0xC0000034) -- primary "not found" code
 #define VL_STATUS_OBJECT_NAME_NOT_FOUND  ((NTSTATUS)0xC0000034L)
+// STATUS_OBJECT_NAME_COLLISION (0xC0000035) -- returned when a file already exists
+// in the merged namespace and FILE_CREATE / rename-without-replace is requested.
+// This is what triggers Explorer's "- Copy" naming and cmd.exe's overwrite prompt.
+#define VL_STATUS_OBJECT_NAME_COLLISION  ((NTSTATUS)0xC0000035L)
 // STATUS_OBJECT_PATH_NOT_FOUND -- missing intermediate directory
 #define VL_STATUS_OBJECT_PATH_NOT_FOUND  ((NTSTATUS)0xC000003AL)
 // STATUS_NO_SUCH_FILE -- alternate "not found" used by some Nt calls
@@ -2914,6 +2918,38 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
         CreateDisposition == FILE_OVERWRITE ||
         CreateDisposition == FILE_OVERWRITE_IF)
     {
+        // ---- Sandboxie-style: strict merged namespace collision for FILE_CREATE ----
+        //
+        // FILE_CREATE means "create only if the name is free".  Under a merged
+        // namespace the name is NOT free if the file exists in the real store
+        // (unless a tombstone is hiding it, which means it was deleted inside the
+        // sandbox and really is gone from the merged view).
+        //
+        // Without this check the virtual store is empty, so the kernel happily
+        // creates the file and returns STATUS_SUCCESS.  Explorer never sees a
+        // collision, so:
+        //   • Copying aaa.txt inside the same folder produces a second aaa.txt
+        //     (silently shadowing the real one) instead of "aaa - Copy.txt".
+        //   • Lock-file logic (SQLite, Git, etc.) can be fooled by multiple
+        //     sandboxed processes all succeeding on FILE_CREATE of the same lock.
+        //
+        // Returning STATUS_OBJECT_NAME_COLLISION here is exactly what Sandboxie
+        // does and what the kernel itself would return for a real collision.
+        // Explorer uses that status code to decide to append " - Copy"; cmd.exe
+        // uses it to trigger the "Overwrite? (Yes/No/All)" prompt for move.
+        if (CreateDisposition == FILE_CREATE && !isDir) {
+            // Only probe the real store when there is no tombstone (tombstone
+            // means the file was explicitly deleted inside the sandbox, so the
+            // merged namespace correctly considers it absent).
+            if (!TombstoneExists(redPath)) {
+                BYTE realCollBuf[48] = {0};
+                if (!IsFsNotFound(Real_NtQueryAttributesFile(&realOa, realCollBuf))) {
+                    VL_DBG(L"Hook_NtCreateFile: FILE_CREATE, file exists in real merged NS -> COLLISION");
+                    return VL_STATUS_OBJECT_NAME_COLLISION;
+                }
+            }
+        }
+
         EnsureVirtualFsPath(redPath);
         DeleteTombstoneIfPresent(redPath);
 
@@ -4323,6 +4359,67 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
 
     VL_DBG(L"Hook_NtSetInformationFile: %s dest -> %s",
            isLink ? L"hardlink" : L"rename", redName.c_str());
+
+    // ---- Sandboxie-style: strict merged namespace collision for rename ----
+    //
+    // ReplaceIfExists (the first BOOLEAN in the rename/link info structure)
+    // tells the kernel whether to overwrite an existing destination.
+    //
+    // Under a merged namespace the destination "exists" if it is present
+    // in EITHER the virtual OR the real store (unless a tombstone hides it).
+    // Without this check, renaming over a real-only destination succeeds
+    // silently (the virtual store is empty, so the kernel sees no conflict).
+    // That causes:
+    //   • "move c v" in cmd.exe to complete without the "Overwrite?" prompt.
+    //   • Atomic safe-write patterns (write tmp → rename over original) to
+    //     silently shadow the real original without the app knowing.
+    //
+    // If ReplaceIfExists=FALSE and the destination exists only in the real
+    // store (not tombstoned), we return STATUS_OBJECT_NAME_COLLISION.
+    // MoveFileEx / cmd.exe then handle this the same way they would for a
+    // real collision: cmd prompts, Explorer copies with a new name, etc.
+    //
+    // If ReplaceIfExists=TRUE the caller has already accepted the overwrite;
+    // we let the rename proceed.  The renamed virtual file lands at redName
+    // and naturally shadows the real file at targetLogicalPath — no extra
+    // tombstone needed because the virtual file is already there.
+    //
+    // Hardlinks (isLink=true) always create a new name; ReplaceIfExists
+    // semantics apply the same way, so we check them too.
+    {
+        BOOLEAN replaceIfExists = *(BOOLEAN*)p;
+        if (!replaceIfExists) {
+            // Does the destination exist in the virtual store already?
+            // If so the kernel will return STATUS_OBJECT_NAME_COLLISION
+            // on its own — we don't need to do anything extra.
+            VL_UNICODE_STRING virtDstUs; MakeUStr(&virtDstUs, redName);
+            VL_OBJECT_ATTRIBUTES virtDstOa; MakeOA(&virtDstOa, &virtDstUs);
+            BYTE virtDstBuf[48] = {0};
+            bool virtDstExists = !IsFsNotFound(
+                Real_NtQueryAttributesFile(&virtDstOa, virtDstBuf));
+
+            if (!virtDstExists) {
+                // Virtual store has no file at the destination.
+                // Check whether a tombstone is hiding a deleted real file
+                // (tombstone = caller already deleted it in the sandbox).
+                if (!TombstoneExists(redName)) {
+                    // Check the real store.
+                    VL_UNICODE_STRING realDstUs;
+                    MakeUStr(&realDstUs, targetLogicalPath);
+                    VL_OBJECT_ATTRIBUTES realDstOa;
+                    MakeOA(&realDstOa, &realDstUs);
+                    BYTE realDstBuf[48] = {0};
+                    if (!IsFsNotFound(
+                            Real_NtQueryAttributesFile(&realDstOa, realDstBuf))) {
+                        VL_DBG(L"Hook_NtSetInformationFile: %s dest exists in "
+                               L"real merged NS, ReplaceIfExists=FALSE -> COLLISION",
+                               isLink ? L"hardlink" : L"rename");
+                        return VL_STATUS_OBJECT_NAME_COLLISION;
+                    }
+                }
+            }
+        }
+    }
 
     // Ensure the virtual destination directory exists before the rename/link.
     EnsureVirtualFsPath(redName);
