@@ -11,17 +11,7 @@ REM set VLAUNCHER_DEBUG=true
 
 
 ::_______________________________________________
-
-:: Navigate to the build directory where VirtLauncher is compiled
-if exist "..\build" (
-    cd "..\build"
-) else if exist "build" (
-    cd "build"
-) else (
-    echo [ERROR] Build directory not found. Please compile the project first.
-    pause
-    exit /b 1
-)
+cd "..\build"
 
 :: Auto-detect the launcher to use (prefer 64-bit if available)
 set LAUNCHER=VirtLauncher64.exe

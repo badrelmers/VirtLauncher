@@ -44,32 +44,33 @@ echo [*] Cleaning up existing processes...
 taskkill /f /im %APP32_NAME% /t >nul 2>&1
 taskkill /f /im %APP64_NAME% /t >nul 2>&1
 timeout /t 1 /nobreak >nul
+if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
 
 :: --- Run Tests ---
 echo ______________________________
 :: x64 Launcher Tests
-call :RunTest "x64 Launcher - x64 App (via cmd)" "VirtLauncher64.exe -r HKEY_CURRENT_USER\VirtApp -c redirects.ini cmd /c %TEST64_PATH%" "VirtHook64.dll" "%APP64_NAME%"
+call :RunTest "x64 Launcher - x64 App (via cmd)" "VirtLauncher64.exe -r -f -e cmd /c %TEST64_PATH%" "VirtHook64.dll" "%APP64_NAME%"
 echo ______________________________
-call :RunTest "x64 Launcher - x64 App (Direct)"  "VirtLauncher64.exe -r HKEY_CURRENT_USER\VirtApp -c redirects.ini %TEST64_PATH%" "VirtHook64.dll" "%APP64_NAME%"
+call :RunTest "x64 Launcher - x64 App (Direct)"  "VirtLauncher64.exe -r -f -e %TEST64_PATH%" "VirtHook64.dll" "%APP64_NAME%"
 
 echo ______________________________
 :: x32 Launcher Tests
-call :RunTest "x32 Launcher - x32 App (via cmd)" "VirtLauncher32.exe -r HKEY_CURRENT_USER\VirtApp -c redirects.ini cmd /c %TEST32_PATH%" "VirtHook32.dll" "%APP32_NAME%"
+call :RunTest "x32 Launcher - x32 App (via cmd)" "VirtLauncher32.exe -r -f -e cmd /c %TEST32_PATH%" "VirtHook32.dll" "%APP32_NAME%"
 
 echo ______________________________
-call :RunTest "x32 Launcher - x32 App (Direct)"  "VirtLauncher32.exe -r HKEY_CURRENT_USER\VirtApp -c redirects.ini %TEST32_PATH%" "VirtHook32.dll" "%APP32_NAME%"
+call :RunTest "x32 Launcher - x32 App (Direct)"  "VirtLauncher32.exe -r -f -e %TEST32_PATH%" "VirtHook32.dll" "%APP32_NAME%"
 
 echo ______________________________
 :: Cross-Arch Tests
-call :RunTest "x32 Launcher - x64 App (via cmd)" "VirtLauncher32.exe -r HKEY_CURRENT_USER\VirtApp -c redirects.ini cmd /c %TEST64_PATH%" "VirtHook64.dll" "%APP64_NAME%"
+call :RunTest "x32 Launcher - x64 App (via cmd)" "VirtLauncher32.exe -r -f -e cmd /c %TEST64_PATH%" "VirtHook64.dll" "%APP64_NAME%"
 
 echo ______________________________
-call :RunTest "x32 Launcher - x64 App (Direct)"  "VirtLauncher32.exe -r HKEY_CURRENT_USER\VirtApp -c redirects.ini %TEST64_PATH%" "VirtHook64.dll" "%APP64_NAME%"
+call :RunTest "x32 Launcher - x64 App (Direct)"  "VirtLauncher32.exe -r -f -e %TEST64_PATH%" "VirtHook64.dll" "%APP64_NAME%"
 
 echo ______________________________
-call :RunTest "x64 Launcher - x32 App (via cmd)" "VirtLauncher64.exe -r HKEY_CURRENT_USER\VirtApp -c redirects.ini cmd /c %TEST32_PATH%" "VirtHook32.dll" "%APP32_NAME%"
+call :RunTest "x64 Launcher - x32 App (via cmd)" "VirtLauncher64.exe -r -f -e cmd /c %TEST32_PATH%" "VirtHook32.dll" "%APP32_NAME%"
 echo ______________________________
-call :RunTest "x64 Launcher - x32 App (Direct)"  "VirtLauncher64.exe -r HKEY_CURRENT_USER\VirtApp -c redirects.ini %TEST32_PATH%" "VirtHook32.dll" "%APP32_NAME%"
+call :RunTest "x64 Launcher - x32 App (Direct)"  "VirtLauncher64.exe -r -f -e %TEST32_PATH%" "VirtHook32.dll" "%APP32_NAME%"
 
 :: --- Final Results ---
 echo.
@@ -121,4 +122,6 @@ if %ERRORLEVEL% equ 0 (
 :: Cleanup for next test
 taskkill /f /im %~4 /t >nul 2>&1
 timeout /t 1 /nobreak >nul
+if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
+
 goto :eof

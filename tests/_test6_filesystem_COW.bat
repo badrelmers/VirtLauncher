@@ -27,12 +27,6 @@ for %%F in ("%TEST32_PATH%") do set "APP32_NAME=%%~nxF"
 set /a SUCCESS_COUNT=0
 set /a FAIL_COUNT=0
 
-if not exist "%BUILD_DIR%" (
-    echo [ERROR] Build directory not found. Please build the project first.
-    pause
-    exit /b
-)
-
 cd "%BUILD_DIR%"
 
 echo ============================================================
@@ -121,15 +115,33 @@ if %ERRORLEVEL% EQU 0 (
     echo good
 )
 
+rmdir /Q /S "%CD%\VIRTL"
+rmdir /Q /S "c:\ccc"
 
 echo.
 echo.
 echo ______merged view using TablacusExplorer
 echo press Enter to run TablacusExplorer to test Merged View: 
 echo create a folder in c:\ then refresh c:\ you must see the usual c:\ files + our new folder, if you see only the new folder then Merged View have a Bug
+echo virtual store dir: %CD%\VIRTL
 echo.
+
 pause
+
+:: Extract exe name
+for %%F in ("%TEST64_PATH%") do set "APP64_NAME=%%~nxF"
+for %%F in ("%TEST32_PATH%") do set "APP32_NAME=%%~nxF"
+
+:: 1. Initial Cleanup
+echo [*] Cleaning up existing processes...
+taskkill /f /im %APP32_NAME% /t >nul 2>&1
+taskkill /f /im %APP64_NAME% /t >nul 2>&1
+timeout /t 1 /nobreak >nul
+
 VirtLauncher64.exe -r -f -e "%TEST64_PATH%"
+
+
+rmdir /Q /S "%CD%\VIRTL"
 
 
 

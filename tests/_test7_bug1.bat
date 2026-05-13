@@ -11,6 +11,7 @@ CD /D "%~dp0"
 color 2F
 set "BUILD_DIR=..\build"
 cd "%BUILD_DIR%"
+if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
 
 echo ============================================================
 echo  TEST BUG1: The Relative Path Bug: GetHandleLogicalPath never checks g_FileMap
@@ -27,6 +28,11 @@ echo.
 set "BUG1_REALDIR=c:\vl_bug1_testdir"
 mkdir "%BUG1_REALDIR%" 2>nul
 
+:: Remove any leftover virtual counterpart so the test starts clean
+set "BUG1_VIRTDIR=%CD%\VIRTL\%BUG1_REALDIR::=%"
+if exist "%BUG1_VIRTDIR%" rmdir /S /Q "%BUG1_VIRTDIR%" 2>nul
+
+
 :: Create the virtual dir inside the sandbox (so virtual handle is returned on open)
 VirtLauncher64.exe -f -e cmd /c "mkdir %BUG1_REALDIR%" 2>nul
 
@@ -34,7 +40,7 @@ VirtLauncher64.exe -f -e cmd /c "mkdir %BUG1_REALDIR%" 2>nul
 echo real_content > "%BUG1_REALDIR%\cow_file.txt"
 
 :: Sanity-check: confirm it's NOT in the virtual store
-if exist "%CD%\VIRTL\%BUG1_REALDIR::=%\cow_file.txt" del "%CD%\VIRTL\%BUG1_REALDIR::=%\cow_file.txt"
+if exist "%BUG1_VIRTDIR%\cow_file.txt" del "%BUG1_VIRTDIR%\cow_file.txt"
 
 
 echo ______Bug1: COW read via NT-relative open through virtual dir handle
@@ -75,6 +81,12 @@ if %ERRORLEVEL% EQU 0 (
     @rem [unexpected: basic COW is broken]
     color 4F & echo bad
 )
+
+
+:: Cleanup
+rmdir /S /Q "%BUG1_REALDIR%" 
+rmdir /S /Q "%BUG1_VIRTDIR%" 
+if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
 
 pause
 exit /b

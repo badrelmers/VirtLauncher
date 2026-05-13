@@ -10,8 +10,8 @@ CD /D "%~dp0"
 ::_______________________________________________
 color 2F
 set "BUILD_DIR=..\build"
-copy /y test_bug2.exe "%BUILD_DIR%" >nul 2>&1
 cd "%BUILD_DIR%"
+if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
 
 :: Create the real directory that the test will open (must exist on real FS)
 set "BUG2_REALDIR=c:\vl_bug2_testdir"
@@ -35,7 +35,7 @@ echo.
 @rem echo.
 
 echo ______Bug2: stale read-only dir handle misses virtual file
-VirtLauncher64.exe -f -e test_bug2.exe %BUG2_REALDIR% >nul
+VirtLauncher64.exe -f -e "%~dp0test_bug2.exe" "%BUG2_REALDIR%" >nul
 if %ERRORLEVEL% EQU 0 (
     echo good
 ) else (
@@ -43,7 +43,9 @@ if %ERRORLEVEL% EQU 0 (
 )
 
 :: Cleanup
-rmdir /S /Q "%BUG2_REALDIR%" 2>nul
+rmdir /S /Q "%BUG2_REALDIR%" 
+rmdir /S /Q "%BUG2_VIRTDIR%" 
+if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
 
 pause
 exit /b

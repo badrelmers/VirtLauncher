@@ -8,59 +8,26 @@ CD /D "%~dp0"
 
 
 ::_______________________________________________
+cd "..\build"
+if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
+rmdir /Q /S c:\virtl 2>nul
 
-@rem dont use tasklist to list exe dll, it does not list all dll of x32 exe!! use listdlls
+@rem echo c:\=c:\virtl>"%TEMP%\redir.ini"
+@rem echo d:\=c:\virtl>>"%TEMP%\redir.ini"
+@rem echo e:\=c:\virtl>>"%TEMP%\redir.ini"
+@rem echo f:\=c:\virtl>>"%TEMP%\redir.ini"
 
+echo c:\=c:\virtl\>"%TEMP%\redir.ini"
+echo d:\=c:\virtl>>"%TEMP%\redir.ini"
+echo e:\=c:\virtl\>>"%TEMP%\redir.ini"
+echo f:\=c:\virtl>>"%TEMP%\redir.ini"
 
-:: --- Configuration ---
-set "TEST32_PATH=F:\_bin\_code\_kickstart\____shortcuts\_appz\_explorer\TablacusExplorer\_last\TE32.exe"
-set "TEST64_PATH=F:\_bin\_code\_kickstart\____shortcuts\_appz\_explorer\TablacusExplorer\_last\TE64.exe"
-set "LISTDLLS_EXE=%~dp0ListDlls\listdlls64.exe"
-set "BUILD_DIR=..\build"
+echo virtual store: C:\virtl
+VirtLauncher64.exe -r -c "%TEMP%\redir.ini" -e cmd
 
-@rem ___________________________________________________________
-:: Extract exe name
-for %%F in ("%TEST64_PATH%") do set "APP64_NAME=%%~nxF"
-for %%F in ("%TEST32_PATH%") do set "APP32_NAME=%%~nxF"
-
-:: Counters
-set /a SUCCESS_COUNT=0
-set /a FAIL_COUNT=0
-
-if not exist "%BUILD_DIR%" (
-    echo [ERROR] Build directory not found. Please build the project first.
-    pause
-    exit /b
-)
-
-cd "%BUILD_DIR%"
-
-echo ============================================================
-echo  VirtLauncher Injection Test Suite
-echo ============================================================
-color 2F
-
-set "currdir=%CD%"
-@rem remove :
-set "currdir=%currdir::=%"
-@rem echo currdir: %currdir%
-
-mkdir VIRTL 2>nul
-rmdir /Q /S VIRTL || (echo error & pause & exit)
-
-@rem echo c:\=d:\z1>redir.ini
-@rem echo d:\=d:\z2>>redir.ini
-@rem echo e:\=d:\z3>>redir.ini
-@rem echo f:\=d:\z4>>redir.ini
-
-echo c:\=d:\z1\>redir.ini
-echo d:\=d:\z2\>>redir.ini
-echo e:\=d:\z3\>>redir.ini
-echo f:\=d:\z4\>>redir.ini
-VirtLauncher64.exe -r -c redir.ini -e cmd
-
-
-
+@rem this will not run
+if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
+rmdir /Q /S c:\virtl 2>nul
 pause
 exit
 
