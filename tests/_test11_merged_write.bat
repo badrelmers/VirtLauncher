@@ -19,6 +19,7 @@ rmdir /Q /S "%testdir%" 2>nul
 
 
 
+
 echo __________________1
 rmdir /Q /S "%CD%\VIRTL" 2>nul
 rmdir /Q /S "%testdir%" 2>nul
@@ -78,29 +79,37 @@ if %ERRORLEVEL% EQU 0 (
 )
 
 
-echo __________________3
-@rem The system cannot find the file specified
-
+echo __________________3 1
+@rem test folder overwrite
 rmdir /Q /S "%CD%\VIRTL" 2>nul
 rmdir /Q /S "%testdir%" 2>nul
 
 mkdir "%testdir%\cc"
-mkdir "%testdir%\vv"
-VirtLauncher64.exe -r -f -e cmd /c move "%testdir%\cc" "%testdir%\vv" >nul 2>nul
+mkdir "%testdir%\vv\cc"
+VirtLauncher64.exe -r -f -e cmd /S /C "echo y|move /-Y "%testdir%\cc" "%testdir%\vv" " | findstr Overwrite >nul
 if %ERRORLEVEL% EQU 0 (
     echo good
 ) else (
     color 4F & echo bad
 )
 
+echo __________________3 2
+@rem cc folder should not exist now thanks to the tombstone
+VirtLauncher64.exe -r -f -e cmd /S /C "dir /b "%testdir%" " | findstr cc >nul
+if %ERRORLEVEL% EQU 0 (
+    color 4F & echo bad
+) else (
+    echo good
+)
+
+
 echo __________________4
 @rem The system cannot find the file specified
 
 rmdir /Q /S "%CD%\VIRTL" 2>nul
 rmdir /Q /S "%testdir%" 2>nul
-
 mkdir "%testdir%\cc"
-VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\cc" "%testdir%\vvc" >nul 2>nul
+VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\cc" vvc
 if %ERRORLEVEL% EQU 0 (
     echo good
 ) else (

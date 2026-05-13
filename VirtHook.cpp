@@ -3102,9 +3102,17 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
     // Write CoW on directory: create the virtual directory and open it.
     if (isDir) {
         EnsureVirtualFsPath(redPath);
-        st = Real_NtCreateFile(FileHandle, DesiredAccess, &newOa, IoStatusBlock,
-                                AllocationSize, FileAttributes, ShareAccess,
-                                CreateDisposition, CreateOptions, EaBuffer, EaLength);
+        // When isDir was upgraded from FILE_ATTRIBUTE_DIRECTORY (caller didn't
+        // pass FILE_DIRECTORY_FILE in CreateOptions), force the directory flags
+        // so the kernel creates/opens a directory, not a regular file.
+        ULONG dirCreateOptions = CreateOptions
+                                 | FILE_DIRECTORY_FILE
+                                 | FILE_SYNCHRONOUS_IO_NONALERT;
+        ULONG dirAccess        = DesiredAccess | SYNCHRONIZE;
+        st = Real_NtCreateFile(FileHandle, dirAccess, &newOa, IoStatusBlock,
+                                AllocationSize, FileAttributes | FILE_ATTRIBUTE_DIRECTORY,
+                                ShareAccess, CreateDisposition,
+                                dirCreateOptions, EaBuffer, EaLength);
         if (NT_SUCCESS(st)) {
             VirtFileEntry e;
             e.hVirt = *FileHandle;
@@ -3267,9 +3275,46 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
 
     // Write CoW on directory.
     if (isDir) {
+        // EnsureVirtualFsPath creates the PARENT directory chain but NOT the
+        // target directory itself (it treats the leaf as a file name).
+        // We must explicitly create the virtual directory before opening it,
+        // because NtOpenFile can only OPEN — it cannot create.
+        //
+        // Two-step:
+        //   1. NtCreateFile(FILE_OPEN_IF | FILE_DIRECTORY_FILE) creates the
+        //      virtual directory if absent, or opens it if already there.
+        //      We immediately close this handle; its only job is to materialise
+        //      the directory in the virtual store.
+        //   2. NtOpenFile with the caller's original DesiredAccess + OpenOptions
+        //      (plus FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT so the
+        //      kernel allows opening a directory) gives the caller their handle.
         EnsureVirtualFsPath(redPath);
-        st = Real_NtOpenFile(FileHandle, DesiredAccess, &newOa,
-                              IoStatusBlock, ShareAccess, OpenOptions);
+        {
+            HANDLE hMkdir = NULL;
+            VL_IO_STATUS_BLOCK iosbMkdir = {};
+            VL_UNICODE_STRING virtDirUs; MakeUStr(&virtDirUs, redPath);
+            VL_OBJECT_ATTRIBUTES virtDirOa; MakeOA(&virtDirOa, &virtDirUs);
+            Real_NtCreateFile(&hMkdir,
+                               FILE_LIST_DIRECTORY | SYNCHRONIZE,
+                               &virtDirOa, &iosbMkdir, NULL,
+                               FILE_ATTRIBUTE_DIRECTORY,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               FILE_OPEN_IF,
+                               FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+                               NULL, 0);
+            if (hMkdir) Real_NtClose(hMkdir);
+        }
+        // Open the now-materialised virtual directory for the caller.
+        // Always include FILE_DIRECTORY_FILE + FILE_SYNCHRONOUS_IO_NONALERT so
+        // the kernel accepts a directory handle regardless of what the caller
+        // passed (cmd.exe omits FILE_DIRECTORY_FILE when opening for rename).
+        ULONG dirOpenOptions = OpenOptions
+                               | FILE_DIRECTORY_FILE
+                               | FILE_SYNCHRONOUS_IO_NONALERT;
+        ULONG dirAccess      = DesiredAccess | SYNCHRONIZE;
+        st = Real_NtOpenFile(FileHandle, dirAccess, &newOa,
+                              IoStatusBlock, ShareAccess, dirOpenOptions);
+        VL_DBG(L"Hook_NtOpenFile: write CoW dir, virtual open st=0x%08X", (ULONG)st);
         if (NT_SUCCESS(st)) {
             VirtFileEntry e;
             e.hVirt = *FileHandle;
