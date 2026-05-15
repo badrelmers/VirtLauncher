@@ -1432,19 +1432,29 @@ static bool FileHasTombstoneInVirtDir(const std::wstring& virtDirPath,
                                        const std::wstring& fileName)
 {
     if (virtDirPath.empty() || fileName.empty()) return false;
-    // Strip trailing backslash to prevent double-backslash when e.logPath
-    // was stored with a trailing separator (e.g. \??\c:\test11_merged_write\).
-    // Without this, the probe path becomes "...\test11_merged_write\\cc.vl_deleted"
-    // which NtQueryAttributesFile rejects, so the tombstone is never found and
-    // the deleted entry re-appears in directory listings.
-    const std::wstring& dir = (!virtDirPath.empty() && virtDirPath.back() == L'\\')
-                              ? virtDirPath.substr(0, virtDirPath.size() - 1)
-                              : virtDirPath;
-    std::wstring tp = dir + L"\\" + fileName + L".vl_deleted";
-    VL_UNICODE_STRING us; MakeUStr(&us, tp);
-    VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
-    BYTE dummy[48] = {0};
-    return NT_SUCCESS(Real_NtQueryAttributesFile(&oa, dummy));
+
+    // Build the virtual path of the entry and delegate to TombstoneExists —
+    // the SAME function used by Hook_NtOpenFile's tombstone check.  This
+    // guarantees the path construction is byte-for-byte identical, eliminating
+    // any divergence between what NtOpenFile finds and what NtQueryDirectoryFile
+    // finds.
+    //
+    // Previous implementation built the path separately with Fix A (strip
+    // trailing '\'), but a subtle lifetime issue with the const-ref-to-ternary
+    // could produce wrong results on some call paths.  Delegating to
+    // TombstoneExists is simpler, correct, and consistent.
+    //
+    // Strip ALL trailing backslashes from virtDirPath so we always get exactly
+    // one '\\' between the dir and the fileName component.
+    std::wstring virtEntryPath = virtDirPath;
+    while (!virtEntryPath.empty() && virtEntryPath.back() == L'\\')
+        virtEntryPath.pop_back();
+    if (virtEntryPath.empty()) return false;
+    virtEntryPath += L'\\';
+    virtEntryPath += fileName;
+
+    VL_DBG(L"FileHasTombstoneInVirtDir: probing %s.vl_deleted", virtEntryPath.c_str());
+    return TombstoneExists(virtEntryPath);
 }
 
 // Return true if the filename ends with the tombstone suffix ".vl_deleted".
