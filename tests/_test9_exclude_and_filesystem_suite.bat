@@ -55,15 +55,15 @@ if not exist "%LAUNCHER%" (
 ::    excl_only.ini     [exclude] excl  only  (for --filesystem tests)
 :: ====================================================================
 
-set TEST_DIR=%CD%\_excl_test_ws
-set SRC_DIR=%TEST_DIR%\src
-set DST_DIR=%TEST_DIR%\dst
-set EXCL_DIR=%SRC_DIR%\excl
-set EXCL_SIBLING=%SRC_DIR%\excl_sibling
-set SANDBOX1=%TEST_DIR%\sandbox1
-set SANDBOX2=%TEST_DIR%\sandbox2
-set FULL_INI=%TEST_DIR%\full.ini
-set EXCL_ONLY_INI=%TEST_DIR%\excl_only.ini
+set "TEST_DIR=%CD%\_excl_test_ws"
+set "SRC_DIR=%TEST_DIR%\src"
+set "DST_DIR=%TEST_DIR%\dst"
+set "EXCL_DIR=%SRC_DIR%\excl"
+set "EXCL_SIBLING=%SRC_DIR%\excl_sibling"
+set "SANDBOX1=%TEST_DIR%\sandbox1"
+set "SANDBOX2=%TEST_DIR%\sandbox2"
+set "FULL_INI=%TEST_DIR%\full.ini"
+set "EXCL_ONLY_INI=%TEST_DIR%\excl_only.ini"
 
 :: ---- Compute --filesystem shadow paths --------------------------------
 ::
@@ -75,22 +75,22 @@ set EXCL_ONLY_INI=%TEST_DIR%\excl_only.ini
 ::    _SRC_TAIL     = \build\_excl_test_ws\src
 ::    SHADOW1       = %SANDBOX1%\D\build\_excl_test_ws\src
 ::
-for %%D in ("%SRC_DIR%")     do set _SDRIVE=%%~dD
-set _DL=!_SDRIVE:~0,1!
-set _SRC_TAIL=!SRC_DIR:~2!
-set _EXCL_TAIL=!EXCL_DIR:~2!
-set _EXCL_SIB_TAIL=!EXCL_SIBLING:~2!
+for %%D in ("%SRC_DIR%")     do set "_SDRIVE=%%~dD"
+set "_DL=!_SDRIVE:~0,1!"
+set "_SRC_TAIL=!SRC_DIR:~2!"
+set "_EXCL_TAIL=!EXCL_DIR:~2!"
+set "_EXCL_SIB_TAIL=!EXCL_SIBLING:~2!"
 
 ::  SHADOW1 / SHADOW2  = virtual store copy of SRC_DIR
-set SHADOW1=%SANDBOX1%\!_DL!!_SRC_TAIL!
-set SHADOW2=%SANDBOX2%\!_DL!!_SRC_TAIL!
+set "SHADOW1=%SANDBOX1%\!_DL!!_SRC_TAIL!"
+set "SHADOW2=%SANDBOX2%\!_DL!!_SRC_TAIL!"
 
 ::  EXCL_SHADOW1/2  = where EXCL_DIR *would* land if it were not excluded
-set EXCL_SHADOW1=%SANDBOX1%\!_DL!!_EXCL_TAIL!
-set EXCL_SHADOW2=%SANDBOX2%\!_DL!!_EXCL_TAIL!
+set "EXCL_SHADOW1=%SANDBOX1%\!_DL!!_EXCL_TAIL!"
+set "EXCL_SHADOW2=%SANDBOX2%\!_DL!!_EXCL_TAIL!"
 
 ::  EXCL_SIB_SHADOW2  = where EXCL_SIBLING would land in sandbox2
-set EXCL_SIB_SHADOW2=%SANDBOX2%\!_DL!!_EXCL_SIB_TAIL!
+set "EXCL_SIB_SHADOW2=%SANDBOX2%\!_DL!!_EXCL_SIB_TAIL!"
 
 :: ---- Clean and create workspace ----
 rmdir /s /q "%TEST_DIR%" 2>nul
@@ -364,7 +364,7 @@ echo ============================================================
 
 :: 3.1  Write via -f: must create file in the sandbox shadow, not the real SRC_DIR
 echo ___________________
-%LAUNCHER% -f "%SANDBOX1%" cmd /c "echo FsContent>%SRC_DIR%\fs_write.txt"
+%LAUNCHER% -f "%SANDBOX1%" cmd /S /c "echo FsContent>"%SRC_DIR%\fs_write.txt" "
 if exist "%SHADOW1%\fs_write.txt" (
     if not exist "%SRC_DIR%\fs_write.txt" (
         call :Pass "3.1  FS Write: file created in sandbox shadow, not real SRC_DIR"
@@ -379,7 +379,7 @@ if exist "%SHADOW1%\fs_write.txt" (
 echo ___________________
 mkdir "%SHADOW1%" 2>nul
 echo FsReadContent>"%SHADOW1%\fs_read.txt"
-%LAUNCHER% -f "%SANDBOX1%" cmd /c "findstr FsReadContent %SRC_DIR%\fs_read.txt >nul"
+%LAUNCHER% -f "%SANDBOX1%" cmd /S /c "findstr FsReadContent "%SRC_DIR%\fs_read.txt" >nul"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "3.2  FS Read: sandbox shadow file readable via logical SRC path"
 ) else (
@@ -389,7 +389,7 @@ if !ERRORLEVEL! EQU 0 (
 :: 3.3  if-exist via -f: shadow file must be visible to existence check
 echo ___________________
 echo FsExistContent>"%SHADOW1%\fs_exist.txt"
-%LAUNCHER% -f "%SANDBOX1%" cmd /c "if exist %SRC_DIR%\fs_exist.txt (exit /b 0) else (exit /b 1)"
+%LAUNCHER% -f "%SANDBOX1%" cmd /S /c "if exist "%SRC_DIR%\fs_exist.txt" (exit /b 0) else (exit /b 1)"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "3.3  FS Exist Check: shadow file visible via logical SRC path (NtQueryAttributesFile)"
 ) else (
@@ -399,7 +399,7 @@ if !ERRORLEVEL! EQU 0 (
 :: 3.4  Delete via -f: plant in shadow, delete via logical path, must remove from shadow
 echo ___________________
 echo DeleteMe>"%SHADOW1%\fs_del.txt"
-%LAUNCHER% -f "%SANDBOX1%" cmd /c "del %SRC_DIR%\fs_del.txt"
+%LAUNCHER% -f "%SANDBOX1%" cmd /S /c "del "%SRC_DIR%\fs_del.txt" "
 if not exist "%SHADOW1%\fs_del.txt" (
     call :Pass "3.4  FS Delete: delete via logical path removed file from sandbox shadow"
 ) else (
@@ -411,7 +411,7 @@ if not exist "%SHADOW1%\fs_del.txt" (
 ::      from the truncating create in 3.1.
 echo ___________________
 echo LineOne>"%SHADOW1%\fs_append.txt"
-%LAUNCHER% -f "%SANDBOX1%" cmd /c "echo LineTwo>>%SRC_DIR%\fs_append.txt"
+%LAUNCHER% -f "%SANDBOX1%" cmd /S /c "echo LineTwo>>"%SRC_DIR%\fs_append.txt" "
 findstr "LineTwo" "%SHADOW1%\fs_append.txt" >nul 2>&1
 if !ERRORLEVEL! EQU 0 (
     if not exist "%SRC_DIR%\fs_append.txt" (
@@ -446,7 +446,7 @@ echo ============================================================
 
 :: 4.1  Non-excluded path: write must still land in sandbox shadow2
 echo ___________________
-%LAUNCHER% -f "%SANDBOX2%" -c "%EXCL_ONLY_INI%" cmd /c "echo SandboxContent>%SRC_DIR%\fsexcl_write.txt"
+%LAUNCHER% -f "%SANDBOX2%" -c "%EXCL_ONLY_INI%" cmd /S /c "echo SandboxContent>"%SRC_DIR%\fsexcl_write.txt" "
 if exist "%SHADOW2%\fsexcl_write.txt" (
     if not exist "%SRC_DIR%\fsexcl_write.txt" (
         call :Pass "4.1  FS+Excl Write: non-excluded path correctly goes to sandbox shadow"
@@ -459,7 +459,7 @@ if exist "%SHADOW2%\fsexcl_write.txt" (
 
 :: 4.2  Excluded path: write must bypass sandbox and land on real FS
 echo ___________________
-%LAUNCHER% -f "%SANDBOX2%" -c "%EXCL_ONLY_INI%" cmd /c "echo ExclBypass>%EXCL_DIR%\fsexcl_excl_write.txt"
+%LAUNCHER% -f "%SANDBOX2%" -c "%EXCL_ONLY_INI%" cmd /S /c "echo ExclBypass>"%EXCL_DIR%\fsexcl_excl_write.txt" "
 if exist "%EXCL_DIR%\fsexcl_excl_write.txt" (
     call :Pass "4.2  FS+Excl Bypass Write: excluded path bypasses sandbox, write lands on real FS"
 ) else (
@@ -481,7 +481,7 @@ echo ___________________
 echo RealFileContent>"%EXCL_DIR%\fsexcl_read.txt"
 mkdir "%EXCL_SHADOW2%" 2>nul
 echo DecoyInShadow>"%EXCL_SHADOW2%\fsexcl_read.txt"
-%LAUNCHER% -f "%SANDBOX2%" -c "%EXCL_ONLY_INI%" cmd /c "findstr RealFileContent %EXCL_DIR%\fsexcl_read.txt >nul"
+%LAUNCHER% -f "%SANDBOX2%" -c "%EXCL_ONLY_INI%" cmd /S /c "findstr RealFileContent "%EXCL_DIR%\fsexcl_read.txt" >nul"
 if !ERRORLEVEL! EQU 0 (
     call :Pass "4.4  FS+Excl Read: excluded path returned real FS content, not sandbox decoy"
 ) else (
@@ -492,7 +492,7 @@ if !ERRORLEVEL! EQU 0 (
 echo ___________________
 echo RealDeleteTarget>"%EXCL_DIR%\fsexcl_del.txt"
 echo ShadowDecoy>"%EXCL_SHADOW2%\fsexcl_del.txt"
-%LAUNCHER% -f "%SANDBOX2%" -c "%EXCL_ONLY_INI%" cmd /c "del %EXCL_DIR%\fsexcl_del.txt"
+%LAUNCHER% -f "%SANDBOX2%" -c "%EXCL_ONLY_INI%" cmd /S /c "del "%EXCL_DIR%\fsexcl_del.txt" "
 if not exist "%EXCL_DIR%\fsexcl_del.txt" (
     if exist "%EXCL_SHADOW2%\fsexcl_del.txt" (
         call :Pass "4.5  FS+Excl Delete: real file deleted, shadow decoy untouched"
