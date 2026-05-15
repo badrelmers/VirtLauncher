@@ -1432,7 +1432,15 @@ static bool FileHasTombstoneInVirtDir(const std::wstring& virtDirPath,
                                        const std::wstring& fileName)
 {
     if (virtDirPath.empty() || fileName.empty()) return false;
-    std::wstring tp = virtDirPath + L"\\" + fileName + L".vl_deleted";
+    // Strip trailing backslash to prevent double-backslash when e.logPath
+    // was stored with a trailing separator (e.g. \??\c:\test11_merged_write\).
+    // Without this, the probe path becomes "...\test11_merged_write\\cc.vl_deleted"
+    // which NtQueryAttributesFile rejects, so the tombstone is never found and
+    // the deleted entry re-appears in directory listings.
+    const std::wstring& dir = (!virtDirPath.empty() && virtDirPath.back() == L'\\')
+                              ? virtDirPath.substr(0, virtDirPath.size() - 1)
+                              : virtDirPath;
+    std::wstring tp = dir + L"\\" + fileName + L".vl_deleted";
     VL_UNICODE_STRING us; MakeUStr(&us, tp);
     VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
     BYTE dummy[48] = {0};
@@ -4504,6 +4512,29 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
     // Ensure the virtual destination directory exists before the rename/link.
     EnsureVirtualFsPath(redName);
 
+    // ---- Capture source logical path BEFORE the rename ----
+    //
+    // After Real_NtSetInformationFile returns, the kernel has already updated
+    // the file object's internal name to the new (destination) name.
+    // GetHandleLogicalPath(FileHandle) would therefore return the NEW path,
+    // not the old one — making tombstone placement impossible.
+    //
+    // Solution: look up the file entry now (before the rename) to capture
+    // e.logPath, which still holds the source's logical path (e.g. \??\c:\test11_merged_write\cc).
+    // We also derive its virtual-store path (redSrcPath) here for the same reason.
+    std::wstring preSrcLogical, preSrcRedPath;
+    if (!isLink) {
+        VirtFileEntry srcEntry;
+        if (GetFileEntry(FileHandle, srcEntry) && !srcEntry.logPath.empty()) {
+            preSrcLogical = srcEntry.logPath;
+            preSrcRedPath = ApplyFsRedirect(preSrcLogical);
+        } else {
+            // Fall back to NtQueryObject (works before rename)
+            preSrcLogical = GetHandleLogicalPath(FileHandle);
+            preSrcRedPath = ApplyFsRedirect(preSrcLogical);
+        }
+    }
+
     ULONG newNameBytes = (ULONG)(redName.size() * sizeof(WCHAR));
     ULONG newLength    = RENAME_INFO_NAME_OFFSET + newNameBytes;
     std::vector<BYTE> buf(newLength, 0);
@@ -4524,36 +4555,29 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
     // its old name (it was atomically moved to the destination in the virtual
     // store).  But if the source name also exists in the REAL store, it will
     // re-emerge in the merged view immediately — cmd.exe then sees the entry
-    // still present, retries the rename, succeeds again (vvc now exists in
-    // virtual → collision on the 2nd try) and prints "A duplicate file name
-    // exists, or the file cannot be found." four times.
+    // still present, retries the rename, and gets errors.
     //
-    // Fix: place a tombstone for the source's virtual path so the real entry
-    // is hidden from the merged namespace.  Also clear any stale tombstone
-    // that might be blocking the destination (it now exists in virtual).
-    if (NT_SUCCESS(stRename) && !isLink) {
-        // Get the source's logical path from the handle.
-        std::wstring srcLogical = GetHandleLogicalPath(FileHandle);
-        if (!srcLogical.empty()) {
-            std::wstring redSrcPath = ApplyFsRedirect(srcLogical);
-            if (redSrcPath != srcLogical) {
-                // Does the source name still exist in the real store?
-                // (It always does for real-only entries; for virtual-only
-                // entries the real probe returns NOT_FOUND and we skip.)
-                VL_UNICODE_STRING realSrcUs; MakeUStr(&realSrcUs, srcLogical);
-                VL_OBJECT_ATTRIBUTES realSrcOa; MakeOA(&realSrcOa, &realSrcUs);
-                BYTE realSrcBuf[48] = {0};
-                if (!IsFsNotFound(Real_NtQueryAttributesFile(&realSrcOa, realSrcBuf))) {
-                    VL_DBG(L"Hook_NtSetInformationFile: rename OK, "
-                           L"tombstoning real source %s", redSrcPath.c_str());
-                    EnsureVirtualFsPath(redSrcPath);
-                    CreateTombstone(redSrcPath);
-                }
-                // Remove any stale tombstone on the destination — the
-                // virtual file now exists there.
-                DeleteTombstoneIfPresent(redName);
-            }
+    // We use preSrcLogical / preSrcRedPath captured BEFORE the rename call
+    // (not GetHandleLogicalPath after), because the kernel updates the file
+    // object's name atomically during the rename — any post-rename query
+    // returns the NEW name, not the old one.
+    if (NT_SUCCESS(stRename) && !isLink && !preSrcLogical.empty()
+        && preSrcRedPath != preSrcLogical)
+    {
+        // Probe the real store to see if the old source name still exists.
+        // For real-only entries it always will; for virtual-only entries
+        // the probe returns NOT_FOUND and we correctly skip the tombstone.
+        VL_UNICODE_STRING realSrcUs; MakeUStr(&realSrcUs, preSrcLogical);
+        VL_OBJECT_ATTRIBUTES realSrcOa; MakeOA(&realSrcOa, &realSrcUs);
+        BYTE realSrcBuf[48] = {0};
+        if (!IsFsNotFound(Real_NtQueryAttributesFile(&realSrcOa, realSrcBuf))) {
+            VL_DBG(L"Hook_NtSetInformationFile: rename OK, tombstoning real source %s",
+                   preSrcRedPath.c_str());
+            EnsureVirtualFsPath(preSrcRedPath);
+            CreateTombstone(preSrcRedPath);
         }
+        // Remove any stale tombstone on the destination — it now exists in virtual.
+        DeleteTombstoneIfPresent(redName);
     }
 
     return stRename;
