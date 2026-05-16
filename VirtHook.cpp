@@ -3700,13 +3700,43 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
                             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
         }
         if (!hNewVirt) {
-            // Virtual dir still doesn't exist - nothing to merge.
-            VL_DBG(L"Hook_NtQueryDirectoryFile: isRealOnly dir, no virtual counterpart yet: %s",
+            // Virtual dir still doesn't exist — pass through to real, but
+            // still filter tombstoned entries.  Without this, cmd.exe's rename
+            // command caches "cc" from the pre-rename isRealOnly enumeration,
+            // then after the rename it tries to open the cached entry, gets
+            // NOT_FOUND (tombstone), and prints an error for each cached hit.
+            //
+            // We must handle both ReturnSingleEntry paths here:
+            //   - FALSE: loop until we get a non-tombstoned entry or exhaustion
+            //   - TRUE:  loop until we get a non-tombstoned entry or exhaustion
+            VL_DBG(L"Hook_NtQueryDirectoryFile: isRealOnly dir, tombstone-filtered pass-through: %s",
                    e.logPath.c_str());
-            return Real_NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
-                                              IoStatusBlock, FileInformation, Length,
-                                              FileInformationClass, ReturnSingleEntry,
-                                              FileName, RestartScan);
+            const std::wstring virtDirPathRT = ApplyFsRedirect(e.logPath);
+            BOOLEAN restart = RestartScan;
+            while (true) {
+                NTSTATUS st = Real_NtQueryDirectoryFile(
+                    FileHandle, Event, ApcRoutine, ApcContext,
+                    IoStatusBlock, FileInformation, Length,
+                    FileInformationClass, ReturnSingleEntry,
+                    FileName, restart);
+                restart = FALSE; // only restart on first call
+                if (!NT_SUCCESS(st)) return st;
+
+                if (!virtDirPathRT.empty()) {
+                    if (ReturnSingleEntry) {
+                        // Single-entry: check just this one name
+                        std::wstring name = ExtractDirFileName(FileInformation, FileInformationClass);
+                        if (!name.empty() && IsTombstoneName(name)) continue;
+                        if (!name.empty() && FileHasTombstoneInVirtDir(virtDirPathRT, name))
+                            continue;
+                    } else {
+                        // Multi-entry: filter the whole buffer in-place
+                        FilterDirBuffer(FileInformation, Length, FileInformationClass,
+                                        nullptr, virtDirPathRT);
+                    }
+                }
+                return st;
+            }
         }
         // Virtual dir now exists - upgrade to merged view.
         // FileHandle IS the real handle (hVirt==hReal==FileHandle for isRealOnly).
@@ -3991,11 +4021,33 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
                             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
         }
         if (!hNewVirt) {
-            VL_DBG(L"Hook_NtQueryDirectoryFileEx: isRealOnly dir, no virtual counterpart yet: %s",
-                   e.logPath.c_str());
-            return Real_NtQueryDirectoryFileEx(FileHandle, Event, ApcRoutine, ApcContext,
-                                                IoStatusBlock, FileInformation, Length,
-                                                FileInformationClass, QueryFlags);
+            // Virtual dir still doesn't exist — pass through with tombstone filtering.
+            const std::wstring virtDirPathRT = ApplyFsRedirect(e.logPath);
+            bool singleEntry = (QueryFlags & 0x1) != 0; // SL_RETURN_SINGLE_ENTRY
+            ULONG qFlagsRestart = QueryFlags | 0x2;     // SL_RESTART_SCAN for first call
+            bool firstCall = true;
+            while (true) {
+                NTSTATUS st = Real_NtQueryDirectoryFileEx(
+                    FileHandle, Event, ApcRoutine, ApcContext,
+                    IoStatusBlock, FileInformation, Length,
+                    FileInformationClass,
+                    firstCall ? qFlagsRestart : QueryFlags);
+                firstCall = false;
+                if (!NT_SUCCESS(st)) return st;
+
+                if (!virtDirPathRT.empty()) {
+                    if (singleEntry) {
+                        std::wstring name = ExtractDirFileName(FileInformation, FileInformationClass);
+                        if (!name.empty() && IsTombstoneName(name)) continue;
+                        if (!name.empty() && FileHasTombstoneInVirtDir(virtDirPathRT, name))
+                            continue;
+                    } else {
+                        FilterDirBuffer(FileInformation, Length, FileInformationClass,
+                                        nullptr, virtDirPathRT);
+                    }
+                }
+                return st;
+            }
         }
         VL_DBG(L"Hook_NtQueryDirectoryFileEx: upgrading isRealOnly dir to merged view: %s",
                e.logPath.c_str());
