@@ -579,6 +579,7 @@ struct VirtFileEntry {
     bool         realEnumDone;   // NtQueryDirectoryFile: real listing exhausted
     bool         realRestartPending; // restart-scan flag for real shadow handle
     bool         hasCachedFileName;  // true once FileName pattern has been saved
+    bool         virtRestartPending; // force virtual handle to use cached pattern on first query
     std::set<std::wstring, CiLess> virtNames;
     std::wstring cachedFileName;     // saved FileName search pattern for 1st real call
 
@@ -587,7 +588,8 @@ struct VirtFileEntry {
         : hVirt(NULL), hReal(NULL),
           isDir(false), isRealOnly(false),
           virtEnumDone(false), realEnumDone(false),
-          realRestartPending(false), hasCachedFileName(false)
+          realRestartPending(false), hasCachedFileName(false),
+          virtRestartPending(false)
     {}
 };
 static std::map<HANDLE, VirtFileEntry> g_FileMap;
@@ -3677,6 +3679,13 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
                                           FileName, RestartScan);
     }
 
+    // FIX 1: Cache the search pattern immediately, BEFORE any early returns
+    if (RestartScan || !e.hasCachedFileName) {
+        e.cachedFileName    = FileName ? FromUStr(FileName) : L"";
+        e.hasCachedFileName = true;
+        UpdateFileEntry(FileHandle, e);
+    }
+
     // ----------------------------------------------------------------
     // Bug 2 fix: isRealOnly directory upgrade.
     //
@@ -3700,15 +3709,8 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
                             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
         }
         if (!hNewVirt) {
-            // Virtual dir still doesn't exist — pass through to real, but
-            // still filter tombstoned entries.  Without this, cmd.exe's rename
-            // command caches "cc" from the pre-rename isRealOnly enumeration,
-            // then after the rename it tries to open the cached entry, gets
-            // NOT_FOUND (tombstone), and prints an error for each cached hit.
-            //
-            // We must handle both ReturnSingleEntry paths here:
-            //   - FALSE: loop until we get a non-tombstoned entry or exhaustion
-            //   - TRUE:  loop until we get a non-tombstoned entry or exhaustion
+            // Virtual dir still doesn't exist — pass through to real, but still
+            // filter tombstoned entries so deleted-in-sandbox files don't appear.
             VL_DBG(L"Hook_NtQueryDirectoryFile: isRealOnly dir, tombstone-filtered pass-through: %s",
                    e.logPath.c_str());
             const std::wstring virtDirPathRT = ApplyFsRedirect(e.logPath);
@@ -3719,18 +3721,15 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
                     IoStatusBlock, FileInformation, Length,
                     FileInformationClass, ReturnSingleEntry,
                     FileName, restart);
-                restart = FALSE; // only restart on first call
+                restart = FALSE;
                 if (!NT_SUCCESS(st)) return st;
-
                 if (!virtDirPathRT.empty()) {
                     if (ReturnSingleEntry) {
-                        // Single-entry: check just this one name
                         std::wstring name = ExtractDirFileName(FileInformation, FileInformationClass);
                         if (!name.empty() && IsTombstoneName(name)) continue;
                         if (!name.empty() && FileHasTombstoneInVirtDir(virtDirPathRT, name))
                             continue;
                     } else {
-                        // Multi-entry: filter the whole buffer in-place
                         FilterDirBuffer(FileInformation, Length, FileInformationClass,
                                         nullptr, virtDirPathRT);
                     }
@@ -3748,10 +3747,8 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
         e.hReal              = FileHandle;
         e.isRealOnly         = false;
         e.virtEnumDone       = false;
-        e.realEnumDone       = false;
-        e.realRestartPending = true;
-        e.virtNames.clear();
-        e.hasCachedFileName  = false;
+        e.virtRestartPending = true; // Force hVirt to initialize with the cached pattern
+        // DO NOT reset e.realRestartPending or clear e.virtNames here!
         UpdateFileEntry(FileHandle, e);
     }
 
@@ -3777,13 +3774,6 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
         }
     }
 
-    // Save the search pattern on the very first call so we can replay it
-    // when we open real-side enumeration later.
-    if (RestartScan || !e.hasCachedFileName) {
-        e.cachedFileName    = FileName ? FromUStr(FileName) : L"";
-        e.hasCachedFileName = true;
-    }
-
     if (RestartScan) {
         e.virtEnumDone       = false;
         e.realEnumDone       = false;
@@ -3799,15 +3789,25 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
     // Multi-entry path  (!ReturnSingleEntry)
     // ---------------------------------------------------------------
     if (!ReturnSingleEntry) {
-        BOOLEAN virtRestart              = RestartScan;
+        // Evaluate restart requirement based on new flag
+        BOOLEAN virtRestart = e.virtRestartPending ? TRUE : RestartScan;
+        e.virtRestartPending = false; 
         BOOLEAN localFileName_consumed   = FALSE;
 
         while (!e.virtEnumDone) {
+            PVL_UNICODE_STRING pVirtFn = localFileName_consumed ? NULL : FileName;
+            VL_UNICODE_STRING virtFnUs;
+            // Provide cached pattern if this is a newly upgraded virtual handle
+            if (virtRestart && !pVirtFn && e.hasCachedFileName && !e.cachedFileName.empty()) {
+                MakeUStr(&virtFnUs, e.cachedFileName);
+                pVirtFn = &virtFnUs;
+            }
+
             NTSTATUS st = Real_NtQueryDirectoryFile(
                 e.hVirt, Event, ApcRoutine, ApcContext,
                 IoStatusBlock, FileInformation, Length,
                 FileInformationClass, FALSE,
-                localFileName_consumed ? NULL : FileName, virtRestart);
+                pVirtFn, virtRestart);
             virtRestart            = FALSE;
             localFileName_consumed = TRUE;
 
@@ -3895,8 +3895,17 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
     // Single-entry path  (ReturnSingleEntry = TRUE)
     // Used by FindFirstFile / FindNextFile — this is the hot path.
     // ---------------------------------------------------------------
-    BOOLEAN restartVirt = RestartScan;
+    BOOLEAN restartVirt = e.virtRestartPending ? TRUE : RestartScan;
+    e.virtRestartPending = false;
     BOOLEAN restartReal = e.realRestartPending ? TRUE : FALSE;
+
+    // Apply cached pattern to a newly upgraded virtual handle
+    VL_UNICODE_STRING virtFnUs;
+    PVL_UNICODE_STRING pVirtFileName = FileName;
+    if (restartVirt && !pVirtFileName && e.hasCachedFileName && !e.cachedFileName.empty()) {
+        MakeUStr(&virtFnUs, e.cachedFileName);
+        pVirtFileName = &virtFnUs;
+    }
 
     // Prepare real-side FileName pointer for the first real query
     VL_UNICODE_STRING realFnUs;
@@ -3913,8 +3922,9 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
                 e.hVirt, Event, ApcRoutine, ApcContext,
                 IoStatusBlock, FileInformation, Length,
                 FileInformationClass, TRUE,
-                FileName, restartVirt);
+                pVirtFileName, restartVirt);
             restartVirt = FALSE;
+            pVirtFileName = NULL; // Clear for subsequent virtual calls
 
             if (NT_SUCCESS(st)) {
                 std::wstring name = ExtractDirFileName(FileInformation, FileInformationClass);
@@ -4022,19 +4032,19 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
         }
         if (!hNewVirt) {
             // Virtual dir still doesn't exist — pass through with tombstone filtering.
+            VL_DBG(L"Hook_NtQueryDirectoryFileEx: isRealOnly dir, tombstone-filtered pass-through: %s",
+                   e.logPath.c_str());
             const std::wstring virtDirPathRT = ApplyFsRedirect(e.logPath);
-            bool singleEntry = (QueryFlags & 0x1) != 0; // SL_RETURN_SINGLE_ENTRY
-            ULONG qFlagsRestart = QueryFlags | 0x2;     // SL_RESTART_SCAN for first call
-            bool firstCall = true;
+            bool singleEntry = (QueryFlags & 0x02u) != 0; // SL_RETURN_SINGLE_ENTRY
+            bool firstCall   = true;
             while (true) {
+                ULONG qf = firstCall ? (QueryFlags | 0x01u) : (QueryFlags & ~0x01u);
+                firstCall = false;
                 NTSTATUS st = Real_NtQueryDirectoryFileEx(
                     FileHandle, Event, ApcRoutine, ApcContext,
                     IoStatusBlock, FileInformation, Length,
-                    FileInformationClass,
-                    firstCall ? qFlagsRestart : QueryFlags);
-                firstCall = false;
+                    FileInformationClass, qf);
                 if (!NT_SUCCESS(st)) return st;
-
                 if (!virtDirPathRT.empty()) {
                     if (singleEntry) {
                         std::wstring name = ExtractDirFileName(FileInformation, FileInformationClass);
@@ -4055,10 +4065,9 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
         e.hReal              = FileHandle;
         e.isRealOnly         = false;
         e.virtEnumDone       = false;
-        e.realEnumDone       = false;
-        e.realRestartPending = true;
-        e.virtNames.clear();
-        e.hasCachedFileName  = false;
+        e.virtRestartPending = true; // force hVirt to use the cached pattern on first query
+        // DO NOT reset realRestartPending, realEnumDone, or virtNames —
+        // preserve enumeration state across the upgrade.
         UpdateFileEntry(FileHandle, e);
     }
 
@@ -4187,7 +4196,8 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
     // ---------------------------------------------------------------
     // Single-entry path
     // ---------------------------------------------------------------
-    ULONG flagsVirt = QueryFlags;
+    ULONG flagsVirt = e.virtRestartPending ? (QueryFlags | 0x01u) : (QueryFlags & ~0x01u);
+    e.virtRestartPending = false;
     ULONG flagsReal = e.realRestartPending ? (QueryFlags | 0x01u) : (QueryFlags & ~0x01u);
 
     while (true) {
@@ -4616,8 +4626,11 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
     // After a successful rename the virtual source entry no longer exists at
     // its old name (it was atomically moved to the destination in the virtual
     // store).  But if the source name also exists in the REAL store, it will
-    // re-emerge in the merged view immediately — cmd.exe then sees the entry
-    // still present, retries the rename, and gets errors.
+    // re-emerge in the merged view immediately.
+    //
+    // Sandbox principle: real files are NEVER moved or deleted.  We only place
+    // a tombstone so the real source is hidden from the merged namespace.
+    // This applies uniformly to both files and directories — no special-casing.
     //
     // We use preSrcLogical / preSrcRedPath captured BEFORE the rename call
     // (not GetHandleLogicalPath after), because the kernel updates the file
