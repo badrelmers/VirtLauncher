@@ -164,9 +164,8 @@ rmdir /Q /S "%testdir%" 2>nul
 
 mkdir "%testdir%\cc"
 mkdir "%testdir%\vvc"
-@rem TODO uncomment this and delete the one below it when the buf is fixeds
-@rem VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\cc" vvc 2>&1 | findstr /C:"A duplicate file name exists" | "%~dp0_bin\wc.exe" -l | findstr /C:"      1"
-VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\cc" vvc 2>&1 | findstr /C:"A duplicate file name exists"
+VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\cc" vvc 2>&1 | findstr /C:"A duplicate file name exists" | "%~dp0_bin\wc.exe" -l | findstr /C:"      1" >nul
+@rem VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\cc" vvc 2>&1 | findstr /C:"A duplicate file name exists"
 if %ERRORLEVEL% EQU 0 (
     echo good
 ) else (
@@ -211,9 +210,8 @@ mkdir "%testdir%"
 echo sdfsdf>"%testdir%\fileee"
 echo sdfsdf>"%testdir%\fileee2"
 @rem it should print one line "A duplicate file name exists" ,not multiple times but just once hence the wc use
-@rem TODO uncomment this and delete the one below it when the buf is fixeds
-@rem VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\fileee" fileee2 2>&1 | findstr /C:"A duplicate file name exists" | "%~dp0_bin\wc.exe" -l | findstr /C:"      1"
-VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\fileee" fileee2 2>&1 | findstr /C:"A duplicate file name exists"
+VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\fileee" fileee2 2>&1 | findstr /C:"A duplicate file name exists" | "%~dp0_bin\wc.exe" -l | findstr /C:"      1" >nul
+@rem VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\fileee" fileee2 2>&1 | findstr /C:"A duplicate file name exists"
 if %ERRORLEVEL% EQU 0 (
     echo good
 ) else (
@@ -238,7 +236,7 @@ echo dsfsd>"%testdir%\cc\ggg"
 @rem pause
 
 @rem it gave error: Invalid path
-VirtLauncher64.exe -r -f -e cmd /c xcopy "%testdir%\cc" "%testdir%\vvc" /I /E /Q /H /R
+VirtLauncher64.exe -r -f -e cmd /c xcopy "%testdir%\cc" "%testdir%\vvc" /I /E /Q /H /R | findstr /C:"1 File(s) copied" | "%~dp0_bin\wc.exe" -l | findstr /C:"      1" >nul
 if %ERRORLEVEL% EQU 0 (
     echo good
 ) else (
@@ -262,7 +260,7 @@ mkdir "%testdir%\vvc"
 echo dsfsd>"%testdir%\cc\ggg"
 echo dsfsd>"%testdir%\vvc\ggg"
 
-VirtLauncher64.exe -r -f -e cmd /S /c "echo y|xcopy "%testdir%\cc" "%testdir%\vvc" /I /E /Q /H /R"
+VirtLauncher64.exe -r -f -e cmd /S /c "echo y|xcopy "%testdir%\cc" "%testdir%\vvc" /I /E /Q /H /R" | findstr /C:"1 File(s) copied" | "%~dp0_bin\wc.exe" -l | findstr /C:"      1" >nul
 if %ERRORLEVEL% EQU 0 (
     echo good
 ) else (
@@ -287,7 +285,7 @@ echo sdfsdf>"%testdir%\fileee"
 @rem pause
 
 @rem the file is copied but it print this error: The file cannot be copied onto itself.
-VirtLauncher64.exe -r -f -e cmd /c copy "%testdir%\fileee" "%testdir%\fileeecopy"
+VirtLauncher64.exe -r -f -e cmd /c copy "%testdir%\fileee" "%testdir%\fileeecopy" | findstr /C:"        1 file(s) copied." | "%~dp0_bin\wc.exe" -l | findstr /C:"      1" >nul
 if %ERRORLEVEL% EQU 0 (
     echo good
 ) else (
@@ -311,7 +309,7 @@ echo sdfsdf>"%testdir%\fileee"
 echo sdfsdf>"%testdir%\fileee2"
 
 @rem the file is copied but it print this error: The file cannot be copied onto itself.
-VirtLauncher64.exe -r -f -e cmd /c copy "%testdir%\fileee" "%testdir%\fileee2" 
+VirtLauncher64.exe -r -f -e cmd /c copy "%testdir%\fileee" "%testdir%\fileee2"  | findstr /C:"        1 file(s) copied." | "%~dp0_bin\wc.exe" -l | findstr /C:"      1" >nul
 if %ERRORLEVEL% EQU 0 (
     echo good
 ) else (
@@ -344,7 +342,7 @@ echo sdfsdf>"%testdir%\fileee"
 @rem pause
 
 @rem it gave this: The directory is not empty.  it should not because the same command without virtuaisation does not do like that!
-VirtLauncher64.exe -r -f -e cmd /S /c "echo y|rmdir /S "%testdir%" "
+VirtLauncher64.exe -r -f -e cmd /S /c "echo y|rmdir /S "%testdir%" " >nul
 if %ERRORLEVEL% EQU 0 (
     echo good
 ) else (

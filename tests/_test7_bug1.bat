@@ -85,7 +85,8 @@ if %ERRORLEVEL% EQU 0 (
 
 :: Cleanup
 rmdir /S /Q "%BUG1_REALDIR%" 
-rmdir /S /Q "%BUG1_VIRTDIR%" 
+@rem BUG1_VIRTDIR folder was never created
+if exist "%BUG1_VIRTDIR%" rmdir /S /Q "%BUG1_VIRTDIR%" 
 if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
 
 pause

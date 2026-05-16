@@ -3740,15 +3740,21 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
         // Virtual dir now exists - upgrade to merged view.
         // FileHandle IS the real handle (hVirt==hReal==FileHandle for isRealOnly).
         // hVirt becomes the new virtual handle; hReal stays as FileHandle.
-        // Reset enumeration state so the merged view starts cleanly.
         VL_DBG(L"Hook_NtQueryDirectoryFile: upgrading isRealOnly dir to merged view: %s",
                e.logPath.c_str());
         e.hVirt              = hNewVirt;
         e.hReal              = FileHandle;
         e.isRealOnly         = false;
-        e.virtEnumDone       = false;
-        e.virtRestartPending = true; // Force hVirt to initialize with the cached pattern
-        // DO NOT reset e.realRestartPending or clear e.virtNames here!
+        // The virtual dir was just created by a CoW triggered during this
+        // enumeration session (e.g. by opening an entry for rename/delete).
+        // Its only content is CoW copies of files the real side already yielded.
+        // Setting virtEnumDone=true skips the virtual side entirely so those
+        // files are not presented a second time, which would cause cmd.exe to
+        // attempt (and fail) the same rename twice, printing the error twice.
+        e.virtEnumDone       = true;
+        e.virtRestartPending = false;
+        // DO NOT reset e.realRestartPending or clear e.virtNames here —
+        // preserve the real handle's enumeration position across the upgrade.
         UpdateFileEntry(FileHandle, e);
     }
 
@@ -4064,8 +4070,10 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
         e.hVirt              = hNewVirt;
         e.hReal              = FileHandle;
         e.isRealOnly         = false;
-        e.virtEnumDone       = false;
-        e.virtRestartPending = true; // force hVirt to use the cached pattern on first query
+        // Same reasoning as NtQueryDirectoryFile: the virtual dir was created by
+        // a CoW during this enumeration; skip it to avoid re-yielding CoW copies.
+        e.virtEnumDone       = true;
+        e.virtRestartPending = false;
         // DO NOT reset realRestartPending, realEnumDone, or virtNames —
         // preserve enumeration state across the upgrade.
         UpdateFileEntry(FileHandle, e);
@@ -4298,6 +4306,35 @@ static NTSTATUS NTAPI Hook_NtQueryInformationFile(
     return st;
 }
 
+// ---- Win32RecursiveDeleteContentsNoHook ----
+// Deletes all contents of a directory (not the directory itself) using raw
+// Win32 calls.  Must be called with SetReentrant(true) active so our NT hooks
+// do not intercept the Win32 → Nt call chain and try to redirect paths that
+// are already physical virtual-store paths.
+//
+// Purpose: before the kernel's delete-on-close fires on a virtual directory,
+// we must evacuate any tombstone files (.vl_deleted) we placed inside it.
+// The kernel refuses to delete a non-empty directory, which causes rmdir /S
+// to fail with "The directory is not empty" even though from the sandbox's
+// point of view the directory was already empty.
+static void Win32RecursiveDeleteContentsNoHook(const std::wstring& win32Dir) {
+    std::wstring pattern = win32Dir + L"\\*";
+    WIN32_FIND_DATAW fd = {};
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        std::wstring child = win32Dir + L"\\" + fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            Win32RecursiveDeleteContentsNoHook(child);
+            RemoveDirectoryW(child.c_str());
+        } else {
+            DeleteFileW(child.c_str());
+        }
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+}
+
 // ---- NtSetInformationFile -- intercepts rename, hardlink, and delete-on-close ----
 //
 // Both FILE_RENAME_INFORMATION and FILE_LINK_INFORMATION embed a target
@@ -4356,7 +4393,10 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
         BOOLEAN deleteOnClose = *(BOOLEAN*)FileInformation;
         if (deleteOnClose) {
             VirtFileEntry e;
-            if (GetFileEntry(FileHandle, e) && !e.isRealOnly && !e.isDir && !e.logPath.empty()) {
+            // Removed the old !e.isDir guard: directories also need tombstones
+            // when deleted, otherwise the real directory reappears in the merged
+            // view as soon as the virtual copy is gone.
+            if (GetFileEntry(FileHandle, e) && !e.isRealOnly && !e.logPath.empty()) {
                 std::wstring redPath = ApplyFsRedirect(e.logPath);
                 VL_UNICODE_STRING realUs; MakeUStr(&realUs, e.logPath);
                 VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realUs);
@@ -4364,6 +4404,29 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
                 if (!IsFsNotFound(Real_NtQueryAttributesFile(&realOa, basicBuf))) {
                     EnsureVirtualFsPath(redPath);
                     CreateTombstone(redPath);
+
+                    // Directories only: the virtual copy may contain .vl_deleted
+                    // tombstone files left by sandbox-level deletion of the
+                    // directory's contents (e.g. rmdir /S deletes files first,
+                    // each creating a tombstone, THEN deletes the directory).
+                    // The kernel refuses to delete a non-empty directory and
+                    // returns STATUS_DIRECTORY_NOT_EMPTY, which propagates to
+                    // cmd.exe as "The directory is not empty".
+                    //
+                    // Fix: evacuate all tombstone files (and any other virtual
+                    // content) from the virtual directory before calling
+                    // Real_NtSetInformationFile so the kernel sees an empty dir
+                    // and can apply delete-on-close successfully.
+                    // The tombstone we just created at the PARENT level (above)
+                    // is enough to keep the real directory masked.
+                    if (e.isDir) {
+                        std::wstring win32VirtDir = NtPathToWin32(redPath);
+                        SetReentrant(true);
+                        Win32RecursiveDeleteContentsNoHook(win32VirtDir);
+                        SetReentrant(false);
+                        VL_DBG(L"Hook_NtSetInformationFile: evacuated virtual dir before delete-on-close: %s",
+                               win32VirtDir.c_str());
+                    }
                 }
             }
         }
