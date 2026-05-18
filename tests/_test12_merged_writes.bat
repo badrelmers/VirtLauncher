@@ -134,7 +134,7 @@ call :Pass "3.1 Rename Real File to New Name"
 :skip5
 
 @rem this test fail even in sandboxie so i will not fix it now in my code
-goto :skip6
+goto :bypasss
 
 echo __________________3.2 Rename Real Folder to New Folder ---
 call :ResetEnv
@@ -146,6 +146,7 @@ call :AssertFileExists "%virt_testdir%\new_dir\data.txt" || goto :skip6
 call :AssertFileExists "%virt_testdir%\ren_dir.vl_deleted" || goto :skip6
 call :Pass "3.2 Rename Real Folder to New Folder"
 :skip6
+:bypasss
 
 echo __________________3.3 Rename Real File to Existing Real File (Collision) ---
 call :ResetEnv
