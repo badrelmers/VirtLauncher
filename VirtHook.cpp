@@ -1,5 +1,7 @@
+// Copyright 2026 Badr Elmers, https://github.com/badrelmers
+// 
 // ============================================================
-// VirtHook.cpp  - VirtLauncher Hook DLL  (v12 - console title fix)
+// VirtHook.cpp  - VirtLauncher Hook DLL
 // Injected into target process by VirtLauncher.exe via Detours
 //
 // Virtualizes:
@@ -61,19 +63,10 @@
 // User-settable flags propagated by VirtLauncher.exe:
 //   VLAUNCHER_DEBUG=1  = enable OutputDebugString logging (--debug)
 //
-// Build x86  (VS2010 x86 command prompt):
-//   cl /nologo /EHsc /O2 /MT /W3 /LD VirtHook.cpp
-//      /I<detours>\include /Fe:VirtHook32.dll
-//      /link /OUT:VirtHook32.dll /DEF:VirtHook.def
-//         <detours>\lib.X86\detours.lib
-//
-// Build x64  (VS2010 x64 command prompt):
-//   cl /nologo /EHsc /O2 /MT /W3 /LD VirtHook.cpp
-//      /I<detours>\include /Fe:VirtHook64.dll
-//      /link /OUT:VirtHook64.dll /DEF:VirtHook.def
-//         <detours>\lib.X64\detours.lib
-//
-// NOTE: MinGW is NOT supported -- Microsoft Detours requires MSVC.
+// ============================================================
+// Build instructions (see BUILD.bat):
+// NOTE: MinGW is NOT supported (Microsoft Detours requires MSVC).
+// 
 // ============================================================
 
 #define WIN32_LEAN_AND_MEAN

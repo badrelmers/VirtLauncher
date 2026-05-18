@@ -1,3 +1,5 @@
+// Copyright 2026 Badr Elmers, https://github.com/badrelmers
+//
 // ============================================================
 // VirtLauncher.cpp  - Application Virtualization Launcher
 //
@@ -8,94 +10,11 @@
 //   https://github.com/microsoft/detours
 //
 // ============================================================
-// Build instructions (see also BUILD.bat):
-//
-//  x86  (VS2010 x86 Native Tools Command Prompt):
-//    cl /nologo /EHsc /O2 /MD /W3 VirtLauncher.cpp
-//       /I<detours>\include /Fe:VirtLauncher32.exe
-//       /link /SUBSYSTEM:CONSOLE
-//       <detours>\lib.X86\detours.lib shlwapi.lib advapi32.lib
-//
-//  x64  (VS2010 x64 Native Tools Command Prompt):
-//    cl /nologo /EHsc /O2 /MD /W3 VirtLauncher.cpp
-//       /I<detours>\include /Fe:VirtLauncher64.exe
-//       /link /SUBSYSTEM:CONSOLE
-//       <detours>\lib.X64\detours.lib shlwapi.lib advapi32.lib
-//
+// Build instructions (see BUILD.bat):
 // NOTE: MinGW is NOT supported (Microsoft Detours requires MSVC).
 //
 // ============================================================
-// Usage:
-//   VirtLauncher.exe [options] --exec <app.exe> [args...]
-//   VirtLauncher.exe [options] <app.exe> [args...]   (legacy, see note below)
-//
-// Options:
-//   --verbose, -v          Print informational messages to stdout.
-//                          Env: VLAUNCHER_VERBOSE=1
-//
-//   --debug, -d            Enable debug logging to DebugView (OutputDebugString).
-//                          Env: VLAUNCHER_DEBUG=1
-//
-//   --exec <app.exe> [args...], -e <app.exe> [args...]
-//                          Explicitly marks the start of the target command.
-//                          Everything after --exec is the application and its
-//                          arguments. Use this when the app name or its args
-//                          could be mistaken for option values (e.g. when using
-//                          -r or -f without a hive/folder and the app name does
-//                          not start with '-').
-//
-//   --registry [HivePath], -r [HivePath]
-//                          Enable registry virtualisation.
-//                          HivePath is consumed only if it looks like a hive
-//                          (starts with HKCU, HKLM, HKEY_, HKU, HKCR, or
-//                          \Registry\).  Default hive: HKCU\VirtLauncher
-//
-//   --filesystem [Folder], -f [Folder]
-//                          Enable filesystem virtualisation using Folder as the
-//                          virtual store root.  Folder is consumed only if it
-//                          looks like a path (drive letter, UNC \\, or .\...).
-//                          Default: .\VIRTL
-//
-//   --config <config.ini>, -c <config.ini>
-//                          Load explicit FS redirect rules from an INI file.
-//                          Takes precedence over --filesystem for matched paths.
-//
-//   --help, -h, /?         Show this help.
-//
-// FS Config File Format  (plain text, UTF-8 or ANSI)  [--config]:
-//   # Comment lines start with # or ;
-//   [redirect]
-//   C:\OriginalPath=D:\RedirectedPath
-//   C:\Program Files\MyApp=E:\Portable\MyApp
-//
-//   [exclude]
-//   C:\Windows
-//   C:\Program Files\CommonApp
-//
-//   Rules:
-//    - One redirect per line, format:  source=destination
-//    - [exclude] entries are plain paths (no '='); those paths are NEVER
-//      virtualised -- reads and writes go directly to the real file system
-//      even when --filesystem or a [redirect] rule would otherwise cover them.
-//      Exclusions are checked before all redirect rules and the FSDIR catch-all.
-//    - Paths are Win32 absolute paths
-//    - Matching is case-insensitive prefix match on NT paths
-//    - Longer/more-specific rules should come first
-//    - Environment variables are NOT expanded
-//
-// Architecture notes:
-//   Use VirtLauncher32.exe for 32-bit target apps.
-//   Use VirtLauncher64.exe for 64-bit target apps.
-//   The launcher auto-detects target bitness and warns on mismatch.
-//   VirtHook32.dll / VirtHook64.dll must be in the same folder
-//   as the launcher EXE.
-//
-// Internal environment variables (set automatically, do not set manually):
-//   VIRTLAUNCHER_REG   NT registry base path passed to VirtHook.dll
-//   VIRTLAUNCHER_FS    Path to the FS redirect config INI for VirtHook.dll
-//   VIRTLAUNCHER_FSDIR Virtual store root folder path for VirtHook.dll
-//   VIRTLAUNCHER_DLL   Absolute path to VirtHook DLL for child injection
-// ============================================================
+
 
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
@@ -308,11 +227,13 @@ static bool LooksLikeFsPath(const wchar_t* s) {
 
 static void PrintUsage(const wchar_t* self) {
     wprintf(L"VirtLauncher - Application Virtualization Launcher\n");
+    wprintf(L"Copyright 2026 Badr Elmers, https://github.com/badrelmers\n");
+
     wprintf(L"Requires VirtHook32.dll / VirtHook64.dll alongside the EXE.\n\n");
 
     wprintf(L"Usage:\n");
-    wprintf(L"  %s [options] --exec <app.exe> [app args...]\n", self);
-    wprintf(L"  %s [options] <app.exe> [app args...]   (see Ambiguity note)\n\n", self);
+    wprintf(L"  VirtLauncher64.exe [options] --exec <app.exe> [app args...]\n");
+    wprintf(L"  VirtLauncher64.exe [options] <app.exe> [app args...]   (see Ambiguity note)\n\n");
 
     wprintf(L"Options:\n");
     wprintf(L"  --verbose, -v\n");
@@ -364,7 +285,7 @@ static void PrintUsage(const wchar_t* self) {
     wprintf(L"        \\\\ (UNC), or .\\ / ..\\ (relative dot-path).\n");
     wprintf(L"  Bare names (e.g. 'cmd', 'notepad') are never consumed as values.\n");
     wprintf(L"  For complete safety use --exec:\n");
-    wprintf(L"    %s -r -f --exec cmd /c echo hello\n\n", self);
+    wprintf(L"    VirtLauncher64.exe -r -f --exec cmd /c echo hello\n\n");
 
     wprintf(L"FS Config file format  (--config):\n");
     wprintf(L"  # Lines starting with # or ; are comments\n");
@@ -378,18 +299,37 @@ static void PrintUsage(const wchar_t* self) {
     wprintf(L"    - One redirect per line: source=destination (Win32 absolute paths)\n");
     wprintf(L"    - Matching is case-insensitive prefix match on NT paths\n");
     wprintf(L"    - List more-specific rules before less-specific ones\n");
+    wprintf(L"    - Environment variables are NOT expanded\n");
     wprintf(L"    - [exclude] paths are never virtualised; reads and writes always\n");
     wprintf(L"      go to the real folder even when --filesystem or [redirect] would\n");
     wprintf(L"      otherwise cover them. Exclusions take priority over all redirects.\n\n");
 
     wprintf(L"Architecture:\n");
-    wprintf(L"  VirtLauncher32.exe + VirtHook32.dll  -> for 32-bit target apps\n");
-    wprintf(L"  VirtLauncher64.exe + VirtHook64.dll  -> for 64-bit target apps\n");
-    wprintf(L"  Detours handles cross-arch (32-bit launcher + 64-bit target) automatically.\n\n");
+    wprintf(L"  Either launcher can target either bitness -- Detours automatically\n");
+    wprintf(L"  selects VirtHook32.dll or VirtHook64.dll to match the target process.\n\n");
+    wprintf(L"  VirtLauncher32.exe -- runs on both 32-bit and 64-bit Windows:\n");
+    wprintf(L"    32-bit OS : can only launch 32-bit target apps (OS limitation)\n");
+    wprintf(L"    64-bit OS : can launch both 32-bit and 64-bit target apps\n\n");
+    wprintf(L"  VirtLauncher64.exe -- runs on 64-bit Windows only:\n");
+    wprintf(L"    64-bit OS : can launch both 32-bit and 64-bit target apps\n\n");
+    wprintf(L"  Both VirtHook32.dll and VirtHook64.dll must be present in the same\n");
+    wprintf(L"  folder as the launcher EXE for cross-arch injection to work.\n\n");
 
     wprintf(L"Environment variables (user-settable):\n");
     wprintf(L"  VLAUNCHER_VERBOSE=1   Same effect as --verbose\n");
     wprintf(L"  VLAUNCHER_DEBUG=1     Same effect as --debug\n\n");
+
+    wprintf(L"Internal environment variables (set automatically, do not set manually):\n");
+    wprintf(L"  VIRTLAUNCHER_REG   NT registry base path passed to VirtHook.dll\n");
+    wprintf(L"  VIRTLAUNCHER_FS    Path to the FS redirect config INI for VirtHook.dll\n");
+    wprintf(L"  VIRTLAUNCHER_FSDIR Virtual store root folder path for VirtHook.dll\n");
+    wprintf(L"  VIRTLAUNCHER_DLL   Absolute path to VirtHook DLL for child injection\n\n");
+    wprintf(L"  This vars are set automatically by the launcher for VirtHook.dll -- do\n");
+    wprintf(L"  not set these manually unless you are doing advanced custom injection.\n\n");
+    
+    wprintf(L"Notes:\n");
+    wprintf(L"  - Run as Administrator if the target requires elevation.\n\n");
+    
 
     wprintf(L"Examples:\n");
     wprintf(L"  # Registry virtualisation with explicit hive\n");
@@ -419,11 +359,6 @@ static void PrintUsage(const wchar_t* self) {
     wprintf(L"  # Full virtualisation: registry + filesystem + verbose output\n");
     wprintf(L"  VirtLauncher64.exe -v -r HKCU\\VirtApp -f D:\\Sandbox --exec installer.exe /SILENT\n\n");
 
-    wprintf(L"Notes:\n");
-    wprintf(L"  - VIRTLAUNCHER_REG, VIRTLAUNCHER_FS, VIRTLAUNCHER_FSDIR, VIRTLAUNCHER_DLL\n");
-    wprintf(L"    are set automatically by the launcher for VirtHook.dll -- do not set\n");
-    wprintf(L"    these manually unless you are doing advanced custom injection.\n");
-    wprintf(L"  - Run as Administrator if the target requires elevation.\n");
 }
 
 // ============================================================
