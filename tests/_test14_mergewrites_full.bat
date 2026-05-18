@@ -2,6 +2,8 @@
 SETLOCAL EnableDelayedExpansion
 CD /D "%~dp0"
 
+mode con | findstr "32766" >nul|| mode con lines=32766 COLS=120 &REM prevent "mode con" from clearing the console
+
 ::_______________________________________________
 REM set VLAUNCHER_VERBOSE=true
 set VLAUNCHER_DEBUG=true
@@ -1328,6 +1330,20 @@ echo __________________ 20.9  rmdir non-existent dir ^(should fail^)
 call :R & mkdir "%T%"
 %EXE% cmd /c rmdir "%T%\nope" >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (call :P) else (call :F)
+
+echo __________________ 20.10  rmdir non-empty dir without /S ^(should fail^)
+@rem sandboxie also have a strange behavior with this test, in sandboxie the first time i run rmdir nothing is printed and an empty folder is created in the virt store, and only the second time i run rmdir it works fine and print: The directory is not empty.!!!
+@rem with virtlauncher the first run it create nonempty.vl_deleted which means that the delete was succuful which wrong , it should fail.
+@rem update: i fixed it
+call :R & mkdir "%T%"
+mkdir "%T%\nonempty"
+echo R>"%T%\nonempty\r.txt"
+%EXE% cmd /c rmdir "%T%\nonempty" 2>&1 | findstr /C:"The directory is not empty." >nul
+if %ERRORLEVEL% EQU 0 (call :P) else (call :F)
+
+REM dir still visible after failed rmdir
+%EXE% cmd /c dir /B "%T%\nonempty" >nul 2>nul
+if %ERRORLEVEL% EQU 0 (call :P) else (call :F)
 
 
 :: ====================================================================

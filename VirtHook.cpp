@@ -4306,6 +4306,58 @@ static NTSTATUS NTAPI Hook_NtQueryInformationFile(
     return st;
 }
 
+// Returns true if the merged (virtual + real) view of a directory is empty.
+// Used to enforce correct rmdir-without-/S semantics: the hook must NOT allow
+// delete-on-close to succeed when the merged directory still has visible entries,
+// even though the virtual CoW copy the kernel sees is always empty.
+//
+// A directory is considered empty in the merged view when:
+//   (a) the virtual store directory has no visible (non-tombstone) entries, AND
+//   (b) every entry in the real directory has a tombstone in the virtual store.
+//
+// Must be called with SetReentrant(true) active so FindFirstFileW does not
+// re-enter the FS hooks.
+static bool IsMergedDirEmpty(const std::wstring& logPath,
+                              const std::wstring& virtNtPath)
+{
+    // Step 1: scan the virtual directory for any visible (non-tombstone) entries.
+    std::wstring win32Virt = NtPathToWin32(virtNtPath);
+    if (!win32Virt.empty()) {
+        WIN32_FIND_DATAW fd = {};
+        HANDLE hFind = FindFirstFileW((win32Virt + L"\\*").c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (wcscmp(fd.cFileName, L".") == 0 ||
+                    wcscmp(fd.cFileName, L"..") == 0) continue;
+                if (IsTombstoneName(fd.cFileName)) continue; // internal marker
+                FindClose(hFind);
+                return false; // visible virtual entry found
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
+    }
+
+    // Step 2: scan the real directory; any entry without a tombstone is visible.
+    std::wstring win32Real = NtPathToWin32(logPath);
+    if (!win32Real.empty()) {
+        WIN32_FIND_DATAW fd = {};
+        HANDLE hFind = FindFirstFileW((win32Real + L"\\*").c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (wcscmp(fd.cFileName, L".") == 0 ||
+                    wcscmp(fd.cFileName, L"..") == 0) continue;
+                if (!FileHasTombstoneInVirtDir(virtNtPath, fd.cFileName)) {
+                    FindClose(hFind);
+                    return false; // real entry visible in merged view
+                }
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
+    }
+
+    return true;
+}
+
 // ---- Win32RecursiveDeleteContentsNoHook ----
 // Deletes all contents of a directory (not the directory itself) using raw
 // Win32 calls.  Must be called with SetReentrant(true) active so our NT hooks
@@ -4402,6 +4454,24 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
                 VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realUs);
                 BYTE basicBuf[48] = {0};
                 if (!IsFsNotFound(Real_NtQueryAttributesFile(&realOa, basicBuf))) {
+
+                    // For directories: verify the merged view is empty BEFORE touching
+                    // the tombstone. rmdir without /S must fail with
+                    // STATUS_DIRECTORY_NOT_EMPTY when the directory has visible content.
+                    // Without this check the hook creates an empty virtual CoW copy and
+                    // the kernel deletes it successfully, bypassing the emptiness guard.
+                    if (e.isDir) {
+                        SetReentrant(true);
+                        bool empty = IsMergedDirEmpty(e.logPath, redPath);
+                        SetReentrant(false);
+                        if (!empty) {
+                            VL_DBG(L"Hook_NtSetInformationFile: dir not empty in merged view, "
+                                   L"returning STATUS_DIRECTORY_NOT_EMPTY for %s",
+                                   e.logPath.c_str());
+                            return (NTSTATUS)0xC0000101L; // STATUS_DIRECTORY_NOT_EMPTY
+                        }
+                    }
+
                     EnsureVirtualFsPath(redPath);
                     CreateTombstone(redPath);
 
@@ -4424,10 +4494,11 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
                         SetReentrant(true);
                         Win32RecursiveDeleteContentsNoHook(win32VirtDir);
                         SetReentrant(false);
-                        VL_DBG(L"Hook_NtSetInformationFile: evacuated virtual dir before delete-on-close: %s",
-                               win32VirtDir.c_str());
+                        VL_DBG(L"Hook_NtSetInformationFile: evacuated virtual dir before "
+                               L"delete-on-close: %s", win32VirtDir.c_str());
                     }
                 }
+
             }
         }
         return Real_NtSetInformationFile(FileHandle, IoStatusBlock,
