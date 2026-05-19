@@ -84,6 +84,14 @@
 #include <set>
 #include <algorithm>
 
+// Export DetourFinishHelperProcess as ordinal 1.
+// Detours requires this for cross-arch (32<->64) injection via rundll32 helper. https://github.com/microsoft/detours/wiki/OverviewHelpers
+#ifdef _WIN64
+#pragma comment(linker, "/EXPORT:DetourFinishHelperProcess,@1")
+#else
+#pragma comment(linker, "/EXPORT:DetourFinishHelperProcess=_DetourFinishHelperProcess@16,@1")
+#endif
+
 // ============================================================
 // Debug logging -- output visible in Sysinternals DebugView
 // (run DebugView as admin before launching VirtLauncher).
