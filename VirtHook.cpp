@@ -1297,6 +1297,60 @@ static bool TombstoneExists(const std::wstring& virtualNtPath) {
     return NT_SUCCESS(Real_NtQueryAttributesFile(&oa, dummy));
 }
 
+// Check whether any ANCESTOR directory of virtualNtPath has a tombstone,
+// meaning a parent folder was deleted inside the sandbox.
+//
+// Example: if C:\test was virtually deleted, TombstoneExists fires for
+// \??\c:\virtl\C\test.vl_deleted.  When a child like C:\test\fileee is
+// accessed directly (not via directory enumeration), we must also return
+// NOT_FOUND -- this function catches that case by walking up the virtual
+// path and probing each ancestor.
+//
+// We stop at the virtual store root (virtRoot) so we never probe above it.
+// The function is intentionally conservative: it stops at the first
+// ancestor tombstone found and returns true immediately.
+static bool AncestorHasTombstone(const std::wstring& virtualNtPath) {
+    if (virtualNtPath.empty()) return false;
+
+    // Determine the virtual store root so we don't probe above it.
+    // We stop when the path has been stripped down to the root.
+    std::wstring virtRoot;
+    for (size_t i = 0; i < g_FsRedirects.size(); ++i) {
+        const std::wstring& to = g_FsRedirects[i].second;
+        if (!to.empty() && StartsWithI(virtualNtPath, to) &&
+            virtualNtPath.size() > to.size())
+        {
+            virtRoot = to;
+            break;
+        }
+    }
+    if (virtRoot.empty() && !g_FsDirNtBase.empty() &&
+        StartsWithI(virtualNtPath, g_FsDirNtBase) &&
+        virtualNtPath.size() > g_FsDirNtBase.size())
+    {
+        virtRoot = g_FsDirNtBase;
+    }
+    if (virtRoot.empty()) return false;
+
+    // Walk up the path, stripping one component at a time, checking
+    // each ancestor for a tombstone until we reach virtRoot.
+    std::wstring check = virtualNtPath;
+    while (true) {
+        size_t last = check.rfind(L'\\');
+        if (last == std::wstring::npos) break;
+        check = check.substr(0, last);
+
+        // Stop once we've reached or gone above the virtual store root
+        if (check.size() <= virtRoot.size()) break;
+
+        if (TombstoneExists(check)) {
+            VL_DBG(L"AncestorHasTombstone: ancestor %s is tombstoned", check.c_str());
+            return true;
+        }
+    }
+    return false;
+}
+
 static void CreateTombstone(const std::wstring& virtualNtPath) {
     if (!Real_NtCreateFile) return;
     std::wstring tp = TombstonePath(virtualNtPath);
@@ -3069,6 +3123,13 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
         return VL_STATUS_OBJECT_NAME_NOT_FOUND;
     }
 
+    // Ancestor tombstone check: if a parent folder was virtually deleted,
+    // children accessed by direct path must also appear as not found.
+    if (AncestorHasTombstone(redPath)) {
+        VL_DBG(L"Hook_NtCreateFile: ancestor tombstone -> NOT_FOUND");
+        return VL_STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
     // Does the real file exist?
     // Fix BUG1: The Relative Path Bug: GetHandleLogicalPath never checks g_FileMap
     // FIX: use realOa (built from ntPath, RootDirectory=NULL) instead of
@@ -3242,6 +3303,13 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
     bool tombstoned = TombstoneExists(redPath);
     if (tombstoned) {
         VL_DBG(L"Hook_NtOpenFile: tombstone -> deleted in sandbox, NOT_FOUND");
+        return VL_STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
+    // Ancestor tombstone check: a child of a virtually-deleted parent must
+    // not be accessible by direct path either.
+    if (AncestorHasTombstone(redPath)) {
+        VL_DBG(L"Hook_NtOpenFile: ancestor tombstone -> NOT_FOUND");
         return VL_STATUS_OBJECT_NAME_NOT_FOUND;
     }
 
@@ -3583,6 +3651,15 @@ static NTSTATUS NTAPI Hook_NtQueryAttributesFile(
         return VL_STATUS_OBJECT_NAME_NOT_FOUND;
     }
 
+    // Check if any ancestor directory was virtually deleted.
+    // Without this, accessing a child path directly (e.g. C:\test\file.txt)
+    // bypasses the parent tombstone and falls through to the real filesystem,
+    // making children of deleted-in-sandbox folders incorrectly visible.
+    if (AncestorHasTombstone(redPath)) {
+        VL_DBG(L"Hook_NtQueryAttributesFile: ancestor tombstone -> NOT_FOUND");
+        return VL_STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
     // CoW read fallback to real.
     VL_DBG(L"Hook_NtQueryAttributesFile: virtual not found, fallback to real");
     return Real_NtQueryAttributesFile(ObjectAttributes, FileInformation);
@@ -3608,6 +3685,11 @@ static NTSTATUS NTAPI Hook_NtQueryFullAttributesFile(
 
     if (TombstoneExists(redPath)) {
         VL_DBG(L"Hook_NtQueryFullAttributesFile: tombstone -> NOT_FOUND");
+        return VL_STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
+    if (AncestorHasTombstone(redPath)) {
+        VL_DBG(L"Hook_NtQueryFullAttributesFile: ancestor tombstone -> NOT_FOUND");
         return VL_STATUS_OBJECT_NAME_NOT_FOUND;
     }
 
@@ -3644,6 +3726,11 @@ static NTSTATUS NTAPI Hook_NtQueryInformationByName(
 
     if (TombstoneExists(redPath)) {
         VL_DBG(L"Hook_NtQueryInformationByName: tombstone -> NOT_FOUND");
+        return VL_STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
+    if (AncestorHasTombstone(redPath)) {
+        VL_DBG(L"Hook_NtQueryInformationByName: ancestor tombstone -> NOT_FOUND");
         return VL_STATUS_OBJECT_NAME_NOT_FOUND;
     }
 

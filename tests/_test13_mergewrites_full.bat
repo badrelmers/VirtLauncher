@@ -603,18 +603,16 @@ call :check_ok "8.1a exit code 0"
 call :check_ok "8.1b folder invisible in sandbox"
 
 :: ---------------------------------------------------------------
-rem TODO fix this:  the parent folder is correctly listed as non existent but i still can read and write its content files
-goto :bypass2
+rem fixed:  the parent folder is correctly listed as non existent but i still can read and write its content files
 echo __________________ 8.2  rmdir /S real folder with contents
 call :reset
 mkdir "%testdir%"
 echo sdfsdf>"%testdir%\fileee"
-%VL% cmd /S /c "echo y|rmdir /S "%testdir%""
+%VL% cmd /S /c "echo y|rmdir /S "%testdir%" " >nul
 call :check_ok "8.2a exit code 0"
 %VL% cmd /c if exist "%testdir%\fileee" exit 1
 call :check_ok "8.2b contents invisible in sandbox"
 call :expect_exists  "%testdir%\fileee"   "8.2c real file untouched on disk"
-:bypass2
 
 :: ---------------------------------------------------------------
 echo __________________ 8.3  rmdir virtual folder
