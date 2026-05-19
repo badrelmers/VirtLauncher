@@ -42,7 +42,7 @@ echo ============================================================
     echo call "%VCVARS%" x86
     echo cd /D "%SRCDIR%"
     echo echo --- cl x86: VirtHook32.dll ---
-    echo cl /nologo /EHsc /O2 /MT /W3 /LD VirtHook.cpp /Fe:VirtHook32.dll /I"%DETOURS_PATH%\include" /link /OUT:VirtHook32.dll "%DETOURS_PATH%\lib.X86\detours.lib"
+    echo cl /nologo /EHsc /O2 /MT /W3 /LD VirtHook.cpp /Fe:VirtHook32.dll /I"%DETOURS_PATH%\include" /link /OUT:VirtHook32.dll "%DETOURS_PATH%\lib.X86\detours.lib" user32.lib
     echo if errorlevel 1 exit /b 1
     
     echo echo --- cl x86: VirtLauncher32.exe ---
@@ -58,7 +58,7 @@ echo ============================================================
     echo call "%VCVARS%" x64
     echo cd /D "%SRCDIR%"
     echo echo --- cl x64: VirtHook64.dll ---
-    echo cl /nologo /EHsc /O2 /MT /W3 /LD VirtHook.cpp /Fe:VirtHook64.dll /I"%DETOURS_PATH%\include" /link /OUT:VirtHook64.dll "%DETOURS_PATH%\lib.X64\detours.lib"
+    echo cl /nologo /EHsc /O2 /MT /W3 /LD VirtHook.cpp /Fe:VirtHook64.dll /I"%DETOURS_PATH%\include" /link /OUT:VirtHook64.dll "%DETOURS_PATH%\lib.X64\detours.lib" user32.lib
     echo if errorlevel 1 exit /b 1
     
     echo echo --- cl x64: VirtLauncher64.exe ---

@@ -5120,17 +5120,18 @@ static BOOL WINAPI Hook_CreateProcessA(
     if (Real_##fn) DetourDetach(reinterpret_cast<PVOID*>(&Real_##fn), Hook_##fn)
 
 // ============================================================
-// Window title prefixing
+// ============================================================
+// Window & Console Title Prefixing Hooks
 //
-// Every top-level window created or renamed inside the virtualized
-// process gets its title prefixed with "@" so the user can instantly
-// tell it is running sandboxed — the same visual cue Sandboxie uses
-// (which prefixes "#").
+// Every top-level, title-bar-bearing window created or renamed inside the
+// virtualized process gets its title prefixed with "@ " so the user can
+// instantly tell it is running sandboxed — the same visual cue Sandboxie
+// uses (which prefixes "#").
 //
 // We hook SIX entry points:
 //   SetWindowTextW / SetWindowTextA    — title changes after creation (GUI apps)
 //   CreateWindowExW / CreateWindowExA  — initial title at creation time (GUI apps)
-//   SetConsoleTitleW / SetConsoleTitleA — console title changes (cmd, PowerShell, etc.)
+//   SetConsoleTitleW / SetConsoleTitleA — console title changes (cmd, PowerShell …)
 //
 // Why SetConsoleTitle* is required:
 //   cmd.exe never calls SetWindowTextW. Its console window is owned by
@@ -5149,13 +5150,112 @@ static BOOL WINAPI Hook_CreateProcessA(
 //      eliminating any un-prefixed flash.
 //
 // Rules (apply to all six hooks equally):
-//   • NULL or empty title  → pass through unchanged (no bare "@" title)
-//   • title already starts with '@' → pass through (avoid double-prefix)
-//   • otherwise → prepend "@ " for readability
+//   • NULL / empty title            → pass through (never produce bare "@ ")
+//   • already starts with "@ "      → pass through (no double-prefix)
+//     NOTE: we check for the full "@ " (with space), not bare '@'.
+//     A title like "@username - App" legitimately starts with '@' and must
+//     still be prefixed to "@ @username - App".
+//
+// Additional guards for SetWindowText* and CreateWindowEx*
+// (NOT needed for SetConsoleTitle* — those only ever affect the console title):
+//   • WS_CHILD set                  → child control (button, label, edit…) → skip
+//   • WS_CAPTION absent             → no visible title bar → skip
+//     (covers tooltips, menus, splash screens, borderless windows)
+//   • GetAncestor(GA_ROOT) != hwnd  → not the root of its hierarchy → skip
+//     (catches MDI child frames and other non-child yet non-root windows;
+//      available since Windows 2000, works on XP+)
+//   • Known system class            → skip
+//     #32768  popup menu,  #32769  desktop,
+//     Tooltips_class32,  Button (defence-in-depth)
+//
+// XP compatibility note:
+//   All APIs used here — GetAncestor, GetWindowLongW, GetClassNameW,
+//   GetWindowLongPtrW — are present in user32.dll on Windows XP and later.
+//   No Vista+ or Windows 8+ API is required.
 // ============================================================
 
+// ---- Shared helpers --------------------------------------------------------
+
+// AlreadyPrefixed: check for the full "@ " prefix, not just bare '@'.
+// A title that legitimately starts with '@' (e.g. "@username - Chat") would
+// be wrongly skipped by a bare '@' test; the full two-char check is exact.
+static inline bool AlreadyPrefixed(LPCWSTR s) {
+    return s && s[0] == L'@' && s[1] == L' ';
+}
+static inline bool AlreadyPrefixed(LPCSTR s) {
+    return s && s[0] == '@' && s[1] == ' ';
+}
+
+// IsRootTitledWindow: returns true only for a live HWND that is a genuine
+// top-level, title-bar-bearing application window.
+// Used by SetWindowText* where we have an actual HWND to interrogate.
+// Available on Windows XP+.
+static bool IsRootTitledWindow(HWND hwnd) {
+    if (!hwnd) return false;
+
+    // Must be the root of its own parent chain.
+    // GetAncestor(GA_ROOT) catches MDI child frames and embedded host windows
+    // that lack WS_CHILD yet are not the root of their hierarchy.
+    // GA_ROOT = 2, available since Windows 2000 / XP.
+    if (GetAncestor(hwnd, GA_ROOT) != hwnd) return false;
+
+    DWORD style = (DWORD)GetWindowLongW(hwnd, GWL_STYLE);
+
+    // Explicit WS_CHILD guard (defence-in-depth alongside GA_ROOT check)
+    if (style & WS_CHILD) return false;
+
+    // Must have a visible title bar — the only place "@" is meaningful.
+    // WS_CAPTION = WS_BORDER | WS_DLGFRAME; present on all Windows versions.
+    if (!(style & WS_CAPTION)) return false;
+
+    // Block known system pseudo-window classes that can be non-child and
+    // occasionally carry WS_CAPTION yet are never real title-bar windows:
+    //   #32768  — popup menu window
+    //   #32769  — desktop window
+    //   Tooltips_class32 — tooltip
+    //   Button  — stray control (defence-in-depth)
+    wchar_t cls[256] = {0};
+    if (GetClassNameW(hwnd, cls, 256)) {
+        if (wcscmp(cls, L"#32768")           == 0 ||
+            wcscmp(cls, L"#32769")           == 0 ||
+            wcscmp(cls, L"Tooltips_class32") == 0 ||
+            wcscmp(cls, L"Button")           == 0)
+            return false;
+    }
+
+    return true;
+}
+
+// IsTopLevelCaptionedStyle: same logic for CreateWindowEx* where the HWND
+// does not exist yet — we can only inspect the style/class arguments.
+static inline bool IsTopLevelCaptionedStyle(DWORD dwStyle, LPCWSTR lpClassName) {
+    if (dwStyle & WS_CHILD)    return false;   // child control
+    if (!(dwStyle & WS_CAPTION)) return false; // no title bar
+    if (!lpClassName)          return true;
+    return (wcscmp(lpClassName, L"#32768")           != 0 &&
+            wcscmp(lpClassName, L"#32769")           != 0 &&
+            wcscmp(lpClassName, L"Tooltips_class32") != 0 &&
+            wcscmp(lpClassName, L"Button")           != 0);
+}
+static inline bool IsTopLevelCaptionedStyleA(DWORD dwStyle, LPCSTR lpClassName) {
+    if (dwStyle & WS_CHILD)    return false;
+    if (!(dwStyle & WS_CAPTION)) return false;
+    if (!lpClassName)          return true;
+    return (strcmp(lpClassName, "#32768")           != 0 &&
+            strcmp(lpClassName, "#32769")           != 0 &&
+            strcmp(lpClassName, "Tooltips_class32") != 0 &&
+            strcmp(lpClassName, "Button")           != 0);
+}
+
+// ---- SetWindowTextW / SetWindowTextA ---------------------------------------
+// SetWindowTextW is called for EVERY control text update (button labels,
+// edit field content, static text, group box captions, etc.) — not only for
+// window titles.  We gate on IsRootTitledWindow before prefixing so that
+// only genuine top-level title-bar windows are affected.
+
 static BOOL WINAPI Hook_SetWindowTextW(HWND hWnd, LPCWSTR lpString) {
-    if (lpString && lpString[0] != L'\0' && lpString[0] != L'@') {
+    if (lpString && lpString[0] != L'\0' && !AlreadyPrefixed(lpString)
+            && IsRootTitledWindow(hWnd)) {
         std::wstring titled = std::wstring(L"@ ") + lpString;
         return Real_SetWindowTextW(hWnd, titled.c_str());
     }
@@ -5163,19 +5263,28 @@ static BOOL WINAPI Hook_SetWindowTextW(HWND hWnd, LPCWSTR lpString) {
 }
 
 static BOOL WINAPI Hook_SetWindowTextA(HWND hWnd, LPCSTR lpString) {
-    if (lpString && lpString[0] != '\0' && lpString[0] != '@') {
+    if (lpString && lpString[0] != '\0' && !AlreadyPrefixed(lpString)
+            && IsRootTitledWindow(hWnd)) {
         std::string titled = std::string("@ ") + lpString;
         return Real_SetWindowTextA(hWnd, titled.c_str());
     }
     return Real_SetWindowTextA(hWnd, lpString);
 }
 
+// ---- CreateWindowExW / CreateWindowExA -------------------------------------
+// CreateWindowEx creates every kind of widget.  lpWindowName is NOT a window
+// title for child controls — it is the button caption, edit placeholder, etc.
+// We have no live HWND yet, so we check the style/class arguments directly.
+// Only non-child windows that have an actual title bar (WS_CAPTION) and are
+// not a known system pseudo-class get the prefix.
+
 static HWND WINAPI Hook_CreateWindowExW(
     DWORD dwExStyle, LPCWSTR lpClassName, LPCWSTR lpWindowName,
     DWORD dwStyle, int X, int Y, int nWidth, int nHeight,
     HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam)
 {
-    if (lpWindowName && lpWindowName[0] != L'\0' && lpWindowName[0] != L'@') {
+    if (lpWindowName && lpWindowName[0] != L'\0' && !AlreadyPrefixed(lpWindowName)
+            && IsTopLevelCaptionedStyle(dwStyle, lpClassName)) {
         std::wstring titled = std::wstring(L"@ ") + lpWindowName;
         return Real_CreateWindowExW(dwExStyle, lpClassName, titled.c_str(),
                                     dwStyle, X, Y, nWidth, nHeight,
@@ -5191,7 +5300,8 @@ static HWND WINAPI Hook_CreateWindowExA(
     DWORD dwStyle, int X, int Y, int nWidth, int nHeight,
     HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam)
 {
-    if (lpWindowName && lpWindowName[0] != '\0' && lpWindowName[0] != '@') {
+    if (lpWindowName && lpWindowName[0] != '\0' && !AlreadyPrefixed(lpWindowName)
+            && IsTopLevelCaptionedStyleA(dwStyle, lpClassName)) {
         std::string titled = std::string("@ ") + lpWindowName;
         return Real_CreateWindowExA(dwExStyle, lpClassName, titled.c_str(),
                                     dwStyle, X, Y, nWidth, nHeight,
@@ -5202,15 +5312,18 @@ static HWND WINAPI Hook_CreateWindowExA(
                                 hWndParent, hMenu, hInstance, lpParam);
 }
 
-// ---- Console title hooks (kernel32) ----
+// ---- SetConsoleTitleW / SetConsoleTitleA ------------------------------------
 // cmd.exe, PowerShell, and any console application call SetConsoleTitleW/A
 // (not SetWindowTextW) to change their window title.  conhost.exe owns the
 // actual HWND, so our SetWindowTextW hook never fires for those callers.
 // These hooks intercept the kernel32 call before it reaches conhost.
+//
+// No HWND / style / class filtering needed here: SetConsoleTitleW/A affects
+// only the console title string and never touches GUI controls.
 
 static BOOL WINAPI Hook_SetConsoleTitleW(LPCWSTR lpConsoleTitle) {
     VL_DBG(L"Hook_SetConsoleTitleW: title=%s", lpConsoleTitle ? lpConsoleTitle : L"(null)");
-    if (lpConsoleTitle && lpConsoleTitle[0] != L'\0' && lpConsoleTitle[0] != L'@') {
+    if (lpConsoleTitle && lpConsoleTitle[0] != L'\0' && !AlreadyPrefixed(lpConsoleTitle)) {
         std::wstring titled = std::wstring(L"@ ") + lpConsoleTitle;
         return Real_SetConsoleTitleW(titled.c_str());
     }
@@ -5219,7 +5332,7 @@ static BOOL WINAPI Hook_SetConsoleTitleW(LPCWSTR lpConsoleTitle) {
 
 static BOOL WINAPI Hook_SetConsoleTitleA(LPCSTR lpConsoleTitle) {
     VL_DBG(L"Hook_SetConsoleTitleA: title=%S", lpConsoleTitle ? lpConsoleTitle : "(null)");
-    if (lpConsoleTitle && lpConsoleTitle[0] != '\0' && lpConsoleTitle[0] != '@') {
+    if (lpConsoleTitle && lpConsoleTitle[0] != '\0' && !AlreadyPrefixed(lpConsoleTitle)) {
         std::string titled = std::string("@ ") + lpConsoleTitle;
         return Real_SetConsoleTitleA(titled.c_str());
     }
@@ -5527,7 +5640,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
         {
             wchar_t existingTitle[1024] = {0};
             DWORD titleLen = GetConsoleTitleW(existingTitle, 1024);
-            if (titleLen > 0 && existingTitle[0] != L'\0' && existingTitle[0] != L'@') {
+            if (titleLen > 0 && existingTitle[0] != L'\0' && !AlreadyPrefixed(existingTitle)) {
                 std::wstring prefixed = std::wstring(L"@ ") + existingTitle;
                 // Call through the trampoline (Real_) so we don't re-enter
                 // the hook; the title we pass already carries the prefix.
