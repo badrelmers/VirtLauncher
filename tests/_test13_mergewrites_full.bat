@@ -41,7 +41,7 @@ if %ERRORLEVEL% EQU 0 (
     color 4F
     rem echo   FAIL: %~1
     echo   FAIL
-    pause
+    rem pause
 )
 goto :eof
 
@@ -56,7 +56,7 @@ if NOT %ERRORLEVEL% EQU 0 (
     color 4F
     rem echo   FAIL: %~1
     echo   FAIL
-    pause
+    rem pause
 )
 goto :eof
 
@@ -71,7 +71,7 @@ if exist "%~1" (
     color 4F
     rem echo   FAIL: %~2  [expected to exist: %~1]
     echo   FAIL
-    pause
+    rem pause
 )
 goto :eof
 
@@ -86,7 +86,7 @@ if not exist "%~1" (
     color 4F
     rem echo   FAIL: %~2  [expected to be absent: %~1]
     echo   FAIL
-    pause
+    rem pause
 )
 goto :eof
 
@@ -102,7 +102,7 @@ if %ERRORLEVEL% EQU 0 (
     color 4F
     rem echo   FAIL: %~3  [expected "%~2" in %~1]
     echo   FAIL
-    pause
+    rem pause
 )
 goto :eof
 
@@ -824,9 +824,8 @@ call :check_ok "11.4a child accessible after parent rename"
 
 
 :: ---------------------------------------------------------------
-rem todo: fix this: when a file residing in the virtual store is deleted , it gets deleted correctly but it prints also: Could Not Find...
+rem fixed: when a file residing in the virtual store is deleted , it gets deleted correctly but it prints also: Could Not Find...
 rem same as 7.5 and 7.2
-goto :bypass3
 echo __________________ 11.5  move then delete at destination
 call :reset
 mkdir "%testdir%"
@@ -837,8 +836,6 @@ echo x>"%testdir%\src"
 call :check_ok "11.5a move-then-delete: dst invisible"
 %VL% cmd /c if exist "%testdir%\src" exit 1
 call :check_ok "11.5b move-then-delete: src still invisible"
-
-:bypass3
 
 :: ---------------------------------------------------------------
 echo __________________ 11.6  copy file, delete original (real), copy still accessible

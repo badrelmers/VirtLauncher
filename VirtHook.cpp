@@ -3911,7 +3911,9 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
                     BYTE* p = (BYTE*)FileInformation;
                     while (p) {
                         std::wstring nm = ExtractDirFileName(p, FileInformationClass);
-                        if (!nm.empty()) e.virtNames.insert(nm);
+                        // FIX: Do not insert tombstone names so that e.virtNames.empty()
+                        // strictly reflects whether real (non-marker) files were yielded.
+                        if (!nm.empty() && !IsTombstoneName(nm)) e.virtNames.insert(nm);
                         ULONG nx = *(ULONG*)p;
                         if (nx == 0) break;
                         p += nx;
@@ -3974,7 +3976,13 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
                 }
                 continue; // all filtered; query again
             }
-            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES) {
+            // FIX: also translate NO_SUCH_FILE -> NO_MORE_FILES when the virtual side
+            // already yielded files (virtNames non-empty).  This prevents cmd.exe from
+            // printing "Could Not Find" after deleting a purely-virtual file: the real
+            // directory has no matching entry so the kernel returns NO_SUCH_FILE, but
+            // Win32 maps that to ERROR_FILE_NOT_FOUND instead of ERROR_NO_MORE_FILES.
+            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES ||
+                (st == VL_STATUS_NO_SUCH_FILE && !e.virtNames.empty())) {
                 e.realEnumDone = true;
                 UpdateFileEntry(FileHandle, e);
                 return VL_STATUS_NO_MORE_FILES;
@@ -4076,7 +4084,16 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
                 return st;
             }
             // FIX: recognise both end-of-dir codes from the real handle
-            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES) {
+            // FIX: also translate NO_SUCH_FILE -> NO_MORE_FILES when the virtual side
+            // already yielded files (virtNames non-empty).  Without this, cmd.exe receives
+            // ERROR_FILE_NOT_FOUND (mapped from NO_SUCH_FILE by Win32) after deleting a
+            // purely-virtual file, and prints the spurious "Could Not Find" message even
+            // though the deletion succeeded.  The guard !e.virtNames.empty() ensures we
+            // only do this translation when enumeration genuinely completed — not when the
+            // file never existed at all (in which case virtNames is empty and the caller
+            // correctly sees ERROR_FILE_NOT_FOUND from the very first FindFirstFile call).
+            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES ||
+                (st == VL_STATUS_NO_SUCH_FILE && !e.virtNames.empty())) {
                 e.realEnumDone = true;
                 UpdateFileEntry(FileHandle, e);
                 return VL_STATUS_NO_MORE_FILES;
@@ -4226,7 +4243,9 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
                     BYTE* p = (BYTE*)FileInformation;
                     while (p) {
                         std::wstring nm = ExtractDirFileName(p, FileInformationClass);
-                        if (!nm.empty()) e.virtNames.insert(nm);
+                        // FIX: Do not insert tombstone names so e.virtNames.empty()
+                        // strictly tracks whether real (non-marker) files were yielded.
+                        if (!nm.empty() && !IsTombstoneName(nm)) e.virtNames.insert(nm);
                         ULONG nx = *(ULONG*)p;
                         if (nx == 0) break;
                         p += nx;
@@ -4278,7 +4297,9 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
                 }
                 continue;
             }
-            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES) {
+            // FIX: also translate NO_SUCH_FILE -> NO_MORE_FILES when virtual side yielded files.
+            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES ||
+                (st == VL_STATUS_NO_SUCH_FILE && !e.virtNames.empty())) {
                 e.realEnumDone = true;
                 UpdateFileEntry(FileHandle, e);
                 return VL_STATUS_NO_MORE_FILES;
@@ -4347,7 +4368,9 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
                 return st;
             }
             // FIX: accept both end-of-dir codes
-            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES) {
+            // FIX: also translate NO_SUCH_FILE -> NO_MORE_FILES when virtual side yielded files.
+            if (st == VL_STATUS_NO_MORE_ENTRIES || st == VL_STATUS_NO_MORE_FILES ||
+                (st == VL_STATUS_NO_SUCH_FILE && !e.virtNames.empty())) {
                 e.realEnumDone = true;
                 UpdateFileEntry(FileHandle, e);
                 return VL_STATUS_NO_MORE_FILES;
