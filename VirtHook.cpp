@@ -5228,19 +5228,32 @@ static bool IsRootTitledWindow(HWND hwnd) {
 
 // IsTopLevelCaptionedStyle: same logic for CreateWindowEx* where the HWND
 // does not exist yet — we can only inspect the style/class arguments.
+//
+// CRITICAL — atom vs string:
+//   lpClassName is NOT always a string pointer. Win32 allows it to be a
+//   class ATOM packed as MAKEINTATOM(atom), i.e. an integer value <= 0xFFFF
+//   cast to LPCWSTR/LPCSTR.  Calling wcscmp/strcmp on such a value would
+//   dereference address 0x0000C000 (or similar) -> immediate access violation.
+//
+//   IS_INTRESOURCE(p) is the standard Win32 test: ((ULONG_PTR)(p) >> 16) == 0
+//   Any pointer whose value fits in 16 bits is an integer/atom, not a string.
+//   Atoms are application-registered class names, never system pseudo-classes
+//   (#32768, Button, etc.), so if we see an atom we can safely allow prefixing
+//   (it will still be guarded by WS_CHILD / WS_CAPTION above).
 static inline bool IsTopLevelCaptionedStyle(DWORD dwStyle, LPCWSTR lpClassName) {
-    if (dwStyle & WS_CHILD)    return false;   // child control
-    if (!(dwStyle & WS_CAPTION)) return false; // no title bar
-    if (!lpClassName)          return true;
+    if (dwStyle & WS_CHILD)      return false;   // child control
+    if (!(dwStyle & WS_CAPTION)) return false;   // no title bar
+    // NULL or atom (MAKEINTATOM) -- not a system pseudo-class, allow through.
+    if (!lpClassName || IS_INTRESOURCE(lpClassName)) return true;
     return (wcscmp(lpClassName, L"#32768")           != 0 &&
             wcscmp(lpClassName, L"#32769")           != 0 &&
             wcscmp(lpClassName, L"Tooltips_class32") != 0 &&
             wcscmp(lpClassName, L"Button")           != 0);
 }
 static inline bool IsTopLevelCaptionedStyleA(DWORD dwStyle, LPCSTR lpClassName) {
-    if (dwStyle & WS_CHILD)    return false;
+    if (dwStyle & WS_CHILD)      return false;
     if (!(dwStyle & WS_CAPTION)) return false;
-    if (!lpClassName)          return true;
+    if (!lpClassName || IS_INTRESOURCE(lpClassName)) return true;
     return (strcmp(lpClassName, "#32768")           != 0 &&
             strcmp(lpClassName, "#32769")           != 0 &&
             strcmp(lpClassName, "Tooltips_class32") != 0 &&

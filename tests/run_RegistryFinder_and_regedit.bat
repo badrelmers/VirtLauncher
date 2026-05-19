@@ -5,6 +5,10 @@ CD /D "%~dp0"
 REM check admin
 fltmc >nul 2>&1 || ( color 4F & echo. & echo RUNME AS ADMIN & echo. & pause & exit )
 
+::_______________________________________________
+REM set VLAUNCHER_VERBOSE=true
+set VLAUNCHER_DEBUG=true
+
 set "RegistryFinder=F:\_bin\_code\_kickstart\____shortcuts\_appz\_Registry editors\RegistryFinder+++++++++\RegistryFinder64\RegistryFinder.exe"
 
 
