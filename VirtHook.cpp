@@ -520,10 +520,20 @@ static bool g_RegEnabled = false;
 static bool g_FsEnabled  = false;
 
 // Registry virtualisation:
-//   g_VirtNtBase = e.g.  \Registry\User\S-1-5-21-x\VirtApp
-//   g_RealNtBase = parent e.g. \Registry\User\S-1-5-21-x
+//   g_VirtNtBase  = e.g.  \Registry\User\S-1-5-21-x\VirtApp
+//   g_RealNtBase  = parent e.g. \Registry\User\S-1-5-21-x
+//   g_HkcuNtBase  = current user's hive root: \Registry\User\S-1-5-21-x
+//                   (same as g_RealNtBase when VirtNtBase is directly under HKCU,
+//                    but correctly derived even for deep paths like HKCU\a\b\c\store)
 static std::wstring g_VirtNtBase;
 static std::wstring g_RealNtBase;
+
+// NT path of the current user's HKCU hive root (\Registry\User\<SID>).
+// Derived from g_VirtNtBase in LoadConfig by stripping everything after the
+// SID component.  Used by LogicalToVirtual to match HKCU paths
+// (\REGISTRY\USER\<SID>\...) case-insensitively regardless of how deep the
+// virtual store key is nested inside HKCU.
+static std::wstring g_HkcuNtBase;
 
 // FS redirections from --config INI: vector of (nt_from_prefix, nt_to_prefix).
 // Checked first; takes precedence over g_FsDirNtBase catch-all below.
@@ -842,44 +852,130 @@ static std::wstring GetFullNtPath(PVL_OBJECT_ATTRIBUTES oa) {
 
 // Compute virtual NT path from logical path.
 //
-// CRITICAL: StartsWithI is a pure prefix check. We must also verify the
-// match ends on a path separator, otherwise the _Classes shadow hive
-// (\Registry\User\S-1-5-21-...-1000_Classes) would match a g_RealNtBase
-// of (\Registry\User\S-1-5-21-...-1000) and every HKCR / COM access would
-// be intercepted, redirected to garbage virtual paths, and crash the app.
+// Routing table (hive-aware, multi-root sandbox):
+//
+//   \REGISTRY\MACHINE\...               -> VirtNtBase\HKEY_LOCAL_MACHINE\...
+//   \REGISTRY\USER\<CurrentSID>\...     -> VirtNtBase\HKEY_CURRENT_USER\...
+//   \REGISTRY\USER\...                  -> VirtNtBase\HKEY_USERS\...
+//                                          (catches other SIDs, .DEFAULT,
+//                                           S-1-5-18, and <CurrentSID>_Classes)
+//
+// Why the three-level scheme covers all Win32 hives transparently:
+//
+//   At the NT API level (NtOpenKey / NtCreateKey), Win32 hives that appear
+//   independent to applications are just NT sub-paths:
+//
+//   HKCR (HKEY_CLASSES_ROOT)
+//     advapi32 presents HKCR as a merged view of two underlying NT paths:
+//       * \REGISTRY\USER\<SID>_Classes      (per-user classes -- HKEY_USERS)
+//       * \REGISTRY\MACHINE\SOFTWARE\Classes (system classes  -- HKEY_LOCAL_MACHINE)
+//     There is NO separate \REGISTRY\CLASSES root; all HKCR NtOpenKey calls
+//     arrive at our hook as one of those two prefixes.
+//
+//   HKCC (HKEY_CURRENT_CONFIG)
+//     Translates to:
+//       \REGISTRY\MACHINE\System\CurrentControlSet\Hardware Profiles\Current
+//     -> caught by HKEY_LOCAL_MACHINE.
+//
+//   HKU (HKEY_USERS)
+//     Translates to: \REGISTRY\USER  -> caught by HKEY_USERS.
+//
+//   Intercepting MACHINE and USER at the NT level therefore covers HKCR,
+//   HKCC, and HKU for free with no extra per-hive logic required.
+//
+// Exact root paths (\REGISTRY\MACHINE, \REGISTRY\USER\<SID>, \REGISTRY\USER)
+// are intentionally SKIPPED (not redirected).  Apps open the hive root to
+// obtain a base handle for relative opens; redirecting those root handles to
+// a virtual subkey would confuse code that inspects root-level key metadata.
+// Sub-key paths are still intercepted via the relative-path open mechanism
+// (GetHandleLogicalPath resolves the parent handle -> full logical path ->
+// LogicalToVirtual redirects the concatenated path).
+//
+// The virtual store root (g_VirtNtBase) is always excluded to prevent
+// infinite recursion when our own internal NtOpenKey/NtCreateKey calls
+// (inside DoVirtOpen, EnsureVirtualPath, etc.) re-enter the hook.
 static bool LogicalToVirtual(const std::wstring& logical, std::wstring& virt) {
     if (!g_RegEnabled) return false;
-    if (!StartsWithI(logical, g_RealNtBase)) {
-        VL_DBG(L"LogicalToVirtual: SKIP (not under RealNtBase) path=%s base=%s",
-               logical.c_str(), g_RealNtBase.c_str());
-        return false;
-    }
 
-    // Path-boundary guard: the char immediately after g_RealNtBase must be
-    // '\' (sub-key) or end-of-string (hive root itself). Anything else (like
-    // '_', letters) means this is a *different* hive that just shares the
-    // same SID prefix (e.g. \Registry\User\<SID>_Classes).
-    size_t baseLen = g_RealNtBase.size();
-    if (logical.size() > baseLen && logical[baseLen] != L'\\') {
-        VL_DBG(L"LogicalToVirtual: SKIP (boundary mismatch) path=%s", logical.c_str());
-        return false;
-    }
-
+    // Already inside the virtual store -- prevent infinite recursion.
     if (StartsWithI(logical, g_VirtNtBase)) {
         VL_DBG(L"LogicalToVirtual: SKIP (already under VirtNtBase) %s", logical.c_str());
         return false;
     }
 
-    std::wstring sub = logical.substr(baseLen);
-    if (sub.empty()) {
-        VL_DBG(L"LogicalToVirtual: SKIP (hive root itself)");
-        return false;
+    // ---- 1. HKLM: \REGISTRY\MACHINE\... --------------------------------
+    static const std::wstring kMachine = L"\\REGISTRY\\MACHINE";
+    if (StartsWithI(logical, kMachine)) {
+        size_t mLen = kMachine.size();
+        // Component-boundary guard: char after prefix must be '\' or end-of-string.
+        // Prevents '\REGISTRY\MACHINEEXTRA' from matching '\REGISTRY\MACHINE'.
+        if (logical.size() > mLen && logical[mLen] != L'\\') {
+            VL_DBG(L"LogicalToVirtual: SKIP (boundary after MACHINE) path=%s", logical.c_str());
+            return false;
+        }
+        std::wstring sub = logical.substr(mLen);
+        if (sub.empty()) {
+            // Path IS the HKLM root -- skip to preserve real root handles.
+            VL_DBG(L"LogicalToVirtual: SKIP (hive root MACHINE itself)");
+            return false;
+        }
+        virt = g_VirtNtBase + L"\\HKEY_LOCAL_MACHINE" + sub;
+        VL_DBG(L"LogicalToVirtual: REDIRECT %s -> %s", logical.c_str(), virt.c_str());
+        return true;
     }
 
-    virt = g_VirtNtBase + sub;
-    VL_DBG(L"LogicalToVirtual: REDIRECT %s -> %s", logical.c_str(), virt.c_str());
-    return true;
+    // ---- 2. HKCU: \REGISTRY\USER\<CurrentSID>\... ----------------------
+    // g_HkcuNtBase = \Registry\User\<SID>  (populated in LoadConfig).
+    // Case-insensitive match: NtQueryObject returns UPPERCASE \REGISTRY\USER\<SID>
+    // while g_HkcuNtBase uses the lowercase form from VIRTLAUNCHER_REG env var.
+    if (!g_HkcuNtBase.empty() && StartsWithI(logical, g_HkcuNtBase)) {
+        size_t hLen = g_HkcuNtBase.size();
+        if (logical.size() > hLen && logical[hLen] != L'\\') {
+            // The character immediately after the SID is not a separator.
+            // This is a DIFFERENT hive whose name shares the SID prefix --
+            // the canonical case is <SID>_Classes (per-user HKCR backing hive).
+            // Fall through to the HKU catch-all so it routes to HKEY_USERS.
+        } else {
+            std::wstring sub = logical.substr(hLen);
+            if (sub.empty()) {
+                // Path IS the HKCU root -- skip to preserve real root handles.
+                VL_DBG(L"LogicalToVirtual: SKIP (hive root HKCU itself)");
+                return false;
+            }
+            virt = g_VirtNtBase + L"\\HKEY_CURRENT_USER" + sub;
+            VL_DBG(L"LogicalToVirtual: REDIRECT %s -> %s", logical.c_str(), virt.c_str());
+            return true;
+        }
+    }
+
+    // ---- 3. HKU + _Classes: \REGISTRY\USER\... -------------------------
+    // Catches everything under \REGISTRY\USER not handled above:
+    //   * \REGISTRY\USER\<CurrentSID>_Classes  (per-user HKCR portion)
+    //   * \REGISTRY\USER\<OtherSID>\...        (other users)
+    //   * \REGISTRY\USER\.DEFAULT              (default profile)
+    //   * \REGISTRY\USER\S-1-5-18             (SYSTEM account)
+    static const std::wstring kUser = L"\\REGISTRY\\USER";
+    if (StartsWithI(logical, kUser)) {
+        size_t uLen = kUser.size();
+        if (logical.size() > uLen && logical[uLen] != L'\\') {
+            VL_DBG(L"LogicalToVirtual: SKIP (boundary after USER) path=%s", logical.c_str());
+            return false;
+        }
+        std::wstring sub = logical.substr(uLen);
+        if (sub.empty()) {
+            // Path IS the HKU root -- skip to preserve real root handles.
+            VL_DBG(L"LogicalToVirtual: SKIP (hive root USER itself)");
+            return false;
+        }
+        virt = g_VirtNtBase + L"\\HKEY_USERS" + sub;
+        VL_DBG(L"LogicalToVirtual: REDIRECT %s -> %s", logical.c_str(), virt.c_str());
+        return true;
+    }
+
+    VL_DBG(L"LogicalToVirtual: SKIP (not under known hive root) path=%s", logical.c_str());
+    return false;
 }
+
 
 // Ensure every component of virtPath exists (creates missing keys)
 static void EnsureVirtualPath(const std::wstring& virtPath) {
@@ -1715,6 +1811,23 @@ static void LoadConfig() {
             g_RealNtBase = g_VirtNtBase.substr(0, sl);
         if (!g_VirtNtBase.empty() && !g_RealNtBase.empty())
             g_RegEnabled = true;
+
+        // Derive g_HkcuNtBase: the \Registry\User\<SID> portion of VirtNtBase.
+        // VirtNtBase is always under HKCU (the only non-admin-writable hive),
+        // so it always begins with \Registry\User\<SID>\<store-subkey...>.
+        // We strip everything from the 4th backslash onward to get the SID hive:
+        //   \Registry\User\S-1-5-21-...-1000\VirtLauncher\...
+        //   ^0       ^9   ^14               ^sidEnd
+        // If the VirtNtBase path is not under \Registry\User\ (unusual), the
+        // derivation is skipped and g_HkcuNtBase stays empty, which disables the
+        // HKCU-specific routing in LogicalToVirtual (HKLM and HKU still work).
+        const std::wstring kRegUserPfx = L"\\Registry\\User\\";
+        if (StartsWithI(g_VirtNtBase, kRegUserPfx)) {
+            size_t sidEnd = g_VirtNtBase.find(L'\\', kRegUserPfx.size());
+            if (sidEnd != std::wstring::npos)
+                g_HkcuNtBase = g_VirtNtBase.substr(0, sidEnd);
+            // else: VirtNtBase IS the user root itself (degenerate) – stay empty
+        }
     }
 
     // ---- FS redirect config file (VIRTLAUNCHER_FS, from --config) ----
@@ -1754,7 +1867,8 @@ static void LoadConfig() {
     VL_DBG(L"LoadConfig: DebugEnabled=%d", (int)g_DebugEnabled);
     VL_DBG(L"LoadConfig: RegEnabled=%d  VirtNtBase=%s",
            (int)g_RegEnabled, g_VirtNtBase.c_str());
-    VL_DBG(L"LoadConfig:             RealNtBase=%s", g_RealNtBase.c_str());
+    VL_DBG(L"LoadConfig:             RealNtBase=%s  HkcuNtBase=%s",
+           g_RealNtBase.c_str(), g_HkcuNtBase.c_str());
     VL_DBG(L"LoadConfig: FsEnabled=%d  redirects=%u  excludes=%u  FsDirNtBase=%s",
            (int)g_FsEnabled, (unsigned)g_FsRedirects.size(),
            (unsigned)g_FsExcludes.size(), g_FsDirNtBase.c_str());
