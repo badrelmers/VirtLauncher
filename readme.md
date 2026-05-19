@@ -1,4 +1,4 @@
-# VirtLauncher.cpp  - Application Virtualization Launcher
+# VirtLauncher - Application Virtualization Launcher
 Launches an application with a virtual file system and virtual registry by injecting VirtHook[32|64].dll.
 
 
@@ -10,4 +10,4 @@ Launches an application with a virtual file system and virtual registry by injec
 NOTE: MinGW is NOT supported (Microsoft Detours requires MSVC).
 
 
-Copyright 2026 Badr Elmers, https://github.com/badrelmers
+Copyright (c) 2026 Badr Elmers, https://github.com/badrelmers/VirtLauncher
