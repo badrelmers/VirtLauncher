@@ -12,6 +12,13 @@
 ::    - NtQueryMultipleValueKey is all-or-nothing (no per-value fallback).
 
 
+☐ powershell crash
+
+
+☐ One secondary gap found (same class of bug, FS side): Hook_NtQueryInformationFile — class 21 (FileAllInformation) is not handled. It embeds a FILE_NAME_INFORMATION at a fixed offset of 96 bytes that would return a virtual-store volume-relative path. The existing class 9 code already applies ReverseApplyFsRedirect using the same pattern, so class 21 needs the exact same treatment. Class 48 (FileNormalizedNameInformation) has a different format (device path, not volume-relative) so ReverseApplyFsRedirect can't handle it without deeper changes — I'll note it but leave it alone. https://claude.ai/chat/4a7f5ba9-bcdd-4314-a8e7-55395551d219   badr2351
+
+☐ add mingw compile https://github.com/microsoft/Detours/blob/f4c0fc91b8a93fc09ccbbd6e4277efe6872784fe/src/detours.h#L53
+
 ☐ add to the doc and help a reminder to users saying: to keep the virtual store short to prevent 255 charachter limit in old os where 32k is not supported so echo and cmd do not have problems inside the virtual world, for example  _test9_exclude_and_filesystem_suite.bat gave multiple errors when virtual folder is inside this long path "F:\_bin\_src\_launcher_virtualization\__VirtLauncher\_testsss\files\final2_fix_rename - Copy - Copyffffffffffffffffffffffffffffffffffffffffffffff\build"
 
 ☐ add --wait -w flag

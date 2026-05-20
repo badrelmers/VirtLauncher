@@ -4,7 +4,7 @@ CD /D "%~dp0"
 
 ::_______________________________________________
  @rem set VLAUNCHER_VERBOSE=true
- set VLAUNCHER_DEBUG=true
+ @rem set VLAUNCHER_DEBUG=true
 
 
 ::_______________________________________________
