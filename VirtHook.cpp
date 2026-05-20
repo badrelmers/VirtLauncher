@@ -878,12 +878,16 @@ static std::wstring GetHandleLogicalPath(HANDLE h) {
 //   2. Normalised join: ensure exactly one separator between parent and name,
 //      regardless of whether the parent's logPath has a trailing '\' or the
 //      name starts with '\'.
-static std::wstring GetFullNtPath(PVL_OBJECT_ATTRIBUTES oa) {
+static std::wstring GetFullNtPath(PVL_OBJECT_ATTRIBUTES oa, bool isRegistry) {
     if (!oa) return L"";
     std::wstring name = FromUStr(oa->ObjectName);
 
-    // 1. Strip trailing backslashes (registry paths never end in '\').
-    while (!name.empty() && name.back() == L'\\') name.pop_back();
+    if (isRegistry) {
+        // 1. Strip trailing backslashes ONLY for registry keys.
+        // Doing this for filesystem paths turns drive roots (\??\C:\) 
+        // into volume devices (\??\C:), breaking .NET folder validation.
+        while (!name.empty() && name.back() == L'\\') name.pop_back();
+    }
 
     if (!oa->RootDirectory) return name;
 
@@ -1327,7 +1331,7 @@ static bool RedirectFileOA(PVL_OBJECT_ATTRIBUTES oa,
                              std::wstring& redPath)
 {
     if (!g_FsEnabled || !oa || !oa->ObjectName || IsReentrant()) return false;
-    ntPath  = GetFullNtPath(oa);
+    ntPath  = GetFullNtPath(oa, false);
     ntPath  = Win32ToNtPath(ntPath);   // ensure NT format
     redPath = ApplyFsRedirect(ntPath);
     if (redPath == ntPath) return false;
@@ -1994,7 +1998,7 @@ static NTSTATUS DoVirtOpen(
     ULONG                 CreateOptions,
     PULONG                Disposition)
 {
-    std::wstring fullPath = GetFullNtPath(OrigOA);
+    std::wstring fullPath = GetFullNtPath(OrigOA, true);
     std::wstring virtPath;
 
     if (!LogicalToVirtual(fullPath, virtPath)) {
@@ -2775,7 +2779,7 @@ static NTSTATUS NTAPI Hook_NtSaveKeyEx(HANDLE KeyHandle, HANDLE FileHandle, ULON
 static NTSTATUS NTAPI Hook_NtLoadKey(
     PVL_OBJECT_ATTRIBUTES TargetKey, PVL_OBJECT_ATTRIBUTES SourceFile)
 {
-    std::wstring fullPath = GetFullNtPath(TargetKey);
+    std::wstring fullPath = GetFullNtPath(TargetKey, true);
     VL_DBG(L"Hook_NtLoadKey: target=%s", fullPath.c_str());
 
     std::wstring virtPath;
@@ -2794,7 +2798,7 @@ static NTSTATUS NTAPI Hook_NtLoadKey(
 static NTSTATUS NTAPI Hook_NtLoadKey2(
     PVL_OBJECT_ATTRIBUTES TargetKey, PVL_OBJECT_ATTRIBUTES SourceFile, ULONG Flags)
 {
-    std::wstring fullPath = GetFullNtPath(TargetKey);
+    std::wstring fullPath = GetFullNtPath(TargetKey, true);
     VL_DBG(L"Hook_NtLoadKey2: flags=0x%X target=%s", Flags, fullPath.c_str());
 
     std::wstring virtPath;
@@ -2816,7 +2820,7 @@ static NTSTATUS NTAPI Hook_NtLoadKeyEx(
     HANDLE TrustClassKey, HANDLE Event, ULONG DesiredAccess,
     PHANDLE RootHandle, PVOID Reserved)
 {
-    std::wstring fullPath = GetFullNtPath(TargetKey);
+    std::wstring fullPath = GetFullNtPath(TargetKey, true);
     VL_DBG(L"Hook_NtLoadKeyEx: flags=0x%X target=%s", Flags, fullPath.c_str());
 
     std::wstring virtPath;
@@ -2933,7 +2937,7 @@ static NTSTATUS NTAPI Hook_NtSetInformationKey(
 // Without this hook an app (or a library it loads) can unload a real hive
 // subtree by absolute path regardless of our open/create redirections.
 static NTSTATUS NTAPI Hook_NtUnloadKey(PVL_OBJECT_ATTRIBUTES TargetKey) {
-    std::wstring fullPath = GetFullNtPath(TargetKey);
+    std::wstring fullPath = GetFullNtPath(TargetKey, true);
     VL_DBG(L"Hook_NtUnloadKey: target=%s", fullPath.c_str());
 
     std::wstring virtPath;
@@ -2958,7 +2962,7 @@ static NTSTATUS NTAPI Hook_NtLoadKey3(
     PVOID ExtendedParameters, ULONG ExtendedParameterCount,
     ULONG DesiredAccess, HANDLE RootHandle, PVOID Reserved)
 {
-    std::wstring fullPath = GetFullNtPath(TargetKey);
+    std::wstring fullPath = GetFullNtPath(TargetKey, true);
     VL_DBG(L"Hook_NtLoadKey3: flags=0x%X extParamCount=%u target=%s",
            Flags, ExtendedParameterCount, fullPath.c_str());
     std::wstring virtPath;
