@@ -840,14 +840,53 @@ static std::wstring GetHandleLogicalPath(HANDLE h) {
     return L"";
 }
 
-// Build the full NT path from an OBJECT_ATTRIBUTES
+// Build the full NT path from an OBJECT_ATTRIBUTES.
+//
+// FIX (double-backslash / corrupted logPath bug):
+//
+// Some callers pass an ObjectName with a trailing backslash, e.g.:
+//   "Software\Microsoft\.NETFramework\Policy\"
+// GetFullNtPath used to store this verbatim in logPath.  When a child key
+// was subsequently opened relative to that tracked handle, GetHandleLogicalPath
+// returned the path with a trailing '\', and the naive concatenation:
+//   parentPath + L"\\" + name
+// produced a double backslash:
+//   \REGISTRY\MACHINE\Software\Microsoft\.NETFramework\Policy\\AppPatch
+//
+// This corrupted path was then returned to the .NET CLR via NtQueryKey
+// (KeyNameInformation), whose path parser is strict and aborts on empty path
+// segments -- crashing every managed application (PowerShell, any .NET EXE).
+//
+// Fixes applied here:
+//   1. Strip trailing backslashes from the caller-supplied name so that the
+//      stored logPath is always clean and can be safely used as a parent.
+//   2. Normalise the parent+name join so that regardless of whether the
+//      parent ends in '\' or the name begins with '\', exactly one separator
+//      is inserted -- never zero, never two.
 static std::wstring GetFullNtPath(PVL_OBJECT_ATTRIBUTES oa) {
     if (!oa) return L"";
     std::wstring name = FromUStr(oa->ObjectName);
+
+    // 1. Strip trailing backslashes from the name component.
+    //    Registry key paths never semantically end in '\'; a trailing slash is
+    //    only ever an artefact of how some callers format the ObjectName string.
+    //    Storing it would corrupt every logPath built from this key as a parent.
+    while (!name.empty() && name.back() == L'\\') name.pop_back();
+
     if (!oa->RootDirectory) return name;
+
     std::wstring parentPath = GetHandleLogicalPath(oa->RootDirectory);
     if (name.empty()) return parentPath;
-    return parentPath + L"\\" + name;
+
+    // 2. Normalised join: ensure exactly one backslash between parent and name,
+    //    regardless of whether the parent has a trailing '\' (from a previously
+    //    stored logPath that itself came from a trailing-slash ObjectName) or the
+    //    name starts with '\' (absolute path supplied alongside a RootDirectory).
+    bool parentSlash = !parentPath.empty() && parentPath.back() == L'\\';
+    bool nameSlash   = name.front() == L'\\';
+    if (parentSlash && nameSlash)  return parentPath + name.substr(1); // drop one
+    if (parentSlash || nameSlash)  return parentPath + name;            // already one
+    return parentPath + L"\\" + name;                                   // add one
 }
 
 // Compute virtual NT path from logical path.
@@ -2179,35 +2218,49 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
 
     // FIX: KeyNameInformation (class 3) returns the full NT path of the open key.
     //
-    // Forwarding to e.hVirt would make the kernel return the physical virtual-store
+    // Forwarding to e.hVirt makes the kernel return the physical virtual-store
     // path, e.g.:
     //   \Registry\User\<SID>\VirtLauncher\HKEY_LOCAL_MACHINE\SOFTWARE\...
     //
-    // The .NET CLR calls NtQueryKey(KeyNameInformation) during startup to validate
-    // assembly policy and binding paths.  It compares the returned path against the
-    // path it originally opened.  Because the virtual-store path does not match the
-    // expected logical path (\REGISTRY\MACHINE\SOFTWARE\...), the CLR aborts --
-    // crashing every managed application (PowerShell, any .NET EXE) on startup.
+    // The .NET CLR calls NtQueryKey(KeyNameInformation) during CLR startup to
+    // validate assembly policy, binding context, and AppDomain paths.  It
+    // compares the returned path against the path it originally requested.
+    // Seeing the virtual-store path instead of the expected logical path
+    // (\REGISTRY\MACHINE\SOFTWARE\...) causes the CLR to abort initialisation,
+    // crashing every managed application -- PowerShell, any .NET EXE -- before
+    // it prints a single line.
     //
-    // Fix: synthesise the KEY_NAME_INFORMATION response directly from e.logPath,
-    // which always holds the exact logical NT path the application originally
-    // requested.  This keeps the kernel's view of the handle private and presents
-    // the correct logical path to the caller.
+    // Additionally, the double-backslash bug fixed in GetFullNtPath above means
+    // some logPaths were stored with a double backslash
+    // (e.g. ...Policy\\AppPatch).  Returning such a path to the CLR's strict
+    // path parser is equally fatal.  Both problems are eliminated together: the
+    // GetFullNtPath fix guarantees logPath is always clean, and this block
+    // ensures the clean logPath is what the CLR actually sees.
     //
-    // Buffer protocol (mirrors what the real kernel does):
-    //   requiredSize = sizeof(NameLength ULONG) + byte-length of the path string.
-    //   Length < sizeof(ULONG)          -> STATUS_BUFFER_TOO_SMALL  (can't fit NameLength)
-    //   Length >= sizeof(ULONG) but
-    //     < requiredSize               -> write NameLength, return STATUS_BUFFER_OVERFLOW
-    //                                    (.NET uses this two-pass pattern to size its buffer)
-    //   Length >= requiredSize          -> write full response, return STATUS_SUCCESS
+    // Fix: synthesise the KEY_NAME_INFORMATION response directly from e.logPath
+    // (the exact logical NT path the application requested) without asking the
+    // kernel at all.
+    //
+    // Buffer protocol (mirrors real NT kernel behaviour for this class):
+    //
+    //   requiredSize = sizeof(ULONG/*NameLength*/) + byte-length of path string
+    //
+    //   Length < sizeof(ULONG)   -> STATUS_BUFFER_TOO_SMALL
+    //                               (can't even write the NameLength field)
+    //   sizeof(ULONG) <= Length
+    //     < requiredSize         -> write NameLength + as many chars as fit,
+    //                               return STATUS_BUFFER_OVERFLOW
+    //                               (.NET two-pass pattern: probe size first,
+    //                                then retry with correct allocation)
+    //   Length >= requiredSize   -> write full response, STATUS_SUCCESS
     if (KeyInformationClass == VlKeyNameInformation && !e.logPath.empty()) {
         ULONG nameBytes    = (ULONG)(e.logPath.size() * sizeof(WCHAR));
         ULONG requiredSize = sizeof(ULONG) + nameBytes;
 
+        // Always report the true required size so callers can allocate correctly.
         if (ResultLength) *ResultLength = requiredSize;
 
-        // Buffer too small to even write the NameLength ULONG.
+        // Buffer too small to write even the NameLength ULONG.
         if (Length < sizeof(ULONG))
             return VL_STATUS_BUFFER_TOO_SMALL;
 
@@ -2217,18 +2270,24 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
         // Always write NameLength so a size-probe (Length == sizeof(ULONG)) works.
         kni->NameLength = nameBytes;
 
-        // Buffer holds NameLength but not the full string.
-        if (Length < requiredSize)
+        if (Length < requiredSize) {
+            // Buffer holds the NameLength field but not the full string.
+            // Partially fill with however many characters fit -- some CLR builds
+            // read partial data from the buffer on overflow without retrying.
+            ULONG fits = Length - sizeof(ULONG);
+            if (fits > 0)
+                memcpy(kni->Name, e.logPath.c_str(), fits);
             return VL_STATUS_BUFFER_OVERFLOW;
+        }
 
-        // Full buffer available -- write the logical path and succeed.
+        // Full buffer: write the complete logical path and succeed.
         memcpy(kni->Name, e.logPath.c_str(), nameBytes);
         return VL_STATUS_SUCCESS;
     }
 
     // All other information classes (Basic=0, Node=1, Full=2, Cached=4,
-    // Flags=5, VirtualizationInfo=6, HandleTags=7 ...) return structural
-    // metadata, never a path string, so forwarding to e.hVirt is safe.
+    // Flags=5, VirtualizationInfo=6, HandleTags=7, ...) return structural
+    // metadata only -- no path strings -- so forwarding to e.hVirt is safe.
     HANDLE queryH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : KeyHandle);
     return Real_NtQueryKey(queryH, KeyInformationClass,
                             KeyInformation, Length, ResultLength);
@@ -4564,69 +4623,65 @@ static NTSTATUS NTAPI Hook_NtQueryInformationFile(
     NTSTATUS st = Real_NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     if (!NT_SUCCESS(st)) return st;
 
-    // Helper: reverse-translate an embedded FILE_NAME_INFORMATION block.
-    // pFni points to the { ULONG FileNameLength; WCHAR Name[1]; } block.
-    // avail is the number of bytes available in FileInformation from pFni onward.
-    // This is inlined as a lambda-style block via a local struct; kept here to
-    // avoid duplicating the bounds-check / translate / memcpy sequence below.
+    // Helper struct matching FILE_NAME_INFORMATION layout.
+    struct MY_FNI {
+        ULONG FileNameLength; // byte count, no null terminator
+        WCHAR FileName[1];
+    };
+
+    // Reverse-translate a FILE_NAME_INFORMATION block in-place.
+    // pFni   - pointer to the MY_FNI block inside the output buffer.
+    // avail  - bytes available from pFni to the end of the buffer.
+    // If ReverseApplyFsRedirect produces a shorter logical path, write it back.
+    // (The logical path is always <= the physical path in length because we only
+    //  strip a prefix, never add one, so in-place shrink is always safe.)
+    auto reverseTranslateNameBlock = [](MY_FNI* pFni, ULONG avail) {
+        if (pFni->FileNameLength == 0) return;
+        if (avail < sizeof(ULONG) + pFni->FileNameLength) return;
+        std::wstring phys(pFni->FileName, pFni->FileNameLength / sizeof(WCHAR));
+        std::wstring log = ReverseApplyFsRedirect(phys);
+        if (log != phys && log.size() <= phys.size()) {
+            ULONG newLen = (ULONG)(log.size() * sizeof(WCHAR));
+            memcpy(pFni->FileName, log.c_str(), newLen);
+            pFni->FileNameLength = newLen;
+        }
+    };
 
     // FileNameInformation (class 9):
-    //   Returned directly as FILE_NAME_INFORMATION (volume-relative path).
-    if (FileInformationClass == 9 /*FileNameInformation*/ && Length >= sizeof(ULONG)) {
-        struct MY_FNI {
-            ULONG FileNameLength;
-            WCHAR FileName[1];
-        };
-        MY_FNI* p = (MY_FNI*)FileInformation;
-        if (p->FileNameLength > 0 && Length >= sizeof(ULONG) + p->FileNameLength) {
-            std::wstring phys(p->FileName, p->FileNameLength / sizeof(WCHAR));
-            std::wstring log = ReverseApplyFsRedirect(phys);
-            if (log != phys && log.size() <= phys.size()) {
-                ULONG newLen = (ULONG)(log.size() * sizeof(WCHAR));
-                memcpy(p->FileName, log.c_str(), newLen);
-                p->FileNameLength = newLen;
-            }
-        }
+    //   Buffer IS the FILE_NAME_INFORMATION directly.
+    if (FileInformationClass == 9 /*FileNameInformation*/ &&
+        Length >= sizeof(ULONG))
+    {
+        reverseTranslateNameBlock(reinterpret_cast<MY_FNI*>(FileInformation),
+                                  Length);
     }
 
     // FileAllInformation (class 21):
-    //   A composite structure that embeds FILE_NAME_INFORMATION at a fixed offset.
-    //   Without this interception the embedded path leaks the physical virtual-store
-    //   location to the caller -- the same class of bug as the NtQueryKey fix above.
+    //   A composite structure.  FILE_NAME_INFORMATION is embedded at a fixed
+    //   offset of 96 bytes after the start of FILE_ALL_INFORMATION:
     //
-    //   FILE_ALL_INFORMATION layout (field sizes; all LARGE_INTEGERs are 8 bytes):
-    //     FILE_BASIC_INFORMATION      40 bytes  (4 × LARGE_INTEGER + ULONG + 4 pad)
-    //     FILE_STANDARD_INFORMATION   24 bytes  (2 × LARGE_INTEGER + ULONG + 2×BOOLEAN + 2 pad)
+    //     FILE_BASIC_INFORMATION      40 bytes  (4×LARGE_INTEGER + ULONG + 4 pad)
+    //     FILE_STANDARD_INFORMATION   24 bytes  (2×LARGE_INTEGER + ULONG + 2×BOOL + 2 pad)
     //     FILE_INTERNAL_INFORMATION    8 bytes  (LARGE_INTEGER)
     //     FILE_EA_INFORMATION          4 bytes  (ULONG)
     //     FILE_ACCESS_INFORMATION      4 bytes  (ACCESS_MASK)
     //     FILE_POSITION_INFORMATION    8 bytes  (LARGE_INTEGER)
     //     FILE_MODE_INFORMATION        4 bytes  (ULONG)
     //     FILE_ALIGNMENT_INFORMATION   4 bytes  (ULONG)
-    //     FILE_NAME_INFORMATION       at offset 96 (ULONG + WCHAR[])
+    //     FILE_NAME_INFORMATION            <-- offset 96
     //
-#define FILE_ALL_INFORMATION_NAME_OFFSET 96u
-    if (FileInformationClass == 21 /*FileAllInformation*/ &&
-        Length >= FILE_ALL_INFORMATION_NAME_OFFSET + sizeof(ULONG))
-    {
-        struct MY_FNI {
-            ULONG FileNameLength;
-            WCHAR FileName[1];
-        };
-        MY_FNI* p = (MY_FNI*)((BYTE*)FileInformation + FILE_ALL_INFORMATION_NAME_OFFSET);
-        if (p->FileNameLength > 0 &&
-            Length >= FILE_ALL_INFORMATION_NAME_OFFSET + sizeof(ULONG) + p->FileNameLength)
-        {
-            std::wstring phys(p->FileName, p->FileNameLength / sizeof(WCHAR));
-            std::wstring log = ReverseApplyFsRedirect(phys);
-            if (log != phys && log.size() <= phys.size()) {
-                ULONG newLen = (ULONG)(log.size() * sizeof(WCHAR));
-                memcpy(p->FileName, log.c_str(), newLen);
-                p->FileNameLength = newLen;
-            }
+    //   Without this interception the embedded name field leaks the physical
+    //   virtual-store path -- same class of bug as the NtQueryKey fix above.
+    //   The CLR (and other managed code) calls FileAllInformation to validate
+    //   the path of loaded assemblies; a virtual-store path causes it to abort.
+    if (FileInformationClass == 21 /*FileAllInformation*/) {
+        const ULONG kNameOffset = 96u;
+        if (Length > kNameOffset + sizeof(ULONG)) {
+            MY_FNI* pFni = reinterpret_cast<MY_FNI*>(
+                static_cast<BYTE*>(FileInformation) + kNameOffset);
+            reverseTranslateNameBlock(pFni, Length - kNameOffset);
         }
     }
-#undef FILE_ALL_INFORMATION_NAME_OFFSET
 
     return st;
 }
