@@ -687,10 +687,17 @@ static void TrackHandle(HANDLE h, HANDLE hVirt, HANDLE hReal,
     LeaveCriticalSection(&g_KeyMapLock);
 }
 
-static void UntrackHandle(HANDLE h) {
+static bool PopKeyEntry(HANDLE h, VirtKeyEntry& out) {
     EnterCriticalSection(&g_KeyMapLock);
-    g_KeyMap.erase(h);
+    std::map<HANDLE,VirtKeyEntry>::iterator it = g_KeyMap.find(h);
+    if (it != g_KeyMap.end()) { 
+        out = it->second; 
+        g_KeyMap.erase(it);
+        LeaveCriticalSection(&g_KeyMapLock);
+        return true;
+    }
     LeaveCriticalSection(&g_KeyMapLock);
+    return false;
 }
 
 static bool GetEntry(HANDLE h, VirtKeyEntry& out) {
@@ -717,10 +724,17 @@ static void TrackFileHandle(HANDLE h, const VirtFileEntry& e) {
     LeaveCriticalSection(&g_FileMapLock);
 }
 
-static void UntrackFileHandle(HANDLE h) {
+static bool PopFileEntry(HANDLE h, VirtFileEntry& out) {
     EnterCriticalSection(&g_FileMapLock);
-    g_FileMap.erase(h);
+    std::map<HANDLE,VirtFileEntry>::iterator it = g_FileMap.find(h);
+    if (it != g_FileMap.end()) { 
+        out = it->second; 
+        g_FileMap.erase(it);
+        LeaveCriticalSection(&g_FileMapLock);
+        return true;
+    }
     LeaveCriticalSection(&g_FileMapLock);
+    return false;
 }
 
 static bool GetFileEntry(HANDLE h, VirtFileEntry& out) {
@@ -732,10 +746,16 @@ static bool GetFileEntry(HANDLE h, VirtFileEntry& out) {
     return found;
 }
 
-static void UpdateFileEntry(HANDLE h, const VirtFileEntry& e) {
+static bool UpdateFileEntry(HANDLE h, const VirtFileEntry& e) {
+    bool updated = false;
     EnterCriticalSection(&g_FileMapLock);
-    g_FileMap[h] = e;
+    std::map<HANDLE,VirtFileEntry>::iterator it = g_FileMap.find(h);
+    if (it != g_FileMap.end()) { 
+        it->second = e; 
+        updated = true;
+    }
     LeaveCriticalSection(&g_FileMapLock);
+    return updated;
 }
 
 // ============================================================
@@ -2041,6 +2061,7 @@ static NTSTATUS DoVirtOpen(
 
     HANDLE hVirt = NULL;
     NTSTATUS stV = Real_NtOpenKey(&hVirt, DesiredAccess, &voa);
+    if (!NT_SUCCESS(stV)) hVirt = NULL; // FIX: Prevent garbage handles
 
     HANDLE hReal = NULL;
     NTSTATUS sr = Real_NtOpenKey(&hReal, KEY_READ, &realOa); 
@@ -2976,10 +2997,9 @@ static NTSTATUS NTAPI Hook_NtLoadKey3(
 static NTSTATUS NTAPI Hook_NtClose(HANDLE Handle) {
     // Try registry first
     VirtKeyEntry ke;
-    if (GetEntry(Handle, ke)) {
-        VL_DBG(L"Hook_NtClose: tracked REG handle=%p hVirt=%p hReal=%p",
+    if (PopKeyEntry(Handle, ke)) {
+        VL_DBG(L"Hook_NtClose: popped REG handle=%p hVirt=%p hReal=%p",
                Handle, ke.hVirt, ke.hReal);
-        UntrackHandle(Handle);
         NTSTATUS st = VL_STATUS_SUCCESS;
         if (ke.hVirt == Handle) {
             st = Real_NtClose(Handle);
@@ -2997,10 +3017,9 @@ static NTSTATUS NTAPI Hook_NtClose(HANDLE Handle) {
 
     // Try files
     VirtFileEntry fe;
-    if (GetFileEntry(Handle, fe)) {
-        VL_DBG(L"Hook_NtClose: tracked FS handle=%p hVirt=%p hReal=%p",
+    if (PopFileEntry(Handle, fe)) {
+        VL_DBG(L"Hook_NtClose: popped FS handle=%p hVirt=%p hReal=%p",
                Handle, fe.hVirt, fe.hReal);
-        UntrackFileHandle(Handle);
         NTSTATUS st = VL_STATUS_SUCCESS;
         if (fe.hVirt == Handle) {
             st = Real_NtClose(Handle);
@@ -4270,7 +4289,12 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
         e.virtRestartPending = false;
         // DO NOT reset e.realRestartPending or clear e.virtNames here —
         // preserve the real handle's enumeration position across the upgrade.
-        UpdateFileEntry(FileHandle, e);
+
+        // FIX: Ensure the entry wasn't closed by another thread before saving
+        if (!UpdateFileEntry(FileHandle, e)) {
+            if (hNewVirt) Real_NtClose(hNewVirt);
+            return VL_STATUS_INVALID_HANDLE;
+        }
     }
 
     // On-demand open of real shadow handle if missing (non-isRealOnly path).
@@ -4283,7 +4307,12 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
                         FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
                 if (!NT_SUCCESS(sr)) e.hReal = NULL; // FIX
         if (e.hReal) {
-            UpdateFileEntry(FileHandle, e);
+            // FIX: Ensure the entry wasn't closed by another thread
+            if (!UpdateFileEntry(FileHandle, e)) {
+                Real_NtClose(e.hReal);
+                e.hReal = NULL;
+                return VL_STATUS_INVALID_HANDLE;
+            }
             VL_DBG(L"Hook_NtQueryDirectoryFile: on-demand opened real h=%p for %s",
                    e.hReal, e.logPath.c_str());
         } else {
@@ -4610,7 +4639,12 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
         e.virtRestartPending = false;
         // DO NOT reset realRestartPending, realEnumDone, or virtNames —
         // preserve enumeration state across the upgrade.
-        UpdateFileEntry(FileHandle, e);
+
+        // FIX: Ensure the entry wasn't closed by another thread before saving
+        if (!UpdateFileEntry(FileHandle, e)) {
+            if (hNewVirt) Real_NtClose(hNewVirt);
+            return VL_STATUS_INVALID_HANDLE;
+        }
     }
 
     // On-demand open of real shadow handle if missing
@@ -4623,7 +4657,12 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
                         FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
                 if (!NT_SUCCESS(sr)) e.hReal = NULL; // FIX
         if (e.hReal) {
-            UpdateFileEntry(FileHandle, e);
+            // FIX: Ensure the entry wasn't closed by another thread
+            if (!UpdateFileEntry(FileHandle, e)) {
+                Real_NtClose(e.hReal);
+                e.hReal = NULL;
+                return VL_STATUS_INVALID_HANDLE;
+            }
             VL_DBG(L"Hook_NtQueryDirectoryFileEx: on-demand opened real h=%p for %s",
                    e.hReal, e.logPath.c_str());
         } else {
@@ -5197,8 +5236,9 @@ static NTSTATUS NTAPI Hook_NtSetInformationFile(
 
                     // Remove the stale tracking entry; the handle is no longer valid
                     // against the file we just deleted.
-                    UntrackFileHandle(FileHandle);
-
+                    VirtFileEntry staleEntry;
+                    PopFileEntry(FileHandle, staleEntry);
+                    
                     VL_DBG(L"Hook_NtSetInformationFile: cross-volume recycle OK");
                     if (IoStatusBlock) {
                         IoStatusBlock->Status      = VL_STATUS_SUCCESS;
