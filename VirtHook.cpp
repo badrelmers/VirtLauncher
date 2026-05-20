@@ -2004,6 +2004,25 @@ static NTSTATUS DoVirtOpen(
 
     VL_DBG(L"DoVirtOpen: fullPath=%s  isCreate=%d", fullPath.c_str(), (int)isCreate);
 
+    // --- FIX: The Relative Path Bug (Registry edition) ---
+    // OrigOA->RootDirectory may be a handle to the virtual store (because a
+    // parent key was previously intercepted and the returned *KeyHandle was
+    // tracked as hVirt pointing into VirtNtBase).  Passing OrigOA unmodified
+    // to Real_NtOpenKey causes the kernel to look for the subkey inside the
+    // virtual store rather than the real registry, so hReal comes back NULL
+    // for any key that only exists in the real registry (not yet CoW-copied).
+    // This makes DoVirtOpen falsely declare "OPEN neither exists -> NOT_FOUND"
+    // and breaks the merged view -- the PowerShell / .NET CLR crash is caused
+    // by exactly this: keys under HKLM\SOFTWARE\Microsoft\.NETFramework\Policy
+    // cannot be found, mscoree.dll aborts with c0000005.
+    //
+    // Fix: build a clean OA from the already-resolved absolute logical path
+    // (fullPath) with RootDirectory=NULL, identical to the BUG1 fix applied
+    // to the filesystem hooks (see Hook_NtCreateFile / RedirectFileOA).
+    VL_UNICODE_STRING realUs; MakeUStr(&realUs, fullPath);
+    VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realUs,
+        OrigOA->Attributes | OBJ_CASE_INSENSITIVE);
+
     if (isCreate) {
         EnsureVirtualPath(virtPath);
         VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
@@ -2015,7 +2034,7 @@ static NTSTATUS DoVirtOpen(
                                         TitleIndex, Class, CreateOptions, Disposition);
         if (NT_SUCCESS(st)) {
             HANDLE hReal = NULL;
-            Real_NtOpenKey(&hReal, KEY_READ, OrigOA);
+            Real_NtOpenKey(&hReal, KEY_READ, &realOa); // FIX: was OrigOA
             *KeyHandle = hVirt;
             TrackHandle(hVirt, hVirt, hReal, fullPath);
             VL_DBG(L"DoVirtOpen: CREATE OK hVirt=%p hReal=%p", hVirt, hReal);
@@ -2034,7 +2053,7 @@ static NTSTATUS DoVirtOpen(
     NTSTATUS stV = Real_NtOpenKey(&hVirt, DesiredAccess, &voa);
 
     HANDLE hReal = NULL;
-    Real_NtOpenKey(&hReal, KEY_READ, OrigOA);
+    Real_NtOpenKey(&hReal, KEY_READ, &realOa); // FIX: was OrigOA
 
     if (NT_SUCCESS(stV)) {
         *KeyHandle = hVirt;
@@ -3959,8 +3978,20 @@ static NTSTATUS NTAPI Hook_NtQueryAttributesFile(
     }
 
     // CoW read fallback to real.
+    // FIX: The Relative Path Bug (FS edition, query variant).
+    // ObjectAttributes->RootDirectory may point to a virtual-store file handle
+    // tracked by our hook.  Passing ObjectAttributes directly makes
+    // Real_NtQueryAttributesFile look inside the virtual store instead of the
+    // real filesystem, returning NOT_FOUND for files that only exist in the
+    // real store.  ntPath is the fully-resolved absolute logical path built by
+    // RedirectFileOA (GetFullNtPath + Win32ToNtPath), so building realOa from
+    // it with RootDirectory=NULL is always safe and equivalent.
     VL_DBG(L"Hook_NtQueryAttributesFile: virtual not found, fallback to real");
-    return Real_NtQueryAttributesFile(ObjectAttributes, FileInformation);
+    {
+        VL_UNICODE_STRING realUs; MakeUStr(&realUs, ntPath);
+        VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realUs);
+        return Real_NtQueryAttributesFile(&realOa, FileInformation);
+    }
 }
 
 // ---- NtQueryFullAttributesFile ----
@@ -3991,8 +4022,16 @@ static NTSTATUS NTAPI Hook_NtQueryFullAttributesFile(
         return VL_STATUS_OBJECT_NAME_NOT_FOUND;
     }
 
+    // FIX: Same Relative Path Bug as Hook_NtQueryAttributesFile.
+    // Use realOa built from the absolute ntPath (RootDirectory=NULL) so the
+    // kernel queries the real filesystem, not the virtual-store path that
+    // ObjectAttributes->RootDirectory may be pointing to.
     VL_DBG(L"Hook_NtQueryFullAttributesFile: virtual not found, fallback to real");
-    return Real_NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
+    {
+        VL_UNICODE_STRING realUs; MakeUStr(&realUs, ntPath);
+        VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realUs);
+        return Real_NtQueryFullAttributesFile(&realOa, FileInformation);
+    }
 }
 
 // ---- NtQueryInformationByName (Win10+) ----
@@ -4032,10 +4071,18 @@ static NTSTATUS NTAPI Hook_NtQueryInformationByName(
         return VL_STATUS_OBJECT_NAME_NOT_FOUND;
     }
 
+    // FIX: Same Relative Path Bug as Hook_NtQueryAttributesFile.
+    // Use realOa built from the absolute ntPath (RootDirectory=NULL) so the
+    // kernel queries the real filesystem, not the virtual-store path that
+    // ObjectAttributes->RootDirectory may be pointing to.
     VL_DBG(L"Hook_NtQueryInformationByName: virtual not found, fallback to real");
-    return Real_NtQueryInformationByName(ObjectAttributes, IoStatusBlock,
-                                          FileInformation, Length,
-                                          FileInformationClass);
+    {
+        VL_UNICODE_STRING realUs; MakeUStr(&realUs, ntPath);
+        VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realUs);
+        return Real_NtQueryInformationByName(&realOa, IoStatusBlock,
+                                              FileInformation, Length,
+                                              FileInformationClass);
+    }
 }
 
 // ============================================================
