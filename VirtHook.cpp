@@ -2289,8 +2289,8 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
     // -----------------------------------------------------------------------
     // FIX B: KeyFullInformation (class 2) and KeyCachedInformation (class 4)
     //
-    // These classes return SubKeys, Values, and MaxNameLen counts that callers
-    // use to pre-allocate buffers before calling NtEnumerateKey.
+    // These classes return SubKeys, Values, and Max*Len counts that callers
+    // use to pre-allocate buffers before calling NtEnumerateKey/ValueKey.
     //
     // The original code passed e.hVirt to the kernel.  e.hVirt is a CoW
     // placeholder key that is empty when no virtualised writes have occurred,
@@ -2301,14 +2301,34 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
     // from NtEnumerateKey, it writes them into a 0-element pre-allocated buffer
     // -> heap corruption -> c0000005 access violation in mscoree.dll.
     //
-    // Fix: when both handles exist, query each independently and merge the
-    // counts additively (SubKeys, Values) and with max() (length fields).
-    // Over-counting is 100% safe -- the CLR just pre-allocates extra space.
-    // Under-counting is fatal.
+    // WRONG previous fix: merge counts additively (virt.SubKeys + real.SubKeys).
     //
-    // This mirrors exactly what NtEnumerateKey does: it returns entries from
-    // both handles (deduplicated), so the total count can be up to
-    // virt.SubKeys + real.SubKeys.
+    // WHY ADDITIVE IS WRONG:
+    //   EnsureVirtualPath creates intermediate ancestor nodes in the virtual
+    //   store whenever a deep key is first opened.  E.g. opening
+    //     HKLM\Software\Microsoft\.NETFramework\v4.0.30319\foo
+    //   creates VirtBase\HKLM\Software\Microsoft\.NETFramework in the virtual
+    //   store, giving it a child subkey "v4.0.30319".  The REAL
+    //   HKLM\Software\Microsoft\.NETFramework also has "v4.0.30319" among its
+    //   subkeys.  A subsequent NtQueryKey(class=4) on that parent would then
+    //   report real.SubKeys + 1 (the shadowing virtual child) instead of the
+    //   true deduplicated count.  The .NET CLR's RegistryKey.GetSubKeyNames()
+    //   pre-allocates an array of exactly SubKeys entries and iterates precisely
+    //   that many times -- it does NOT tolerate early NO_MORE_ENTRIES and throws
+    //   Win32Exception("No more data is available.") [Win32 error 259] on the
+    //   extra iterations.  This is the direct cause of PowerShell's
+    //   "The shell cannot be started. A failure occurred during initialization:
+    //    No more data is available." crash.
+    //
+    // CORRECT fix: compute the EXACT deduplicated count using the same set-union
+    //   logic that Hook_NtEnumerateKey already uses:
+    //     exactSubKeys = |virtSubkeys ∪ realSubkeys|
+    //                  = virtSubkeys.size()
+    //                  + count(realSubkeys whose name is NOT in virtSubkeys)
+    //   This guarantees the reported count exactly matches what enumeration
+    //   will yield, satisfying both native callers (loop until NO_MORE_ENTRIES)
+    //   and managed callers (.NET CLR, PowerShell) that pre-allocate exactly
+    //   SubKeys/Values entries.
     // -----------------------------------------------------------------------
     if ((KeyInformationClass == VlKeyFullInformation ||
          KeyInformationClass == VlKeyCachedInformation) &&
@@ -2318,31 +2338,92 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
         NTSTATUS stReal = Real_NtQueryKey(e.hReal, KeyInformationClass,
                                           KeyInformation, Length, ResultLength);
 
-        // If the real query succeeded and the buffer is large enough to hold the
-        // fixed-size scalar fields, query the virtual handle into a temp buffer
-        // and merge the counts.
         if (NT_SUCCESS(stReal) && KeyInformation && Length > 0) {
             std::vector<BYTE> virtBuf(Length, 0);
             ULONG virtResLen = 0;
             NTSTATUS stVirt = Real_NtQueryKey(e.hVirt, KeyInformationClass,
                                               &virtBuf[0], Length, &virtResLen);
             if (NT_SUCCESS(stVirt)) {
+
+                // ----------------------------------------------------------
+                // Compute exact deduplicated subkey and value counts.
+                // Mirror the logic used by Hook_NtEnumerateKey/ValueKey:
+                //   1. Start with all virtual names (they shadow real ones).
+                //   2. Walk the real handle; add each real entry whose name
+                //      does NOT already appear in the virtual set.
+                // Using Real_NtEnumerate* (not the hooked versions) to avoid
+                // re-entrancy; SetReentrant guards other hook paths.
+                // ----------------------------------------------------------
+                SetReentrant(true);
+
+                std::vector<std::wstring> virtSubkeys = CollectSubkeyNames(e.hVirt);
+                std::vector<std::wstring> virtVals    = CollectValueNames(e.hVirt);
+
+                ULONG exactSubKeys = (ULONG)virtSubkeys.size();
+                ULONG exactValues  = (ULONG)virtVals.size();
+
+                // Count real subkeys not shadowed by a virtual subkey.
+                {
+                    std::vector<BYTE> tmpBuf(1024, 0);
+                    for (ULONG ri = 0; ; ++ri) {
+                        ULONG resLen = 0;
+                        NTSTATUS st = Real_NtEnumerateKey(
+                            e.hReal, ri, VlKeyBasicInformation,
+                            &tmpBuf[0], (ULONG)tmpBuf.size(), &resLen);
+                        if (st == VL_STATUS_BUFFER_TOO_SMALL ||
+                            st == VL_STATUS_BUFFER_OVERFLOW) {
+                            tmpBuf.assign(resLen + 4, 0);
+                            st = Real_NtEnumerateKey(
+                                e.hReal, ri, VlKeyBasicInformation,
+                                &tmpBuf[0], (ULONG)tmpBuf.size(), &resLen);
+                        }
+                        if (!NT_SUCCESS(st)) break;
+                        VL_KEY_BASIC_INFORMATION* kbi =
+                            reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(&tmpBuf[0]);
+                        std::wstring name(kbi->Name, kbi->NameLength / sizeof(WCHAR));
+                        if (!NameInList(name, virtSubkeys)) exactSubKeys++;
+                    }
+                }
+
+                // Count real values not shadowed by a virtual value.
+                {
+                    std::vector<BYTE> tmpBuf(1024, 0);
+                    for (ULONG ri = 0; ; ++ri) {
+                        ULONG resLen = 0;
+                        NTSTATUS st = Real_NtEnumerateValueKey(
+                            e.hReal, ri, VlKeyValueBasicInformation,
+                            &tmpBuf[0], (ULONG)tmpBuf.size(), &resLen);
+                        if (st == VL_STATUS_BUFFER_TOO_SMALL ||
+                            st == VL_STATUS_BUFFER_OVERFLOW) {
+                            tmpBuf.assign(resLen + 4, 0);
+                            st = Real_NtEnumerateValueKey(
+                                e.hReal, ri, VlKeyValueBasicInformation,
+                                &tmpBuf[0], (ULONG)tmpBuf.size(), &resLen);
+                        }
+                        if (!NT_SUCCESS(st)) break;
+                        VL_KEY_VALUE_BASIC_INFORMATION* kvbi =
+                            reinterpret_cast<VL_KEY_VALUE_BASIC_INFORMATION*>(&tmpBuf[0]);
+                        std::wstring name(kvbi->Name, kvbi->NameLength / sizeof(WCHAR));
+                        if (!NameInList(name, virtVals)) exactValues++;
+                    }
+                }
+
+                SetReentrant(false);
+                // ----------------------------------------------------------
+
                 if (KeyInformationClass == VlKeyFullInformation) {
-                    // VL_KEY_FULL_INFORMATION: the scalar fields (everything
-                    // before the variable-length Class[] array) end at the
-                    // ClassOffset/ClassLength pair.  offsetof(Class) gives the
-                    // byte where the array starts; all scalar fields are before it.
+                    // VL_KEY_FULL_INFORMATION: fixed scalar fields end before
+                    // the variable-length Class[] array.
                     const ULONG kMinFull =
-                        sizeof(LARGE_INTEGER) +          // LastWriteTime
-                        sizeof(ULONG) * 9;               // TitleIndex..MaxValueDataLen
+                        sizeof(LARGE_INTEGER) +   // LastWriteTime
+                        sizeof(ULONG) * 9;        // TitleIndex..MaxValueDataLen
                     if (Length >= kMinFull && virtResLen >= kMinFull) {
                         VL_KEY_FULL_INFORMATION* rFi =
                             reinterpret_cast<VL_KEY_FULL_INFORMATION*>(KeyInformation);
                         VL_KEY_FULL_INFORMATION* vFi =
                             reinterpret_cast<VL_KEY_FULL_INFORMATION*>(&virtBuf[0]);
-                        // Sum counts (virtual entries not yet shadowing real ones).
-                        rFi->SubKeys       += vFi->SubKeys;
-                        rFi->Values        += vFi->Values;
+                        rFi->SubKeys = exactSubKeys;
+                        rFi->Values  = exactValues;
                         // Max of length hints (caller uses them to size name buffers).
                         if (vFi->MaxNameLen      > rFi->MaxNameLen)
                             rFi->MaxNameLen      = vFi->MaxNameLen;
@@ -2361,8 +2442,8 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
                             reinterpret_cast<VL_KEY_CACHED_INFORMATION*>(KeyInformation);
                         VL_KEY_CACHED_INFORMATION* vCi =
                             reinterpret_cast<VL_KEY_CACHED_INFORMATION*>(&virtBuf[0]);
-                        rCi->SubKeys       += vCi->SubKeys;
-                        rCi->Values        += vCi->Values;
+                        rCi->SubKeys = exactSubKeys;
+                        rCi->Values  = exactValues;
                         if (vCi->MaxNameLen      > rCi->MaxNameLen)
                             rCi->MaxNameLen      = vCi->MaxNameLen;
                         if (vCi->MaxValueNameLen > rCi->MaxValueNameLen)
