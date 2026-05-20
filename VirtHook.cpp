@@ -2177,6 +2177,58 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
     VL_DBG(L"Hook_NtQueryKey: class=%d handle=%p virt=%p real=%p",
            (int)KeyInformationClass, KeyHandle, e.hVirt, e.hReal);
 
+    // FIX: KeyNameInformation (class 3) returns the full NT path of the open key.
+    //
+    // Forwarding to e.hVirt would make the kernel return the physical virtual-store
+    // path, e.g.:
+    //   \Registry\User\<SID>\VirtLauncher\HKEY_LOCAL_MACHINE\SOFTWARE\...
+    //
+    // The .NET CLR calls NtQueryKey(KeyNameInformation) during startup to validate
+    // assembly policy and binding paths.  It compares the returned path against the
+    // path it originally opened.  Because the virtual-store path does not match the
+    // expected logical path (\REGISTRY\MACHINE\SOFTWARE\...), the CLR aborts --
+    // crashing every managed application (PowerShell, any .NET EXE) on startup.
+    //
+    // Fix: synthesise the KEY_NAME_INFORMATION response directly from e.logPath,
+    // which always holds the exact logical NT path the application originally
+    // requested.  This keeps the kernel's view of the handle private and presents
+    // the correct logical path to the caller.
+    //
+    // Buffer protocol (mirrors what the real kernel does):
+    //   requiredSize = sizeof(NameLength ULONG) + byte-length of the path string.
+    //   Length < sizeof(ULONG)          -> STATUS_BUFFER_TOO_SMALL  (can't fit NameLength)
+    //   Length >= sizeof(ULONG) but
+    //     < requiredSize               -> write NameLength, return STATUS_BUFFER_OVERFLOW
+    //                                    (.NET uses this two-pass pattern to size its buffer)
+    //   Length >= requiredSize          -> write full response, return STATUS_SUCCESS
+    if (KeyInformationClass == VlKeyNameInformation && !e.logPath.empty()) {
+        ULONG nameBytes    = (ULONG)(e.logPath.size() * sizeof(WCHAR));
+        ULONG requiredSize = sizeof(ULONG) + nameBytes;
+
+        if (ResultLength) *ResultLength = requiredSize;
+
+        // Buffer too small to even write the NameLength ULONG.
+        if (Length < sizeof(ULONG))
+            return VL_STATUS_BUFFER_TOO_SMALL;
+
+        VL_KEY_NAME_INFORMATION* kni =
+            reinterpret_cast<VL_KEY_NAME_INFORMATION*>(KeyInformation);
+
+        // Always write NameLength so a size-probe (Length == sizeof(ULONG)) works.
+        kni->NameLength = nameBytes;
+
+        // Buffer holds NameLength but not the full string.
+        if (Length < requiredSize)
+            return VL_STATUS_BUFFER_OVERFLOW;
+
+        // Full buffer available -- write the logical path and succeed.
+        memcpy(kni->Name, e.logPath.c_str(), nameBytes);
+        return VL_STATUS_SUCCESS;
+    }
+
+    // All other information classes (Basic=0, Node=1, Full=2, Cached=4,
+    // Flags=5, VirtualizationInfo=6, HandleTags=7 ...) return structural
+    // metadata, never a path string, so forwarding to e.hVirt is safe.
     HANDLE queryH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : KeyHandle);
     return Real_NtQueryKey(queryH, KeyInformationClass,
                             KeyInformation, Length, ResultLength);
@@ -4512,6 +4564,14 @@ static NTSTATUS NTAPI Hook_NtQueryInformationFile(
     NTSTATUS st = Real_NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     if (!NT_SUCCESS(st)) return st;
 
+    // Helper: reverse-translate an embedded FILE_NAME_INFORMATION block.
+    // pFni points to the { ULONG FileNameLength; WCHAR Name[1]; } block.
+    // avail is the number of bytes available in FileInformation from pFni onward.
+    // This is inlined as a lambda-style block via a local struct; kept here to
+    // avoid duplicating the bounds-check / translate / memcpy sequence below.
+
+    // FileNameInformation (class 9):
+    //   Returned directly as FILE_NAME_INFORMATION (volume-relative path).
     if (FileInformationClass == 9 /*FileNameInformation*/ && Length >= sizeof(ULONG)) {
         struct MY_FNI {
             ULONG FileNameLength;
@@ -4522,12 +4582,52 @@ static NTSTATUS NTAPI Hook_NtQueryInformationFile(
             std::wstring phys(p->FileName, p->FileNameLength / sizeof(WCHAR));
             std::wstring log = ReverseApplyFsRedirect(phys);
             if (log != phys && log.size() <= phys.size()) {
-                USHORT newLen = (USHORT)(log.size() * sizeof(WCHAR));
+                ULONG newLen = (ULONG)(log.size() * sizeof(WCHAR));
                 memcpy(p->FileName, log.c_str(), newLen);
                 p->FileNameLength = newLen;
             }
         }
     }
+
+    // FileAllInformation (class 21):
+    //   A composite structure that embeds FILE_NAME_INFORMATION at a fixed offset.
+    //   Without this interception the embedded path leaks the physical virtual-store
+    //   location to the caller -- the same class of bug as the NtQueryKey fix above.
+    //
+    //   FILE_ALL_INFORMATION layout (field sizes; all LARGE_INTEGERs are 8 bytes):
+    //     FILE_BASIC_INFORMATION      40 bytes  (4 × LARGE_INTEGER + ULONG + 4 pad)
+    //     FILE_STANDARD_INFORMATION   24 bytes  (2 × LARGE_INTEGER + ULONG + 2×BOOLEAN + 2 pad)
+    //     FILE_INTERNAL_INFORMATION    8 bytes  (LARGE_INTEGER)
+    //     FILE_EA_INFORMATION          4 bytes  (ULONG)
+    //     FILE_ACCESS_INFORMATION      4 bytes  (ACCESS_MASK)
+    //     FILE_POSITION_INFORMATION    8 bytes  (LARGE_INTEGER)
+    //     FILE_MODE_INFORMATION        4 bytes  (ULONG)
+    //     FILE_ALIGNMENT_INFORMATION   4 bytes  (ULONG)
+    //     FILE_NAME_INFORMATION       at offset 96 (ULONG + WCHAR[])
+    //
+#define FILE_ALL_INFORMATION_NAME_OFFSET 96u
+    if (FileInformationClass == 21 /*FileAllInformation*/ &&
+        Length >= FILE_ALL_INFORMATION_NAME_OFFSET + sizeof(ULONG))
+    {
+        struct MY_FNI {
+            ULONG FileNameLength;
+            WCHAR FileName[1];
+        };
+        MY_FNI* p = (MY_FNI*)((BYTE*)FileInformation + FILE_ALL_INFORMATION_NAME_OFFSET);
+        if (p->FileNameLength > 0 &&
+            Length >= FILE_ALL_INFORMATION_NAME_OFFSET + sizeof(ULONG) + p->FileNameLength)
+        {
+            std::wstring phys(p->FileName, p->FileNameLength / sizeof(WCHAR));
+            std::wstring log = ReverseApplyFsRedirect(phys);
+            if (log != phys && log.size() <= phys.size()) {
+                ULONG newLen = (ULONG)(log.size() * sizeof(WCHAR));
+                memcpy(p->FileName, log.c_str(), newLen);
+                p->FileNameLength = newLen;
+            }
+        }
+    }
+#undef FILE_ALL_INFORMATION_NAME_OFFSET
+
     return st;
 }
 
