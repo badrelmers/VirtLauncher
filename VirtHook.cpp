@@ -2002,27 +2002,11 @@ static NTSTATUS DoVirtOpen(
     std::wstring virtPath;
 
     if (!LogicalToVirtual(fullPath, virtPath)) {
-        // Not in our scope -- let caller decide which real function to call
-        return VL_STATUS_OBJECT_NOT_FOUND; // sentinel: caller must call real fn
+        return VL_STATUS_OBJECT_NOT_FOUND; 
     }
 
     VL_DBG(L"DoVirtOpen: fullPath=%s  isCreate=%d", fullPath.c_str(), (int)isCreate);
 
-    // --- FIX: The Relative Path Bug (Registry edition) ---
-    // OrigOA->RootDirectory may be a handle to the virtual store (because a
-    // parent key was previously intercepted and the returned *KeyHandle was
-    // tracked as hVirt pointing into VirtNtBase).  Passing OrigOA unmodified
-    // to Real_NtOpenKey causes the kernel to look for the subkey inside the
-    // virtual store rather than the real registry, so hReal comes back NULL
-    // for any key that only exists in the real registry (not yet CoW-copied).
-    // This makes DoVirtOpen falsely declare "OPEN neither exists -> NOT_FOUND"
-    // and breaks the merged view -- the PowerShell / .NET CLR crash is caused
-    // by exactly this: keys under HKLM\SOFTWARE\Microsoft\.NETFramework\Policy
-    // cannot be found, mscoree.dll aborts with c0000005.
-    //
-    // Fix: build a clean OA from the already-resolved absolute logical path
-    // (fullPath) with RootDirectory=NULL, identical to the BUG1 fix applied
-    // to the filesystem hooks (see Hook_NtCreateFile / RedirectFileOA).
     VL_UNICODE_STRING realUs; MakeUStr(&realUs, fullPath);
     VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realUs,
         OrigOA->Attributes | OBJ_CASE_INSENSITIVE);
@@ -2038,7 +2022,9 @@ static NTSTATUS DoVirtOpen(
                                         TitleIndex, Class, CreateOptions, Disposition);
         if (NT_SUCCESS(st)) {
             HANDLE hReal = NULL;
-            Real_NtOpenKey(&hReal, KEY_READ, &realOa); // FIX: was OrigOA
+            NTSTATUS sr = Real_NtOpenKey(&hReal, KEY_READ, &realOa);
+            if (!NT_SUCCESS(sr)) hReal = NULL; // FIX: Prevent garbage handle
+
             *KeyHandle = hVirt;
             TrackHandle(hVirt, hVirt, hReal, fullPath);
             VL_DBG(L"DoVirtOpen: CREATE OK hVirt=%p hReal=%p", hVirt, hReal);
@@ -2057,7 +2043,8 @@ static NTSTATUS DoVirtOpen(
     NTSTATUS stV = Real_NtOpenKey(&hVirt, DesiredAccess, &voa);
 
     HANDLE hReal = NULL;
-    Real_NtOpenKey(&hReal, KEY_READ, &realOa); // FIX: was OrigOA
+    NTSTATUS sr = Real_NtOpenKey(&hReal, KEY_READ, &realOa); 
+    if (!NT_SUCCESS(sr)) hReal = NULL; // FIX: Prevent garbage handle
 
     if (NT_SUCCESS(stV)) {
         *KeyHandle = hVirt;
@@ -2067,7 +2054,8 @@ static NTSTATUS DoVirtOpen(
     }
 
     if (!hReal) {
-        if (hVirt) Real_NtClose(hVirt);
+        // FIX: Removed dangerous `if (hVirt) Real_NtClose(hVirt);` 
+        // If stV failed, hVirt is garbage and must NOT be closed.
         VL_DBG(L"DoVirtOpen: OPEN neither exists -> NOT_FOUND");
         return VL_STATUS_OBJECT_NOT_FOUND;
     }
@@ -2089,7 +2077,7 @@ static NTSTATUS DoVirtOpen(
     }
 
     VL_DBG(L"DoVirtOpen: OPEN CoW FAILED st=0x%08X -- using real untracked", (ULONG)stC);
-    if (hVirtNew) Real_NtClose(hVirtNew);
+    // FIX: Removed dangerous `if (hVirtNew) Real_NtClose(hVirtNew);`
     if (hReal) {
         *KeyHandle = hReal;
         return VL_STATUS_SUCCESS;
@@ -3456,15 +3444,17 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
             // Try to open real dir shadow for future merge
             if (!e.isDir) {
                 VL_IO_STATUS_BLOCK iosb;
-                Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
+                NTSTATUS sr = Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                 FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+                if (!NT_SUCCESS(sr)) e.hReal = NULL; // FIX
                 if (e.hReal) e.isDir = true;
             } else {
                 VL_IO_STATUS_BLOCK iosb;
-                Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
+                NTSTATUS sr = Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                 FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+                if (!NT_SUCCESS(sr)) e.hReal = NULL; // FIX
             }
             TrackFileHandle(*FileHandle, e);
         }
@@ -3502,15 +3492,17 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
         e.isRealOnly = false;
         if (!e.isDir) {
             VL_IO_STATUS_BLOCK iosb;
-            Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
+            NTSTATUS sr = Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+                if (!NT_SUCCESS(sr)) e.hReal = NULL; // FIX
             if (e.hReal) e.isDir = true;
         } else {
             VL_IO_STATUS_BLOCK iosb;
-            Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
+            NTSTATUS sr = Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+                if (!NT_SUCCESS(sr)) e.hReal = NULL; // FIX
         }
         TrackFileHandle(*FileHandle, e);
         return st;
@@ -3604,9 +3596,10 @@ static NTSTATUS NTAPI Hook_NtCreateFile(
             e.isDir = true;
             e.isRealOnly = false;
             VL_IO_STATUS_BLOCK iosb;
-            Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
+            NTSTATUS sr = Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+                if (!NT_SUCCESS(sr)) e.hReal = NULL; // FIX
             TrackFileHandle(*FileHandle, e);
         }
         return st;
@@ -3685,15 +3678,17 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
         e.isRealOnly = false;
         if (!isDir) {
             VL_IO_STATUS_BLOCK iosb;
-            Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
+            NTSTATUS sr = Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+                if (!NT_SUCCESS(sr)) e.hReal = NULL; // FIX
             if (e.hReal) e.isDir = true;
         } else {
             VL_IO_STATUS_BLOCK iosb;
-            Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
+            NTSTATUS sr = Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+                if (!NT_SUCCESS(sr)) e.hReal = NULL; // FIX
         }
         TrackFileHandle(*FileHandle, e);
         return st;
@@ -3813,9 +3808,10 @@ static NTSTATUS NTAPI Hook_NtOpenFile(
             e.isDir = true;
             e.isRealOnly = false;
             VL_IO_STATUS_BLOCK iosb;
-            Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
+            NTSTATUS sr = Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+                if (!NT_SUCCESS(sr)) e.hReal = NULL; // FIX
             TrackFileHandle(*FileHandle, e);
         }
         return st;
@@ -4221,10 +4217,11 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
             VL_UNICODE_STRING virtName; MakeUStr(&virtName, virtPath);
             VL_OBJECT_ATTRIBUTES virtOa;  MakeOA(&virtOa, &virtName);
             VL_IO_STATUS_BLOCK iosb;
-            Real_NtOpenFile(&hNewVirt, FILE_LIST_DIRECTORY | SYNCHRONIZE,
+            NTSTATUS sr = Real_NtOpenFile(&hNewVirt, FILE_LIST_DIRECTORY | SYNCHRONIZE,
                             &virtOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+            if (!NT_SUCCESS(sr)) hNewVirt = NULL; // FIX
         }
         if (!hNewVirt) {
             // Virtual dir still doesn't exist — pass through to real, but still
@@ -4281,9 +4278,10 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFile(
         VL_UNICODE_STRING realName; MakeUStr(&realName, e.logPath);
         VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
         VL_IO_STATUS_BLOCK iosb;
-        Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
+        NTSTATUS sr = Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                         FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+                if (!NT_SUCCESS(sr)) e.hReal = NULL; // FIX
         if (e.hReal) {
             UpdateFileEntry(FileHandle, e);
             VL_DBG(L"Hook_NtQueryDirectoryFile: on-demand opened real h=%p for %s",
@@ -4566,10 +4564,11 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
             VL_UNICODE_STRING virtName; MakeUStr(&virtName, virtPath);
             VL_OBJECT_ATTRIBUTES virtOa;  MakeOA(&virtOa, &virtName);
             VL_IO_STATUS_BLOCK iosb;
-            Real_NtOpenFile(&hNewVirt, FILE_LIST_DIRECTORY | SYNCHRONIZE,
+            NTSTATUS sr = Real_NtOpenFile(&hNewVirt, FILE_LIST_DIRECTORY | SYNCHRONIZE,
                             &virtOa, &iosb,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+            if (!NT_SUCCESS(sr)) hNewVirt = NULL; // FIX
         }
         if (!hNewVirt) {
             // Virtual dir still doesn't exist — pass through with tombstone filtering.
@@ -4619,9 +4618,10 @@ static NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(
         VL_UNICODE_STRING realName; MakeUStr(&realName, e.logPath);
         VL_OBJECT_ATTRIBUTES realOa; MakeOA(&realOa, &realName);
         VL_IO_STATUS_BLOCK iosb;
-        Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
+        NTSTATUS sr = Real_NtOpenFile(&e.hReal, FILE_LIST_DIRECTORY | SYNCHRONIZE, &realOa, &iosb,
                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                         FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT);
+                if (!NT_SUCCESS(sr)) e.hReal = NULL; // FIX
         if (e.hReal) {
             UpdateFileEntry(FileHandle, e);
             VL_DBG(L"Hook_NtQueryDirectoryFileEx: on-demand opened real h=%p for %s",
