@@ -258,6 +258,21 @@ typedef struct _VL_KEY_FULL_INFORMATION {
     WCHAR Class[1];
 } VL_KEY_FULL_INFORMATION;
 
+// KEY_CACHED_INFORMATION (class 4) -- returned by NtQueryKey.
+// Identical scalar layout to KEY_FULL_INFORMATION but without the variable-length
+// Class string at the end; the kernel fills all count/length fields from cache.
+// Missing from the original type definitions; required for count-merging fix.
+typedef struct _VL_KEY_CACHED_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+    ULONG         TitleIndex;
+    ULONG         SubKeys;
+    ULONG         MaxNameLen;
+    ULONG         Values;
+    ULONG         MaxValueNameLen;
+    ULONG         MaxValueDataLen;
+    ULONG         NameLength;
+} VL_KEY_CACHED_INFORMATION;
+
 typedef struct _VL_KEY_VALUE_BASIC_INFORMATION {
     ULONG TitleIndex;
     ULONG Type;
@@ -846,31 +861,28 @@ static std::wstring GetHandleLogicalPath(HANDLE h) {
 //
 // Some callers pass an ObjectName with a trailing backslash, e.g.:
 //   "Software\Microsoft\.NETFramework\Policy\"
-// GetFullNtPath used to store this verbatim in logPath.  When a child key
-// was subsequently opened relative to that tracked handle, GetHandleLogicalPath
+// GetFullNtPath used to store this verbatim in logPath.  When a child key was
+// subsequently opened relative to that tracked handle, GetHandleLogicalPath
 // returned the path with a trailing '\', and the naive concatenation:
 //   parentPath + L"\\" + name
-// produced a double backslash:
+// produced a double backslash in the stored logPath:
 //   \REGISTRY\MACHINE\Software\Microsoft\.NETFramework\Policy\\AppPatch
 //
-// This corrupted path was then returned to the .NET CLR via NtQueryKey
-// (KeyNameInformation), whose path parser is strict and aborts on empty path
-// segments -- crashing every managed application (PowerShell, any .NET EXE).
+// This corrupted path then propagated to every hook that synthesises a
+// response from logPath (NtQueryKey KeyNameInformation), causing strict
+// path parsers in the .NET CLR to abort and crash the process.
 //
 // Fixes applied here:
-//   1. Strip trailing backslashes from the caller-supplied name so that the
-//      stored logPath is always clean and can be safely used as a parent.
-//   2. Normalise the parent+name join so that regardless of whether the
-//      parent ends in '\' or the name begins with '\', exactly one separator
-//      is inserted -- never zero, never two.
+//   1. Strip trailing backslashes from the caller-supplied name so the stored
+//      logPath is always clean and safe to use as a parent for future opens.
+//   2. Normalised join: ensure exactly one separator between parent and name,
+//      regardless of whether the parent's logPath has a trailing '\' or the
+//      name starts with '\'.
 static std::wstring GetFullNtPath(PVL_OBJECT_ATTRIBUTES oa) {
     if (!oa) return L"";
     std::wstring name = FromUStr(oa->ObjectName);
 
-    // 1. Strip trailing backslashes from the name component.
-    //    Registry key paths never semantically end in '\'; a trailing slash is
-    //    only ever an artefact of how some callers format the ObjectName string.
-    //    Storing it would corrupt every logPath built from this key as a parent.
+    // 1. Strip trailing backslashes (registry paths never end in '\').
     while (!name.empty() && name.back() == L'\\') name.pop_back();
 
     if (!oa->RootDirectory) return name;
@@ -878,15 +890,12 @@ static std::wstring GetFullNtPath(PVL_OBJECT_ATTRIBUTES oa) {
     std::wstring parentPath = GetHandleLogicalPath(oa->RootDirectory);
     if (name.empty()) return parentPath;
 
-    // 2. Normalised join: ensure exactly one backslash between parent and name,
-    //    regardless of whether the parent has a trailing '\' (from a previously
-    //    stored logPath that itself came from a trailing-slash ObjectName) or the
-    //    name starts with '\' (absolute path supplied alongside a RootDirectory).
+    // 2. Normalised join -- exactly one separator, never zero, never two.
     bool parentSlash = !parentPath.empty() && parentPath.back() == L'\\';
     bool nameSlash   = name.front() == L'\\';
-    if (parentSlash && nameSlash)  return parentPath + name.substr(1); // drop one
-    if (parentSlash || nameSlash)  return parentPath + name;            // already one
-    return parentPath + L"\\" + name;                                   // add one
+    if (parentSlash && nameSlash)  return parentPath + name.substr(1);
+    if (parentSlash || nameSlash)  return parentPath + name;
+    return parentPath + L"\\" + name;
 }
 
 // Compute virtual NT path from logical path.
@@ -2216,79 +2225,143 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
     VL_DBG(L"Hook_NtQueryKey: class=%d handle=%p virt=%p real=%p",
            (int)KeyInformationClass, KeyHandle, e.hVirt, e.hReal);
 
-    // FIX: KeyNameInformation (class 3) returns the full NT path of the open key.
+    // -----------------------------------------------------------------------
+    // FIX A: KeyNameInformation (class 3)
     //
-    // Forwarding to e.hVirt makes the kernel return the physical virtual-store
-    // path, e.g.:
+    // Forwarding to e.hVirt returns the physical virtual-store path, e.g.:
     //   \Registry\User\<SID>\VirtLauncher\HKEY_LOCAL_MACHINE\SOFTWARE\...
     //
-    // The .NET CLR calls NtQueryKey(KeyNameInformation) during CLR startup to
-    // validate assembly policy, binding context, and AppDomain paths.  It
-    // compares the returned path against the path it originally requested.
-    // Seeing the virtual-store path instead of the expected logical path
-    // (\REGISTRY\MACHINE\SOFTWARE\...) causes the CLR to abort initialisation,
-    // crashing every managed application -- PowerShell, any .NET EXE -- before
-    // it prints a single line.
+    // The .NET CLR calls NtQueryKey(KeyNameInformation) during startup to
+    // validate assembly policy, binding, and AppDomain paths.  It expects the
+    // exact logical path the app originally opened.  Returning the virtual-store
+    // path causes the CLR to abort, crashing PowerShell and every managed EXE.
     //
-    // Additionally, the double-backslash bug fixed in GetFullNtPath above means
-    // some logPaths were stored with a double backslash
-    // (e.g. ...Policy\\AppPatch).  Returning such a path to the CLR's strict
-    // path parser is equally fatal.  Both problems are eliminated together: the
-    // GetFullNtPath fix guarantees logPath is always clean, and this block
-    // ensures the clean logPath is what the CLR actually sees.
-    //
-    // Fix: synthesise the KEY_NAME_INFORMATION response directly from e.logPath
-    // (the exact logical NT path the application requested) without asking the
-    // kernel at all.
-    //
-    // Buffer protocol (mirrors real NT kernel behaviour for this class):
-    //
-    //   requiredSize = sizeof(ULONG/*NameLength*/) + byte-length of path string
-    //
-    //   Length < sizeof(ULONG)   -> STATUS_BUFFER_TOO_SMALL
-    //                               (can't even write the NameLength field)
+    // Fix: synthesise the response directly from e.logPath.
+    // Buffer protocol mirrors real NT kernel behaviour:
+    //   Length < sizeof(ULONG)          -> STATUS_BUFFER_TOO_SMALL
     //   sizeof(ULONG) <= Length
-    //     < requiredSize         -> write NameLength + as many chars as fit,
-    //                               return STATUS_BUFFER_OVERFLOW
-    //                               (.NET two-pass pattern: probe size first,
-    //                                then retry with correct allocation)
-    //   Length >= requiredSize   -> write full response, STATUS_SUCCESS
+    //     < sizeof(ULONG)+nameBytes     -> write NameLength + partial chars,
+    //                                      STATUS_BUFFER_OVERFLOW
+    //   Length >= sizeof(ULONG)+nameBytes -> full response, STATUS_SUCCESS
+    // -----------------------------------------------------------------------
     if (KeyInformationClass == VlKeyNameInformation && !e.logPath.empty()) {
         ULONG nameBytes    = (ULONG)(e.logPath.size() * sizeof(WCHAR));
         ULONG requiredSize = sizeof(ULONG) + nameBytes;
 
-        // Always report the true required size so callers can allocate correctly.
         if (ResultLength) *ResultLength = requiredSize;
 
-        // Buffer too small to write even the NameLength ULONG.
         if (Length < sizeof(ULONG))
             return VL_STATUS_BUFFER_TOO_SMALL;
 
         VL_KEY_NAME_INFORMATION* kni =
             reinterpret_cast<VL_KEY_NAME_INFORMATION*>(KeyInformation);
-
-        // Always write NameLength so a size-probe (Length == sizeof(ULONG)) works.
         kni->NameLength = nameBytes;
 
         if (Length < requiredSize) {
-            // Buffer holds the NameLength field but not the full string.
-            // Partially fill with however many characters fit -- some CLR builds
-            // read partial data from the buffer on overflow without retrying.
             ULONG fits = Length - sizeof(ULONG);
-            if (fits > 0)
-                memcpy(kni->Name, e.logPath.c_str(), fits);
+            if (fits > 0) memcpy(kni->Name, e.logPath.c_str(), fits);
             return VL_STATUS_BUFFER_OVERFLOW;
         }
 
-        // Full buffer: write the complete logical path and succeed.
         memcpy(kni->Name, e.logPath.c_str(), nameBytes);
         return VL_STATUS_SUCCESS;
     }
 
-    // All other information classes (Basic=0, Node=1, Full=2, Cached=4,
-    // Flags=5, VirtualizationInfo=6, HandleTags=7, ...) return structural
-    // metadata only -- no path strings -- so forwarding to e.hVirt is safe.
-    HANDLE queryH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : KeyHandle);
+    // -----------------------------------------------------------------------
+    // FIX B: KeyFullInformation (class 2) and KeyCachedInformation (class 4)
+    //
+    // These classes return SubKeys, Values, and MaxNameLen counts that callers
+    // use to pre-allocate buffers before calling NtEnumerateKey.
+    //
+    // The original code passed e.hVirt to the kernel.  e.hVirt is a CoW
+    // placeholder key that is empty when no virtualised writes have occurred,
+    // so the kernel legitimately returns SubKeys=0, Values=0.
+    //
+    // However, Hook_NtEnumerateKey presents a *merged* view (virtual + real).
+    // When the CLR sees SubKeys=0 from NtQueryKey but then receives real entries
+    // from NtEnumerateKey, it writes them into a 0-element pre-allocated buffer
+    // -> heap corruption -> c0000005 access violation in mscoree.dll.
+    //
+    // Fix: when both handles exist, query each independently and merge the
+    // counts additively (SubKeys, Values) and with max() (length fields).
+    // Over-counting is 100% safe -- the CLR just pre-allocates extra space.
+    // Under-counting is fatal.
+    //
+    // This mirrors exactly what NtEnumerateKey does: it returns entries from
+    // both handles (deduplicated), so the total count can be up to
+    // virt.SubKeys + real.SubKeys.
+    // -----------------------------------------------------------------------
+    if ((KeyInformationClass == VlKeyFullInformation ||
+         KeyInformationClass == VlKeyCachedInformation) &&
+        e.hVirt && e.hReal && e.hVirt != e.hReal)
+    {
+        // Query the real handle into the caller's buffer first.
+        NTSTATUS stReal = Real_NtQueryKey(e.hReal, KeyInformationClass,
+                                          KeyInformation, Length, ResultLength);
+
+        // If the real query succeeded and the buffer is large enough to hold the
+        // fixed-size scalar fields, query the virtual handle into a temp buffer
+        // and merge the counts.
+        if (NT_SUCCESS(stReal) && KeyInformation && Length > 0) {
+            std::vector<BYTE> virtBuf(Length, 0);
+            ULONG virtResLen = 0;
+            NTSTATUS stVirt = Real_NtQueryKey(e.hVirt, KeyInformationClass,
+                                              &virtBuf[0], Length, &virtResLen);
+            if (NT_SUCCESS(stVirt)) {
+                if (KeyInformationClass == VlKeyFullInformation) {
+                    // VL_KEY_FULL_INFORMATION: the scalar fields (everything
+                    // before the variable-length Class[] array) end at the
+                    // ClassOffset/ClassLength pair.  offsetof(Class) gives the
+                    // byte where the array starts; all scalar fields are before it.
+                    const ULONG kMinFull =
+                        sizeof(LARGE_INTEGER) +          // LastWriteTime
+                        sizeof(ULONG) * 9;               // TitleIndex..MaxValueDataLen
+                    if (Length >= kMinFull && virtResLen >= kMinFull) {
+                        VL_KEY_FULL_INFORMATION* rFi =
+                            reinterpret_cast<VL_KEY_FULL_INFORMATION*>(KeyInformation);
+                        VL_KEY_FULL_INFORMATION* vFi =
+                            reinterpret_cast<VL_KEY_FULL_INFORMATION*>(&virtBuf[0]);
+                        // Sum counts (virtual entries not yet shadowing real ones).
+                        rFi->SubKeys       += vFi->SubKeys;
+                        rFi->Values        += vFi->Values;
+                        // Max of length hints (caller uses them to size name buffers).
+                        if (vFi->MaxNameLen      > rFi->MaxNameLen)
+                            rFi->MaxNameLen      = vFi->MaxNameLen;
+                        if (vFi->MaxClassLen     > rFi->MaxClassLen)
+                            rFi->MaxClassLen     = vFi->MaxClassLen;
+                        if (vFi->MaxValueNameLen > rFi->MaxValueNameLen)
+                            rFi->MaxValueNameLen = vFi->MaxValueNameLen;
+                        if (vFi->MaxValueDataLen > rFi->MaxValueDataLen)
+                            rFi->MaxValueDataLen = vFi->MaxValueDataLen;
+                    }
+                } else { // VlKeyCachedInformation
+                    if (Length >= sizeof(VL_KEY_CACHED_INFORMATION) &&
+                        virtResLen >= sizeof(VL_KEY_CACHED_INFORMATION))
+                    {
+                        VL_KEY_CACHED_INFORMATION* rCi =
+                            reinterpret_cast<VL_KEY_CACHED_INFORMATION*>(KeyInformation);
+                        VL_KEY_CACHED_INFORMATION* vCi =
+                            reinterpret_cast<VL_KEY_CACHED_INFORMATION*>(&virtBuf[0]);
+                        rCi->SubKeys       += vCi->SubKeys;
+                        rCi->Values        += vCi->Values;
+                        if (vCi->MaxNameLen      > rCi->MaxNameLen)
+                            rCi->MaxNameLen      = vCi->MaxNameLen;
+                        if (vCi->MaxValueNameLen > rCi->MaxValueNameLen)
+                            rCi->MaxValueNameLen = vCi->MaxValueNameLen;
+                        if (vCi->MaxValueDataLen > rCi->MaxValueDataLen)
+                            rCi->MaxValueDataLen = vCi->MaxValueDataLen;
+                    }
+                }
+            }
+        }
+        return stReal;
+    }
+
+    // All other classes: forward to whichever handle is available.
+    // Use hReal when both exist -- hVirt is the CoW placeholder and for
+    // structural queries (Basic, Node, Cached without both handles) the real
+    // handle gives more accurate metadata.
+    HANDLE queryH = e.hReal ? e.hReal : (e.hVirt ? e.hVirt : KeyHandle);
     return Real_NtQueryKey(queryH, KeyInformationClass,
                             KeyInformation, Length, ResultLength);
 }
@@ -4623,19 +4696,14 @@ static NTSTATUS NTAPI Hook_NtQueryInformationFile(
     NTSTATUS st = Real_NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
     if (!NT_SUCCESS(st)) return st;
 
-    // Helper struct matching FILE_NAME_INFORMATION layout.
-    struct MY_FNI {
-        ULONG FileNameLength; // byte count, no null terminator
-        WCHAR FileName[1];
-    };
+    // FILE_NAME_INFORMATION layout: { ULONG FileNameLength; WCHAR FileName[1]; }
+    struct MY_FNI { ULONG FileNameLength; WCHAR FileName[1]; };
 
     // Reverse-translate a FILE_NAME_INFORMATION block in-place.
-    // pFni   - pointer to the MY_FNI block inside the output buffer.
-    // avail  - bytes available from pFni to the end of the buffer.
-    // If ReverseApplyFsRedirect produces a shorter logical path, write it back.
-    // (The logical path is always <= the physical path in length because we only
-    //  strip a prefix, never add one, so in-place shrink is always safe.)
-    auto reverseTranslateNameBlock = [](MY_FNI* pFni, ULONG avail) {
+    // avail = bytes available from pFni to end of buffer.
+    // ReverseApplyFsRedirect always produces a path <= the physical length,
+    // so in-place shrink never overflows.
+    auto reverseTranslate = [](MY_FNI* pFni, ULONG avail) {
         if (pFni->FileNameLength == 0) return;
         if (avail < sizeof(ULONG) + pFni->FileNameLength) return;
         std::wstring phys(pFni->FileName, pFni->FileNameLength / sizeof(WCHAR));
@@ -4647,40 +4715,32 @@ static NTSTATUS NTAPI Hook_NtQueryInformationFile(
         }
     };
 
-    // FileNameInformation (class 9):
-    //   Buffer IS the FILE_NAME_INFORMATION directly.
-    if (FileInformationClass == 9 /*FileNameInformation*/ &&
-        Length >= sizeof(ULONG))
-    {
-        reverseTranslateNameBlock(reinterpret_cast<MY_FNI*>(FileInformation),
-                                  Length);
-    }
+    // FileNameInformation (class 9): buffer IS FILE_NAME_INFORMATION.
+    // Pre-existing USHORT type bug fixed: FileNameLength is ULONG, not USHORT.
+    if (FileInformationClass == 9 && Length >= sizeof(ULONG))
+        reverseTranslate(reinterpret_cast<MY_FNI*>(FileInformation), Length);
 
-    // FileAllInformation (class 21):
-    //   A composite structure.  FILE_NAME_INFORMATION is embedded at a fixed
-    //   offset of 96 bytes after the start of FILE_ALL_INFORMATION:
+    // FileAllInformation (class 21): composite structure with FILE_NAME_INFORMATION
+    // embedded at a fixed offset of 96 bytes.
     //
-    //     FILE_BASIC_INFORMATION      40 bytes  (4×LARGE_INTEGER + ULONG + 4 pad)
-    //     FILE_STANDARD_INFORMATION   24 bytes  (2×LARGE_INTEGER + ULONG + 2×BOOL + 2 pad)
-    //     FILE_INTERNAL_INFORMATION    8 bytes  (LARGE_INTEGER)
-    //     FILE_EA_INFORMATION          4 bytes  (ULONG)
-    //     FILE_ACCESS_INFORMATION      4 bytes  (ACCESS_MASK)
-    //     FILE_POSITION_INFORMATION    8 bytes  (LARGE_INTEGER)
-    //     FILE_MODE_INFORMATION        4 bytes  (ULONG)
-    //     FILE_ALIGNMENT_INFORMATION   4 bytes  (ULONG)
-    //     FILE_NAME_INFORMATION            <-- offset 96
+    //   FILE_BASIC_INFORMATION      40 bytes  (4×LARGE_INTEGER + ULONG + 4 pad)
+    //   FILE_STANDARD_INFORMATION   24 bytes  (2×LARGE_INTEGER + ULONG + 2×BOOL + 2 pad)
+    //   FILE_INTERNAL_INFORMATION    8 bytes  (LARGE_INTEGER)
+    //   FILE_EA_INFORMATION          4 bytes  (ULONG)
+    //   FILE_ACCESS_INFORMATION      4 bytes  (ACCESS_MASK)
+    //   FILE_POSITION_INFORMATION    8 bytes  (LARGE_INTEGER)
+    //   FILE_MODE_INFORMATION        4 bytes  (ULONG)
+    //   FILE_ALIGNMENT_INFORMATION   4 bytes  (ULONG)
+    //   FILE_NAME_INFORMATION            <-- offset 96
     //
-    //   Without this interception the embedded name field leaks the physical
-    //   virtual-store path -- same class of bug as the NtQueryKey fix above.
-    //   The CLR (and other managed code) calls FileAllInformation to validate
-    //   the path of loaded assemblies; a virtual-store path causes it to abort.
-    if (FileInformationClass == 21 /*FileAllInformation*/) {
+    // Without interception the embedded name leaks the physical virtual-store
+    // path -- same class of bug as the NtQueryKey FIX A above.
+    if (FileInformationClass == 21) {
         const ULONG kNameOffset = 96u;
-        if (Length > kNameOffset + sizeof(ULONG)) {
-            MY_FNI* pFni = reinterpret_cast<MY_FNI*>(
-                static_cast<BYTE*>(FileInformation) + kNameOffset);
-            reverseTranslateNameBlock(pFni, Length - kNameOffset);
-        }
+        if (Length > kNameOffset + sizeof(ULONG))
+            reverseTranslate(
+                reinterpret_cast<MY_FNI*>(static_cast<BYTE*>(FileInformation) + kNameOffset),
+                Length - kNameOffset);
     }
 
     return st;
