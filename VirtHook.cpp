@@ -2107,10 +2107,12 @@ static NTSTATUS DoVirtOpen(
     // --- NEW FIX: Read-Only CoW Bypass ---
     // If the caller is only asking for read access, do NOT create an empty virtual key.
     // This prevents the massive CoW Explosion that crashes heavy COM apps like Tablacus.
+    // If the caller is only asking for read access (or probing with MAXIMUM_ALLOWED), 
+    // do NOT create an empty virtual key. This prevents the CoW Explosion and 
+    // prevents tricking .NET/COM into thinking they are running as Administrator.
     bool isWrite = (DesiredAccess & (KEY_SET_VALUE | KEY_CREATE_SUB_KEY | 
                                      KEY_CREATE_LINK | DELETE | WRITE_DAC | 
-                                     WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL | 
-                                     MAXIMUM_ALLOWED)) != 0;
+                                     WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL)) != 0;
 
     if (!isWrite) {
         *KeyHandle = hReal;
