@@ -2057,8 +2057,11 @@ static NTSTATUS DoVirtOpen(
         NTSTATUS st = Real_NtCreateKey(&hVirt, DesiredAccess, &voa,
                                         TitleIndex, Class, CreateOptions, Disposition);
         if (NT_SUCCESS(st)) {
+            // Preserve WOW64 view flags when opening the real shadow handle
+            ULONG realAccess = KEY_READ | (DesiredAccess & (KEY_WOW64_64KEY | KEY_WOW64_32KEY));
+
             HANDLE hReal = NULL;
-            NTSTATUS sr = Real_NtOpenKey(&hReal, KEY_READ, &realOa);
+            NTSTATUS sr = Real_NtOpenKey(&hReal, realAccess, &realOa); 
             if (!NT_SUCCESS(sr)) hReal = NULL; // FIX: Prevent garbage handle
 
             *KeyHandle = hVirt;
@@ -2079,8 +2082,11 @@ static NTSTATUS DoVirtOpen(
     NTSTATUS stV = Real_NtOpenKey(&hVirt, DesiredAccess, &voa);
     if (!NT_SUCCESS(stV)) hVirt = NULL; // FIX: Prevent garbage handles
 
+    // Preserve WOW64 view flags when opening the real shadow handle
+    ULONG realAccess = KEY_READ | (DesiredAccess & (KEY_WOW64_64KEY | KEY_WOW64_32KEY));
+
     HANDLE hReal = NULL;
-    NTSTATUS sr = Real_NtOpenKey(&hReal, KEY_READ, &realOa); 
+    NTSTATUS sr = Real_NtOpenKey(&hReal, realAccess, &realOa); 
     if (!NT_SUCCESS(sr)) hReal = NULL; // FIX: Prevent garbage handle
 
     if (NT_SUCCESS(stV)) {
@@ -2367,12 +2373,15 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
         NTSTATUS stReal = Real_NtQueryKey(e.hReal, KeyInformationClass,
                                           KeyInformation, Length, ResultLength);
 
-        if (NT_SUCCESS(stReal) && KeyInformation && Length > 0) {
+        // FIX: Explicitly handle VL_STATUS_BUFFER_OVERFLOW. The kernel successfully fills
+        // the scalar fields (like SubKeys/Values) even when the Class string overflows.
+        if ((NT_SUCCESS(stReal) || stReal == VL_STATUS_BUFFER_OVERFLOW) && KeyInformation && Length > 0) {
             std::vector<BYTE> virtBuf(Length, 0);
             ULONG virtResLen = 0;
             NTSTATUS stVirt = Real_NtQueryKey(e.hVirt, KeyInformationClass,
                                               &virtBuf[0], Length, &virtResLen);
-            if (NT_SUCCESS(stVirt)) {
+                                              
+            if (NT_SUCCESS(stVirt) || stVirt == VL_STATUS_BUFFER_OVERFLOW) {
 
                 // ----------------------------------------------------------
                 // Compute exact deduplicated subkey and value counts.
