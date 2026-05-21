@@ -1006,7 +1006,23 @@ static bool LogicalToVirtual(const std::wstring& logical, std::wstring& virt) {
             // The character immediately after the SID is not a separator.
             // This is a DIFFERENT hive whose name shares the SID prefix --
             // the canonical case is <SID>_Classes (per-user HKCR backing hive).
-            // Fall through to the HKU catch-all so it routes to HKEY_USERS.
+            //
+            // Do NOT redirect and do NOT fall through to the HKU arm.
+            // <SID>_Classes is an independent NT hive loaded directly under
+            // \REGISTRY\USER.  Routing it through HKEY_USERS creates a virtual
+            // path that has no real hive behind it, which breaks COM in two ways:
+            //   1. NtQueryKey(class=7, KeyHandleTagsInformation) on the virtual
+            //      handle returns plain-key flags instead of the hive-root flag
+            //      (REG_FLAG_HIVE_ROOT).  The COM/OLE runtime checks this bit to
+            //      manage the HKCR merged view and misroutes class look-ups.
+            //   2. Relative opens from the redirected handle resolve against the
+            //      virtual store rather than the real _Classes hive, so COM class
+            //      registrations are invisible and data written by the app lands
+            //      in the wrong location.
+            // Both issues cause heap/stack corruption in the caller -> BEX64 crash.
+            VL_DBG(L"LogicalToVirtual: SKIP (non-HKCU SID-suffix hive, e.g. _Classes) path=%s",
+                   logical.c_str());
+            return false;
         } else {
             std::wstring sub = logical.substr(hLen);
             if (sub.empty()) {
