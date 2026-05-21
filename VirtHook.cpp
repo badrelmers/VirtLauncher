@@ -2096,11 +2096,28 @@ static NTSTATUS DoVirtOpen(
         return VL_STATUS_SUCCESS;
     }
 
+
     if (!hReal) {
         // FIX: Removed dangerous `if (hVirt) Real_NtClose(hVirt);` 
         // If stV failed, hVirt is garbage and must NOT be closed.
         VL_DBG(L"DoVirtOpen: OPEN neither exists -> NOT_FOUND");
         return VL_STATUS_OBJECT_NOT_FOUND;
+    }
+
+    // --- NEW FIX: Read-Only CoW Bypass ---
+    // If the caller is only asking for read access, do NOT create an empty virtual key.
+    // This prevents the massive CoW Explosion that crashes heavy COM apps like Tablacus.
+    bool isWrite = (DesiredAccess & (KEY_SET_VALUE | KEY_CREATE_SUB_KEY | 
+                                     KEY_CREATE_LINK | DELETE | WRITE_DAC | 
+                                     WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL | 
+                                     MAXIMUM_ALLOWED)) != 0;
+
+    if (!isWrite) {
+        *KeyHandle = hReal;
+        // Track with hVirt = NULL so enumeration hooks bypass merge penalties
+        TrackHandle(hReal, NULL, hReal, fullPath); 
+        VL_DBG(L"DoVirtOpen: OPEN read-only CoW fallback to real");
+        return VL_STATUS_SUCCESS;
     }
 
     // Copy-on-write
