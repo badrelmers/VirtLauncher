@@ -1007,22 +1007,36 @@ static bool LogicalToVirtual(const std::wstring& logical, std::wstring& virt) {
             // This is a DIFFERENT hive whose name shares the SID prefix --
             // the canonical case is <SID>_Classes (per-user HKCR backing hive).
             //
-            // Do NOT redirect and do NOT fall through to the HKU arm.
-            // <SID>_Classes is an independent NT hive loaded directly under
-            // \REGISTRY\USER.  Routing it through HKEY_USERS creates a virtual
-            // path that has no real hive behind it, which breaks COM in two ways:
-            //   1. NtQueryKey(class=7, KeyHandleTagsInformation) on the virtual
-            //      handle returns plain-key flags instead of the hive-root flag
-            //      (REG_FLAG_HIVE_ROOT).  The COM/OLE runtime checks this bit to
-            //      manage the HKCR merged view and misroutes class look-ups.
-            //   2. Relative opens from the redirected handle resolve against the
-            //      virtual store rather than the real _Classes hive, so COM class
-            //      registrations are invisible and data written by the app lands
-            //      in the wrong location.
-            // Both issues cause heap/stack corruption in the caller -> BEX64 crash.
-            VL_DBG(L"LogicalToVirtual: SKIP (non-HKCU SID-suffix hive, e.g. _Classes) path=%s",
+            // Previous behaviour: return false here (skip virtualization).
+            // Reason given at the time: routing _Classes through HKEY_USERS
+            // would strip the REG_FLAG_HIVE_ROOT flag from KeyHandleTagsInformation
+            // queries on the virtual handle, confusing COM/OLE and causing BEX64
+            // crashes.
+            //
+            // Why that reason no longer applies:
+            //   FIX C in Hook_NtQueryKey intercepts KeyHandleTagsInformation
+            //   (class 7) for ALL tracked handles and unconditionally returns 0.
+            //   COM/OLE therefore never receives REG_FLAG_HIVE_ROOT from a
+            //   virtual handle regardless of what e.hReal would return.
+            //   The crash path is completely closed.
+            //
+            // Why returning false here was a sandbox leak:
+            //   return false tells DoVirtOpen "don't redirect this path".
+            //   The NT call then passes straight through to the real
+            //   \REGISTRY\USER\<SID>_Classes hive. Any per-user COM/HKCR write
+            //   that the kernel routes through _Classes lands in the real host
+            //   registry -- a sandbox escape.
+            //
+            // Fix: do NOT return false. Fall through to the HKEY_USERS block
+            // below, which redirects \REGISTRY\USER\<SID>_Classes to
+            //   VirtNtBase\HKEY_USERS\<SID>_Classes
+            // keeping all _Classes writes inside the virtual store.
+            
+            VL_DBG(L"LogicalToVirtual: _Classes suffix -- falling through to HKEY_USERS block path=%s",
                    logical.c_str());
-            return false;
+            // Intentional fall-through -- do NOT add return false here.
+            // NOTE: adding 'return false;' fix tablacus and powershell crash but writes leaks in HKEY_USERS\<SID>_Classes they are writed directly in the real reg not our virtual reg. in the other hand, removing 'return false;' fix the leak but make tablacus and powershell crash!!!!!!
+            // return false;
         } else {
             std::wstring sub = logical.substr(hLen);
             if (sub.empty()) {

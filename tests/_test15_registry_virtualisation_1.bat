@@ -30,20 +30,69 @@ echo  VirtLauncher Registry Redirection Test Suite
 echo ============================================================
 echo.
 
+@rem NOTE:writes to HKEY_CLASSES_ROOT go to %VIRT_ROOT%\HKEY_LOCAL_MACHINE\SOFTWARE\Classes not %VIRT_ROOT%\HKEY_CLASSES_ROOT
 set "REAL_key=HKEY_CLASSES_ROOT\VirtTest_HKCR_Real"
+set "VIRT_key=%VIRT_ROOT%\HKEY_LOCAL_MACHINE\SOFTWARE\Classes\VirtTest_HKCR_Real"
 call :run_tests
 
 set "REAL_key=HKEY_LOCAL_MACHINE\SOFTWARE\Classes\VirtTest_HKLM_Real"
+set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
 call :run_tests
 
 set "REAL_key=HKEY_LOCAL_MACHINE\SOFTWARE\VirtTest_HKLM_Real"
+set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
 call :run_tests
 
 set "REAL_key=HKEY_CURRENT_USER\Software\VirtTest_HKCU_Real"
+set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
 call :run_tests
 
 
 
+:: 1. Automatically get the current user's SID
+for /f "tokens=2 delims==" %%A in ('wmic useraccount where "name='%username%'" get sid /value 2^>nul') do (
+    set "USER_SID=%%A"
+)
+
+:: Fallback method if WMIC is unavailable (common in newer Windows 11 builds)
+if "%USER_SID%"=="" (
+    for /f "tokens=2" %%A in ('whoami /user /fo table /nh') do (
+        set "USER_SID=%%A"
+    )
+)
+
+:: Trim any trailing spaces
+set "USER_SID=%USER_SID: =%"
+
+@rem echo [+] Found User SID: %USER_SID%
+
+
+:: 2. Define the target key path and the test value
+
+set "REAL_key=HKEY_USERS\%USER_SID%_Classes\VirtHookLeak"
+set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
+call :run_tests
+
+@rem NOTE:writes to HKEY_USERS\S-1-5-21-3874345145-3142222481-512852731-1000 go to %VIRT_ROOT%\HKEY_CURRENT_USER not %VIRT_ROOT%\S-1-5-21-3874345145-3142222481-512852731-1000
+set "REAL_key=HKEY_USERS\%USER_SID%\VirtHookLeak"
+set "VIRT_key=%VIRT_ROOT%\HKEY_CURRENT_USER\VirtHookLeak"
+call :run_tests
+
+set "REAL_key=HKEY_USERS\.DEFAULT\VirtHookLeak"
+set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
+call :run_tests
+
+set "REAL_key=HKEY_USERS\S-1-5-18\VirtHookLeak"
+set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
+call :run_tests
+
+set "REAL_key=HKEY_USERS\S-1-5-19\VirtHookLeak"
+set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
+call :run_tests
+
+set "REAL_key=HKEY_USERS\S-1-5-20\VirtHookLeak"
+set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
+call :run_tests
 
 echo.
 echo ============================================================
@@ -70,10 +119,6 @@ exit /b
 :: TESTS
 :: ============================================================
 :run_tests
-
-:: Virtual mapped paths
-set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
-
 :: Cleanup real host registry to ensure clean slate
 call :CLEANUP
 
