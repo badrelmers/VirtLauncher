@@ -2073,56 +2073,109 @@ static NTSTATUS DoVirtOpen(
         return st;
     }
 
-    // Open path: try virtual first
+    // -----------------------------------------------------------------------
+    // Open path.
+    //
+    // FIX 2: Determine write-intent BEFORE attempting the virtual lookup.
+    //
+    // Previous order of operations:
+    //   1. Try virtual open
+    //   2. If virtual succeeds → return virtual handle (merge entry)
+    //   3. Else if read-only → return real handle (bypass)
+    //   4. Else → CoW + EnsureVirtualPath
+    //
+    // Problem: EnsureVirtualPath (step 4) creates empty intermediate keys in
+    // the virtual store for every ancestor of the actual write target.  E.g.
+    // writing to HKLM\SOFTWARE\SomeApp creates placeholder keys at:
+    //   VirtNtBase\HKEY_LOCAL_MACHINE
+    //   VirtNtBase\HKEY_LOCAL_MACHINE\SOFTWARE
+    //   VirtNtBase\HKEY_LOCAL_MACHINE\SOFTWARE\SomeApp   ← actual target
+    //
+    // On the NEXT read-only open of HKLM\SOFTWARE the virtual lookup (step 1)
+    // succeeds (placeholder exists!) so the read-only bypass (step 3) never
+    // fires.  The caller gets a full {hVirt, hReal} merge entry even though it
+    // only asked for read access.  Two consequences:
+    //
+    //   A. PERFORMANCE: every NtQueryKey(KeyFullInformation) on HKLM\SOFTWARE
+    //      triggers the deduplicated subkey-count loop over all thousands of
+    //      real SOFTWARE children.
+    //
+    //   B. CRASH (KeyHandleTagsInformation, see FIX C in Hook_NtQueryKey):
+    //      the placeholder entry has e.hReal = handle to \REGISTRY\MACHINE\SOFTWARE,
+    //      which IS a Windows hive root.  Forwarding KeyHandleTagsInformation to
+    //      e.hReal returns REG_FLAG_HIVE_ROOT, confusing COM and .NET CLR.
+    //      (FIX C closes that query path, but eliminating the placeholder entry
+    //      entirely is the cleaner defence-in-depth.)
+    //
+    // Fix: move isWrite check to the top.  For read-only opens, skip the
+    // virtual lookup entirely and go straight to the real key bypass.  This
+    // ensures EnsureVirtualPath placeholders are NEVER returned as merge entries
+    // for read-only callers, regardless of whether they were created earlier by
+    // a write open to a deeper subkey.
+    //
+    // For write-capable opens the behaviour is unchanged: try virtual first
+    // (in case a previous CoW wrote something useful there), then CoW if not.
+    // -----------------------------------------------------------------------
+
+    bool isWrite = (DesiredAccess & (KEY_SET_VALUE | KEY_CREATE_SUB_KEY |
+                                     KEY_CREATE_LINK | DELETE | WRITE_DAC |
+                                     WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL)) != 0;
+
+    // Preserve WOW64 view flags on the real shadow handle.
+    ULONG realAccess = KEY_READ | (DesiredAccess & (KEY_WOW64_64KEY | KEY_WOW64_32KEY));
+
+    if (!isWrite) {
+        // ---- Read-only bypass (fast path) --------------------------------
+        // Skip the virtual lookup entirely.  Even if a placeholder exists,
+        // a read-only caller must never get a merge entry that accidentally
+        // exposes hive-root metadata from e.hReal.
+        HANDLE hReal = NULL;
+        NTSTATUS sr = Real_NtOpenKey(&hReal, realAccess, &realOa);
+        if (!NT_SUCCESS(sr) || !hReal) {
+            VL_DBG(L"DoVirtOpen: OPEN read-only real not found -> NOT_FOUND");
+            return VL_STATUS_OBJECT_NOT_FOUND;
+        }
+        *KeyHandle = hReal;
+        // Track with hVirt = NULL so enumeration / query hooks use the
+        // lightweight single-handle path (no merge enumeration penalty).
+        TrackHandle(hReal, NULL, hReal, fullPath);
+        VL_DBG(L"DoVirtOpen: OPEN read-only bypass -> real hReal=%p", hReal);
+        return VL_STATUS_SUCCESS;
+    }
+
+    // ---- Write-capable open path -----------------------------------------
+    // Try virtual first: a previous CoW may have written data there that the
+    // caller needs to see and modify.
     VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
     VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
         OrigOA->Attributes | OBJ_CASE_INSENSITIVE);
 
     HANDLE hVirt = NULL;
     NTSTATUS stV = Real_NtOpenKey(&hVirt, DesiredAccess, &voa);
-    if (!NT_SUCCESS(stV)) hVirt = NULL; // FIX: Prevent garbage handles
-
-    // Preserve WOW64 view flags when opening the real shadow handle
-    ULONG realAccess = KEY_READ | (DesiredAccess & (KEY_WOW64_64KEY | KEY_WOW64_32KEY));
+    if (!NT_SUCCESS(stV)) hVirt = NULL; // prevent garbage handle
 
     HANDLE hReal = NULL;
-    NTSTATUS sr = Real_NtOpenKey(&hReal, realAccess, &realOa); 
-    if (!NT_SUCCESS(sr)) hReal = NULL; // FIX: Prevent garbage handle
+    NTSTATUS sr = Real_NtOpenKey(&hReal, realAccess, &realOa);
+    if (!NT_SUCCESS(sr)) hReal = NULL; // prevent garbage handle
 
-    if (NT_SUCCESS(stV)) {
+    if (hVirt) {
+        // Virtual key already existed (either from a prior CoW or from
+        // EnsureVirtualPath on a deeper write -- but since isWrite=true here,
+        // returning a merge entry is correct: the caller has write intent and
+        // should see the merged view it previously created).
         *KeyHandle = hVirt;
         TrackHandle(hVirt, hVirt, hReal, fullPath);
         VL_DBG(L"DoVirtOpen: OPEN virtual hVirt=%p hReal=%p", hVirt, hReal);
         return VL_STATUS_SUCCESS;
     }
 
-
     if (!hReal) {
-        // FIX: Removed dangerous `if (hVirt) Real_NtClose(hVirt);` 
-        // If stV failed, hVirt is garbage and must NOT be closed.
         VL_DBG(L"DoVirtOpen: OPEN neither exists -> NOT_FOUND");
         return VL_STATUS_OBJECT_NOT_FOUND;
     }
 
-    // --- NEW FIX: Read-Only CoW Bypass ---
-    // If the caller is only asking for read access, do NOT create an empty virtual key.
-    // This prevents the massive CoW Explosion that crashes heavy COM apps like Tablacus.
-    // If the caller is only asking for read access (or probing with MAXIMUM_ALLOWED), 
-    // do NOT create an empty virtual key. This prevents the CoW Explosion and 
-    // prevents tricking .NET/COM into thinking they are running as Administrator.
-    bool isWrite = (DesiredAccess & (KEY_SET_VALUE | KEY_CREATE_SUB_KEY | 
-                                     KEY_CREATE_LINK | DELETE | WRITE_DAC | 
-                                     WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL)) != 0;
-
-    if (!isWrite) {
-        *KeyHandle = hReal;
-        // Track with hVirt = NULL so enumeration hooks bypass merge penalties
-        TrackHandle(hReal, NULL, hReal, fullPath); 
-        VL_DBG(L"DoVirtOpen: OPEN read-only CoW fallback to real");
-        return VL_STATUS_SUCCESS;
-    }
-
-    // Copy-on-write
+    // Virtual key doesn't exist yet.  Copy-on-write: create it now so the
+    // caller's writes land in the virtual store.
     HANDLE hVirtNew = NULL;
     ULONG disp = 0;
     EnsureVirtualPath(virtPath);
@@ -2138,8 +2191,7 @@ static NTSTATUS DoVirtOpen(
         return VL_STATUS_SUCCESS;
     }
 
-    VL_DBG(L"DoVirtOpen: OPEN CoW FAILED st=0x%08X -- using real untracked", (ULONG)stC);
-    // FIX: Removed dangerous `if (hVirtNew) Real_NtClose(hVirtNew);`
+    VL_DBG(L"DoVirtOpen: OPEN CoW FAILED st=0x%08X -- using real", (ULONG)stC);
     if (hReal) {
         *KeyHandle = hReal;
         return VL_STATUS_SUCCESS;
@@ -2514,10 +2566,81 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
         return stReal;
     }
 
-    // All other classes: forward to whichever handle is available.
-    // Use hReal when both exist -- hVirt is the CoW placeholder and for
-    // structural queries (Basic, Node, Cached without both handles) the real
-    // handle gives more accurate metadata.
+    // -----------------------------------------------------------------------
+    // FIX C: KeyHandleTagsInformation (class 7) -- ALWAYS return 0 for any
+    // handle tracked by VirtHook.
+    //
+    // Background
+    // ----------
+    // NtQueryKey(KeyHandleTagsInformation) returns a ULONG flags field.  The
+    // Windows kernel sets REG_FLAG_HIVE_ROOT (0x4) on handles that refer to
+    // the root of a physical registry hive.  The first-level children of
+    // \REGISTRY\MACHINE are all physical hive roots:
+    //
+    //   \REGISTRY\MACHINE\SOFTWARE   -> SOFTWARE.hiv  (hive root)
+    //   \REGISTRY\MACHINE\SYSTEM     -> SYSTEM.hiv    (hive root)
+    //   \REGISTRY\MACHINE\SAM        -> SAM.hiv       (hive root)
+    //   \REGISTRY\MACHINE\SECURITY   -> SECURITY.hiv  (hive root)
+    //   \REGISTRY\MACHINE\HARDWARE   -> HARDWARE.hiv  (hive root)
+    //
+    // The crash sequence (HKCU-only redirection did NOT trigger this)
+    // ---------------------------------------------------------------
+    // When only HKCU was redirected, every HKCU subkey opened for write got
+    // a CoW entry {hVirt, hReal}.  HKCU subkeys are NOT hive roots, so
+    // querying KeyHandleTagsInformation via e.hReal returned 0.  Safe.
+    //
+    // After adding HKLM redirection, an app (Tablacus via a COM/shell DLL,
+    // PowerShell via the .NET CLR policy reader) opens one of:
+    //   \REGISTRY\MACHINE\SOFTWARE
+    //   \REGISTRY\MACHINE\SYSTEM  ...
+    // with write-capable access (KEY_ALL_ACCESS, GENERIC_ALL, KEY_SET_VALUE).
+    // DoVirtOpen creates a CoW entry:
+    //   g_KeyMap[hVirt] = { hVirt, hReal=<handle to MACHINE\SOFTWARE>, ... }
+    //
+    // The caller then calls NtQueryKey(hVirt, class=7).
+    // Hook_NtQueryKey finds the entry, class 7 is not in the 0..4 enum, and
+    // falls to the catch-all:
+    //   queryH = e.hReal;   // = handle to \REGISTRY\MACHINE\SOFTWARE
+    //   Real_NtQueryKey(queryH, class=7, ...)
+    //   -> returns REG_FLAG_HIVE_ROOT = 4
+    //
+    // The caller now believes the virtual CoW handle IS a hive root and
+    // attempts hive-root-level operations on it (lazy-flush control, CLR
+    // assembly-binding validation, COM HKCR merge-root management).  These
+    // operations are wrong for a shallow key under the user hive -> heap/
+    // stack corruption -> crash (BEX64).
+    //
+    // Why FIX 2 alone is not sufficient
+    // -----------------------------------
+    // FIX 2 prevents read-only opens from getting merge entries, eliminating
+    // the most common exposure.  But write-capable opens still produce CoW
+    // entries with hive-root hReal handles.  Any subsequent class-7 query on
+    // those entries would still hit the bug.  FIX C is the definitive guard.
+    //
+    // Fix
+    // ---
+    // Inside the virtual store no handle is ever a hive root.  Return 0
+    // unconditionally for all tracked handles, regardless of what e.hReal
+    // would say.  This is identical to Sandboxie's approach:
+    //   key.c  Key_NtQueryKeyImpl  "KeyHandleTagsInformation" block:
+    //     *(ULONG *)KeyInformation = 0;
+    //     *ResultLength = sizeof(ULONG);
+    //     status = STATUS_SUCCESS;
+    // -----------------------------------------------------------------------
+    if ((int)KeyInformationClass == 7 /* KeyHandleTagsInformation */) {
+        if (ResultLength) *ResultLength = sizeof(ULONG);
+        if (!KeyInformation || Length < sizeof(ULONG))
+            return VL_STATUS_BUFFER_TOO_SMALL;
+        *(ULONG *)KeyInformation = 0;
+        return VL_STATUS_SUCCESS;
+    }
+
+    // All other classes (KeyFlagsInformation=5, KeyVirtualizationInformation=6,
+    // KeyTrustInformation=8, KeyLayerInformation=9, ...): forward to whichever
+    // handle is available.  Use hReal when both exist -- hVirt is the CoW
+    // placeholder and for structural queries the real handle gives more
+    // accurate metadata.  None of these remaining classes carry hive-root
+    // semantics, so forwarding to hReal is safe.
     HANDLE queryH = e.hReal ? e.hReal : (e.hVirt ? e.hVirt : KeyHandle);
     return Real_NtQueryKey(queryH, KeyInformationClass,
                             KeyInformation, Length, ResultLength);
