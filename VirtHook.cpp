@@ -2076,106 +2076,84 @@ static NTSTATUS DoVirtOpen(
     // -----------------------------------------------------------------------
     // Open path.
     //
-    // FIX 2: Determine write-intent BEFORE attempting the virtual lookup.
+    // Order of operations (restored to original correct order):
+    //   1. Try virtual open  (always -- a previous CoW write may be there)
+    //   2. If virtual exists → return merge entry {hVirt, hReal}
+    //   3. Else open real
+    //   4. If real not found → NOT_FOUND
+    //   5. If read-only → read-only bypass: return hReal tracked with hVirt=NULL
+    //   6. Else → Copy-on-Write: create virtual key, return merge entry
     //
-    // Previous order of operations:
-    //   1. Try virtual open
-    //   2. If virtual succeeds → return virtual handle (merge entry)
-    //   3. Else if read-only → return real handle (bypass)
-    //   4. Else → CoW + EnsureVirtualPath
+    // Why virtual must be tried FIRST (even for read-only opens):
+    //   When a sandboxed app previously wrote to HKLM\SOFTWARE\VirtTest_HKLM_Real
+    //   via CoW, the data lives in:
+    //     VirtNtBase\HKEY_LOCAL_MACHINE\SOFTWARE\VirtTest_HKLM_Real
+    //   The real HKLM path has NO data.  A subsequent read-only open of the same
+    //   path (e.g. `reg query HKLM\SOFTWARE\VirtTest_HKLM_Real`) MUST find the
+    //   virtual key first, or it returns NOT_FOUND and the read fails.
     //
-    // Problem: EnsureVirtualPath (step 4) creates empty intermediate keys in
-    // the virtual store for every ancestor of the actual write target.  E.g.
-    // writing to HKLM\SOFTWARE\SomeApp creates placeholder keys at:
-    //   VirtNtBase\HKEY_LOCAL_MACHINE
-    //   VirtNtBase\HKEY_LOCAL_MACHINE\SOFTWARE
-    //   VirtNtBase\HKEY_LOCAL_MACHINE\SOFTWARE\SomeApp   ← actual target
-    //
-    // On the NEXT read-only open of HKLM\SOFTWARE the virtual lookup (step 1)
-    // succeeds (placeholder exists!) so the read-only bypass (step 3) never
-    // fires.  The caller gets a full {hVirt, hReal} merge entry even though it
-    // only asked for read access.  Two consequences:
-    //
-    //   A. PERFORMANCE: every NtQueryKey(KeyFullInformation) on HKLM\SOFTWARE
-    //      triggers the deduplicated subkey-count loop over all thousands of
-    //      real SOFTWARE children.
-    //
-    //   B. CRASH (KeyHandleTagsInformation, see FIX C in Hook_NtQueryKey):
-    //      the placeholder entry has e.hReal = handle to \REGISTRY\MACHINE\SOFTWARE,
-    //      which IS a Windows hive root.  Forwarding KeyHandleTagsInformation to
-    //      e.hReal returns REG_FLAG_HIVE_ROOT, confusing COM and .NET CLR.
-    //      (FIX C closes that query path, but eliminating the placeholder entry
-    //      entirely is the cleaner defence-in-depth.)
-    //
-    // Fix: move isWrite check to the top.  For read-only opens, skip the
-    // virtual lookup entirely and go straight to the real key bypass.  This
-    // ensures EnsureVirtualPath placeholders are NEVER returned as merge entries
-    // for read-only callers, regardless of whether they were created earlier by
-    // a write open to a deeper subkey.
-    //
-    // For write-capable opens the behaviour is unchanged: try virtual first
-    // (in case a previous CoW wrote something useful there), then CoW if not.
+    // EnsureVirtualPath / hive-root safety note:
+    //   EnsureVirtualPath creates empty INTERMEDIATE keys (ancestors of the real
+    //   write target).  Those placeholders are returned as merge entries {hVirt,
+    //   hReal} even for read-only opens.  This is acceptable because:
+    //     - FIX C in Hook_NtQueryKey ensures KeyHandleTagsInformation always
+    //       returns 0 for any tracked handle, so hReal being a physical hive
+    //       root (HKLM\SOFTWARE, HKLM\SYSTEM …) can never mislead COM/CLR.
+    //     - Placeholder merge entries trigger the deduplicated subkey-count
+    //       logic which, while slower than a pure real-key query, is correct.
+    //   Skipping the virtual lookup for read-only opens would be WRONG: it
+    //   would make all CoW-written keys invisible to read-only callers.
     // -----------------------------------------------------------------------
-
-    bool isWrite = (DesiredAccess & (KEY_SET_VALUE | KEY_CREATE_SUB_KEY |
-                                     KEY_CREATE_LINK | DELETE | WRITE_DAC |
-                                     WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL)) != 0;
 
     // Preserve WOW64 view flags on the real shadow handle.
     ULONG realAccess = KEY_READ | (DesiredAccess & (KEY_WOW64_64KEY | KEY_WOW64_32KEY));
 
-    if (!isWrite) {
-        // ---- Read-only bypass (fast path) --------------------------------
-        // Skip the virtual lookup entirely.  Even if a placeholder exists,
-        // a read-only caller must never get a merge entry that accidentally
-        // exposes hive-root metadata from e.hReal.
-        HANDLE hReal = NULL;
-        NTSTATUS sr = Real_NtOpenKey(&hReal, realAccess, &realOa);
-        if (!NT_SUCCESS(sr) || !hReal) {
-            VL_DBG(L"DoVirtOpen: OPEN read-only real not found -> NOT_FOUND");
-            return VL_STATUS_OBJECT_NOT_FOUND;
-        }
-        *KeyHandle = hReal;
-        // Track with hVirt = NULL so enumeration / query hooks use the
-        // lightweight single-handle path (no merge enumeration penalty).
-        TrackHandle(hReal, NULL, hReal, fullPath);
-        VL_DBG(L"DoVirtOpen: OPEN read-only bypass -> real hReal=%p", hReal);
-        return VL_STATUS_SUCCESS;
-    }
-
-    // ---- Write-capable open path -----------------------------------------
-    // Try virtual first: a previous CoW may have written data there that the
-    // caller needs to see and modify.
+    // Step 1: try virtual key.
     VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
     VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
         OrigOA->Attributes | OBJ_CASE_INSENSITIVE);
 
     HANDLE hVirt = NULL;
     NTSTATUS stV = Real_NtOpenKey(&hVirt, DesiredAccess, &voa);
-    if (!NT_SUCCESS(stV)) hVirt = NULL; // prevent garbage handle
+    if (!NT_SUCCESS(stV)) hVirt = NULL; // guard against garbage handle
 
+    // Step 2: if virtual exists, return merge entry regardless of access mode.
+    // (This covers both real CoW-written keys and EnsureVirtualPath placeholders;
+    //  FIX C makes placeholders safe for KeyHandleTagsInformation queries.)
     HANDLE hReal = NULL;
-    NTSTATUS sr = Real_NtOpenKey(&hReal, realAccess, &realOa);
-    if (!NT_SUCCESS(sr)) hReal = NULL; // prevent garbage handle
-
     if (hVirt) {
-        // Virtual key already existed (either from a prior CoW or from
-        // EnsureVirtualPath on a deeper write -- but since isWrite=true here,
-        // returning a merge entry is correct: the caller has write intent and
-        // should see the merged view it previously created).
+        NTSTATUS srV = Real_NtOpenKey(&hReal, realAccess, &realOa); // best-effort
+        if (!NT_SUCCESS(srV)) hReal = NULL;
         *KeyHandle = hVirt;
         TrackHandle(hVirt, hVirt, hReal, fullPath);
         VL_DBG(L"DoVirtOpen: OPEN virtual hVirt=%p hReal=%p", hVirt, hReal);
         return VL_STATUS_SUCCESS;
     }
 
+    // Step 3: virtual doesn't exist, try real.
+    NTSTATUS sr = Real_NtOpenKey(&hReal, realAccess, &realOa);
+    if (!NT_SUCCESS(sr)) hReal = NULL;
+
+    // Step 4: nothing found.
     if (!hReal) {
         VL_DBG(L"DoVirtOpen: OPEN neither exists -> NOT_FOUND");
         return VL_STATUS_OBJECT_NOT_FOUND;
     }
 
-    // Virtual key doesn't exist yet.  Copy-on-write: create it now so the
-    // caller's writes land in the virtual store.
+    // Step 5: read-only bypass -- real key exists, no virtual data, caller
+    // only reads.  Return the real handle directly (hVirt=NULL) so that
+    // Hook_NtQueryKey uses the fast single-handle path without merge overhead.
+    bool isWrite = (DesiredAccess & (KEY_SET_VALUE | KEY_CREATE_SUB_KEY |
+                                     KEY_CREATE_LINK | DELETE | WRITE_DAC |
+                                     WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL)) != 0;
+    if (!isWrite) {
+        *KeyHandle = hReal;
+        TrackHandle(hReal, NULL, hReal, fullPath); // hVirt=NULL → no merge
+        VL_DBG(L"DoVirtOpen: OPEN read-only bypass -> real hReal=%p", hReal);
+        return VL_STATUS_SUCCESS;
+    }
+
+    // Step 6: write-capable open, virtual doesn't exist yet → Copy-on-Write.
     HANDLE hVirtNew = NULL;
     ULONG disp = 0;
     EnsureVirtualPath(virtPath);

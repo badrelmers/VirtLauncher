@@ -1387,6 +1387,8 @@ echo %FAIL% > "%INNER_FAIL_FILE%"
 :: Cleanup temp files created inside virt
 del /f /q "%TEMP%\VRTqk.txt" "%TEMP%\VRTqk2.txt" "%TEMP%\VRTRename.txt" >nul 2>&1
 del /f /q "%TEMP%\VRTMulti.txt" "%TEMP%\VRTMulti2.txt" "%TEMP%\VRTExport.reg" >nul 2>&1
+
+pause
 exit /b !FAIL!
 
 :: ============================================================
