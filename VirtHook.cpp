@@ -155,6 +155,7 @@ typedef LONG NTSTATUS;
 #define VL_STATUS_NO_SUCH_FILE           ((NTSTATUS)0xC000000FL)
 #define VL_STATUS_ACCESS_DENIED          ((NTSTATUS)0xC0000022L)
 #define VL_STATUS_INVALID_HANDLE         ((NTSTATUS)0xC0000008L)
+#define VL_STATUS_INFO_LENGTH_MISMATCH   ((NTSTATUS)0xC0000004L)
 // STATUS_END_OF_FILE -- returned by NtReadFile at EOF
 #define VL_STATUS_END_OF_FILE            ((NTSTATUS)0xC0000011L)
 
@@ -218,11 +219,16 @@ typedef VOID (NTAPI *VL_PIO_APC_ROUTINE)(PVOID, PVL_IO_STATUS_BLOCK, ULONG);
 
 // Registry information classes
 typedef enum _VL_KEY_INFORMATION_CLASS {
-    VlKeyBasicInformation     = 0,
-    VlKeyNodeInformation      = 1,
-    VlKeyFullInformation      = 2,
-    VlKeyNameInformation      = 3,
-    VlKeyCachedInformation    = 4
+    VlKeyBasicInformation            = 0,
+    VlKeyNodeInformation             = 1,
+    VlKeyFullInformation             = 2,
+    VlKeyNameInformation             = 3,
+    VlKeyCachedInformation           = 4,
+    VlKeyFlagsInformation            = 5,  // per-handle user flags (NtSetInformationKey)
+    VlKeyVirtualizationInformation   = 6,  // UAC registry virtualization status
+    VlKeyHandleTagsInformation       = 7,  // hive-root / volatile / trust bits
+    VlKeyTrustInformation            = 8,  // key trust level
+    VlKeyLayerInformation            = 9   // registry layer info (Win10+)
 } VL_KEY_INFORMATION_CLASS;
 
 typedef enum _VL_KEY_VALUE_INFORMATION_CLASS {
@@ -1124,6 +1130,16 @@ static void EnsureVirtualPath(const std::wstring& virtPath) {
         HANDLE h = NULL; ULONG disp = 0;
         NTSTATUS st = Real_NtCreateKey(&h, KEY_ALL_ACCESS, &oa,
                                         0, NULL, 0, &disp);
+        // Some HKLM sub-trees are volatile (e.g. SYSTEM\CurrentControlSet\
+        // Hardware Profiles\Current).  The kernel returns 0xC0000101
+        // (STATUS_CHILD_MUST_BE_VOLATILE) when we try to create a non-volatile
+        // child inside them.  Retry with REG_OPTION_VOLATILE to fill the gap.
+        // Without this retry, EnsureVirtualPath leaves a hole in the ancestor
+        // chain and subsequent NtCreateKey calls for deep keys return
+        // STATUS_OBJECT_PATH_NOT_FOUND. Mirrors Sandboxie Key_CreatePath_Key.
+        if (st == (NTSTATUS)0xC0000101L)
+            st = Real_NtCreateKey(&h, KEY_ALL_ACCESS, &oa,
+                                   0, NULL, 1 /*REG_OPTION_VOLATILE*/, &disp);
         if (NT_SUCCESS(st) && h) Real_NtClose(h);
     }
 }
@@ -2086,9 +2102,19 @@ static NTSTATUS DoVirtOpen(
         VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
             OrigOA->Attributes | OBJ_CASE_INSENSITIVE);
 
+        // Strip REG_OPTION_VOLATILE (bit 0).  The virtual store is persistent;
+        // volatile keys would vanish on process exit and the sandboxed app
+        // would lose its writes.  Sandboxie Key_NtCreateKeyImpl does the same.
+        ULONG virtCreateOptions = CreateOptions & ~1UL;
+
         HANDLE hVirt = NULL;
         NTSTATUS st = Real_NtCreateKey(&hVirt, DesiredAccess, &voa,
-                                        TitleIndex, Class, CreateOptions, Disposition);
+                                        TitleIndex, Class, virtCreateOptions, Disposition);
+        // If a volatile ancestor was created by EnsureVirtualPath, the kernel
+        // may require this child to be volatile too.
+        if (st == (NTSTATUS)0xC0000101L)
+            st = Real_NtCreateKey(&hVirt, DesiredAccess, &voa,
+                                   TitleIndex, Class, 1 /*REG_OPTION_VOLATILE*/, Disposition);
         if (NT_SUCCESS(st)) {
             // Preserve WOW64 view flags when opening the real shadow handle
             ULONG realAccess = KEY_READ | (DesiredAccess & (KEY_WOW64_64KEY | KEY_WOW64_32KEY));
@@ -2638,10 +2664,10 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
     //     *ResultLength = sizeof(ULONG);
     //     status = STATUS_SUCCESS;
     // -----------------------------------------------------------------------
-    if ((int)KeyInformationClass == 7 /* KeyHandleTagsInformation */) {
+    if (KeyInformationClass == VlKeyHandleTagsInformation) {
         // No tracked handle is ever a hive root.  The _Classes root is now
         // intentionally untracked (LogicalToVirtual returns false for it),
-        // so COM receives the real hive-root handle and real_NtQueryKey
+        // so COM receives the real hive-root handle and Real_NtQueryKey
         // is called directly for it -- REG_FLAG_HIVE_ROOT is returned
         // transparently without going through this hook at all.
         //
@@ -2649,9 +2675,27 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
         // the virtual placeholder is never a hive root, so 0 is correct.
         if (ResultLength) *ResultLength = sizeof(ULONG);
         if (!KeyInformation || Length < sizeof(ULONG))
-            return VL_STATUS_BUFFER_TOO_SMALL;
+            return VL_STATUS_INFO_LENGTH_MISMATCH;
         *(ULONG *)KeyInformation = 0;
         return VL_STATUS_SUCCESS;
+    }
+
+    // Structural classes: Basic(0), Node(1), Flags(5), Trust(8), Layer(9)
+    // return key metadata (LastWriteTime, NameLength, per-handle flags).
+    // For CoW handles, hVirt is an empty placeholder with a brand-new timestamp.
+    // Callers checking LastWriteTime (MSI, assembly policy, COM) must see the
+    // real key's timestamp, not the placeholder's.  Use hReal for these.
+    // For bypass handles (hVirt=NULL), KeyHandle IS hReal -- no difference.
+    if (KeyInformationClass == VlKeyBasicInformation  ||
+        KeyInformationClass == VlKeyNodeInformation   ||
+        KeyInformationClass == VlKeyFlagsInformation  ||
+        KeyInformationClass == VlKeyTrustInformation  ||
+        KeyInformationClass == VlKeyLayerInformation)
+    {
+        HANDLE queryH = (e.hVirt && e.hReal && e.hVirt != e.hReal)
+                        ? e.hReal : KeyHandle;
+        return Real_NtQueryKey(queryH, KeyInformationClass,
+                               KeyInformation, Length, ResultLength);
     }
 
     // All other classes (KeyFlagsInformation=5, KeyVirtualizationInformation=6,
@@ -2873,7 +2917,38 @@ static NTSTATUS NTAPI Hook_NtSetValueKey(
            KeyHandle, e.hVirt);
 
     HANDLE writeH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : KeyHandle);
-    return Real_NtSetValueKey(writeH, ValueName, TitleIndex, Type, Data, DataSize);
+    NTSTATUS st = Real_NtSetValueKey(writeH, ValueName, TitleIndex, Type, Data, DataSize);
+
+    // STATUS_ACCESS_DENIED re-open (mirrors Sandboxie Key_NtSetValueKey):
+    // The caller may hold a handle resolved to KEY_READ (e.g. opened HKLM
+    // with MAXIMUM_ALLOWED; kernel grants KEY_READ because user is not admin).
+    // Re-open relative to writeH with KEY_WRITE -- our hooked NtOpenKey
+    // routes that inner call to the virtual store, giving a writable handle.
+    // Without this, writes via MAXIMUM_ALLOWED handles are silently lost.
+    if (st == VL_STATUS_ACCESS_DENIED && Real_NtOpenKey) {
+        VL_UNICODE_STRING emptyName;
+        emptyName.Length        = 0;
+        emptyName.MaximumLength = sizeof(WCHAR);
+        static WCHAR emptyBuf[1] = {0};
+        emptyName.Buffer        = emptyBuf;
+
+        VL_OBJECT_ATTRIBUTES reopenOa;
+        reopenOa.Length                   = sizeof(VL_OBJECT_ATTRIBUTES);
+        reopenOa.RootDirectory            = writeH;
+        reopenOa.ObjectName               = &emptyName;
+        reopenOa.Attributes               = OBJ_CASE_INSENSITIVE;
+        reopenOa.SecurityDescriptor       = NULL;
+        reopenOa.SecurityQualityOfService = NULL;
+
+        HANDLE writeHandle = NULL;
+        NTSTATUS reopenSt = Real_NtOpenKey(&writeHandle, 0x20006L /*KEY_WRITE*/, &reopenOa);
+        if (NT_SUCCESS(reopenSt) && writeHandle) {
+            st = Real_NtSetValueKey(writeHandle, ValueName, TitleIndex, Type, Data, DataSize);
+            Real_NtClose(writeHandle);
+        }
+    }
+
+    return st;
 }
 
 // ---- NtDeleteKey -- delete from virtual only ----
