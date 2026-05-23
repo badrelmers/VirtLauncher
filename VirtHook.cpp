@@ -1036,7 +1036,7 @@ static bool LogicalToVirtual(const std::wstring& logical, std::wstring& virt) {
                    logical.c_str());
             // Intentional fall-through -- do NOT add return false here.
             // NOTE: adding 'return false;' fix tablacus and powershell crash but writes leaks in HKEY_USERS\<SID>_Classes they are writed directly in the real reg not our virtual reg. in the other hand, removing 'return false;' fix the leak but make tablacus and powershell crash!!!!!!
-            // return false;
+            return false;
         } else {
             std::wstring sub = logical.substr(hLen);
             if (sub.empty()) {
