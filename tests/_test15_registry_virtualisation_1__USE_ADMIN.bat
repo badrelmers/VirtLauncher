@@ -3,7 +3,11 @@ SETLOCAL
 CD /D "%~dp0"
 
 REM check admin
-rem fltmc >nul 2>&1 || ( color 4F & echo. & echo RUNME AS ADMIN & echo. & pause & exit )
+rem we need admin because we write to some previliged keys directly without virtlauncher
+fltmc >nul 2>&1 || ( color 4F & echo. & echo RUNME AS ADMIN & echo. & pause & exit )
+
+mode con | findstr "32766" >nul|| mode con lines=32766 COLS=120 &REM prevent "mode con" from clearing the console
+
 
 :: ============================================================
 REM set VLAUNCHER_VERBOSE=true
@@ -115,17 +119,17 @@ pause
 exit /b
 
 
-:: ============================================================
-:: TESTS
-:: ============================================================
-:run_tests
-:: Cleanup real host registry to ensure clean slate
-call :CLEANUP
 
+@rem ==========================================================================================
+
+:run_tests
 echo =============================================
 echo  %REAL_key%
 echo =============================================
 echo.
+
+:: Cleanup real host registry to ensure clean slate
+call :CLEANUP
 
 echo ====================== 1. Reg Write/Read
 %LAUNCHER% -r "%VIRT_ROOT%" -e cmd /c reg add "%REAL_key%" /v WriteVal /t REG_SZ /d SuccessWrite /f >nul
@@ -164,15 +168,40 @@ reg query "%VIRT_key%" /v WriteVal >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
     call :Pass
 ) else (
-    call :Fail "Reg Delete: Key still exists in Virtual Root."
+    call :Fail "Reg Delete: key still exists in Virtual Root."
 )
 
 
 echo.
+echo ====================== 3. merged view
+
+echo ______Check if Value can be read from the Virtual world
+%LAUNCHER% -r "%VIRT_ROOT%" -e cmd /c reg add "%REAL_key%" /v WriteVal /t REG_SZ /d SuccessWrite /f >nul
+%LAUNCHER% -r "%VIRT_ROOT%" -e cmd /c reg query "%REAL_key%" /v WriteVal | findstr "SuccessWrite" >nul
+if %ERRORLEVEL% EQU 0 (
+    call :Pass
+) else (
+    call :Fail "merged view: Value is not visible from the virtual world."
+)
+
+echo ______Check if Value read from virtual world come from real world or virtual world
+%LAUNCHER% -r "%VIRT_ROOT%" -e cmd /c reg add "%REAL_key%" /v WriteVal /t REG_SZ /d virtualworld /f >nul
+reg add "%REAL_key%" /v WriteVal /t REG_SZ /d realworld /f >nul
+%LAUNCHER% -r "%VIRT_ROOT%" -e cmd /c reg query "%REAL_key%" /v WriteVal | findstr "virtualworld" >nul
+if %ERRORLEVEL% EQU 0 (
+    call :Pass
+) else (
+    call :Fail "merged view: Value come from the real world."
+)
+
+
+
+call :CLEANUP
+echo.
 exit /b
 
 
-
+@rem ==========================================================================================
 :: -------------------------------------------------------------------------
 :: Helpers
 :: -------------------------------------------------------------------------

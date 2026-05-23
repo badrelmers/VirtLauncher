@@ -1003,40 +1003,59 @@ static bool LogicalToVirtual(const std::wstring& logical, std::wstring& virt) {
     if (!g_HkcuNtBase.empty() && StartsWithI(logical, g_HkcuNtBase)) {
         size_t hLen = g_HkcuNtBase.size();
         if (logical.size() > hLen && logical[hLen] != L'\\') {
-            // The character immediately after the SID is not a separator.
-            // This is a DIFFERENT hive whose name shares the SID prefix --
-            // the canonical case is <SID>_Classes (per-user HKCR backing hive).
+            // The character after the SID is not a separator; three sub-cases:
             //
-            // Previous behaviour: return false here (skip virtualization).
-            // Reason given at the time: routing _Classes through HKEY_USERS
-            // would strip the REG_FLAG_HIVE_ROOT flag from KeyHandleTagsInformation
-            // queries on the virtual handle, confusing COM/OLE and causing BEX64
-            // crashes.
+            // A) Exactly "<SID>_Classes" (the _Classes hive ROOT):
+            //    COM/OLE MUST receive the true kernel hive-root handle.
+            //    Giving it a virtual placeholder (non-hive-root KCB) causes
+            //    NtSetInformationKey(KeySetHandleTagsInformation) to perform
+            //    a kernel-type-confused write into a non-root KCB,
+            //    producing heap/stack corruption → BEX64 in Tablacus.
+            //    IMPORTANT: leaf writes are virtualized via Case B below;
+            //    the _Classes root itself carries no meaningful values.
             //
-            // Why that reason no longer applies:
-            //   FIX C in Hook_NtQueryKey intercepts KeyHandleTagsInformation
-            //   (class 7) for ALL tracked handles and unconditionally returns 0.
-            //   COM/OLE therefore never receives REG_FLAG_HIVE_ROOT from a
-            //   virtual handle regardless of what e.hReal would return.
-            //   The crash path is completely closed.
+            // B) "<SID>_Classes\<subkey>" (any subkey path under _Classes):
+            //    Fall through to the HKEY_USERS block (block 3).
+            //    This redirects \REGISTRY\USER\<SID>_Classes\anything to
+            //    VirtNtBase\HKEY_USERS\<SID>_Classes\anything.
+            //    All COM per-user CLSID/Interface/TypeLib writes stay sandboxed.
+            //    This is the path that leak.bat exercises — it creates
+            //    HKEY_USERS\<SID>_Classes\VirtHookLeak (a subkey, not the root).
             //
-            // Why returning false here was a sandbox leak:
-            //   return false tells DoVirtOpen "don't redirect this path".
-            //   The NT call then passes straight through to the real
-            //   \REGISTRY\USER\<SID>_Classes hive. Any per-user COM/HKCR write
-            //   that the kernel routes through _Classes lands in the real host
-            //   registry -- a sandbox escape.
-            //
-            // Fix: do NOT return false. Fall through to the HKEY_USERS block
-            // below, which redirects \REGISTRY\USER\<SID>_Classes to
-            //   VirtNtBase\HKEY_USERS\<SID>_Classes
-            // keeping all _Classes writes inside the virtual store.
-            
-            VL_DBG(L"LogicalToVirtual: _Classes suffix -- falling through to HKEY_USERS block path=%s",
-                   logical.c_str());
-            // Intentional fall-through -- do NOT add return false here.
-            // NOTE: adding 'return false;' fix tablacus and powershell crash but writes leaks in HKEY_USERS\<SID>_Classes they are writed directly in the real reg not our virtual reg. in the other hand, removing 'return false;' fix the leak but make tablacus and powershell crash!!!!!!
-            return false;
+            // C) Any other hive that shares the SID as a name prefix (rare):
+            //    Return false (don't virtualize — same as the old pre-fall-through
+            //    behavior).
+
+            static const std::wstring kClassesSuffix = L"_Classes";
+            const size_t kCSLen        = kClassesSuffix.size(); // 8
+            const size_t classesRootLen = hLen + kCSLen;        // e.g. len("<SID>_Classes")
+
+            // Check whether the path has exactly the "_Classes" suffix (case-insensitive)
+            // starting right after the SID.
+            const bool hasSuffix = (
+                logical.size() >= classesRootLen &&
+                _wcsnicmp(logical.c_str() + hLen,
+                          kClassesSuffix.c_str(), kCSLen) == 0
+            );
+
+            if (hasSuffix &&
+                logical.size() > classesRootLen &&
+                logical[classesRootLen] == L'\\')
+            {
+                // ---- Case B: a subkey path under _Classes ----
+                // Fall through to block 3 (HKEY_USERS) below.
+                VL_DBG(L"LogicalToVirtual: _Classes subkey -- falling through path=%s",
+                       logical.c_str());
+                // Intentional fall-through.
+            }
+            else
+            {
+                // ---- Case A: the _Classes hive root exactly ----
+                // ---- Case C: other SID-prefix hive (not _Classes) ----
+                VL_DBG(L"LogicalToVirtual: SKIP (_Classes root or non-_Classes SID prefix) path=%s",
+                       logical.c_str());
+                return false;
+            }
         } else {
             std::wstring sub = logical.substr(hLen);
             if (sub.empty()) {
@@ -2620,6 +2639,14 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
     //     status = STATUS_SUCCESS;
     // -----------------------------------------------------------------------
     if ((int)KeyInformationClass == 7 /* KeyHandleTagsInformation */) {
+        // No tracked handle is ever a hive root.  The _Classes root is now
+        // intentionally untracked (LogicalToVirtual returns false for it),
+        // so COM receives the real hive-root handle and real_NtQueryKey
+        // is called directly for it -- REG_FLAG_HIVE_ROOT is returned
+        // transparently without going through this hook at all.
+        //
+        // For HKLM hive roots opened via CoW (SOFTWARE.hiv, SYSTEM.hiv, etc.),
+        // the virtual placeholder is never a hive root, so 0 is correct.
         if (ResultLength) *ResultLength = sizeof(ULONG);
         if (!KeyInformation || Length < sizeof(ULONG))
             return VL_STATUS_BUFFER_TOO_SMALL;
