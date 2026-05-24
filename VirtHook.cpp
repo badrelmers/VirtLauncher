@@ -2234,6 +2234,29 @@ static NTSTATUS DoVirtOpen(
             st = Real_NtCreateKey(&hVirt, DesiredAccess, &voa,
                                    TitleIndex, Class, 1 /*REG_OPTION_VOLATILE*/, Disposition);
         if (NT_SUCCESS(st)) {
+            // If this key was previously tombstoned (delete-mark timestamp),
+            // clear the stamp by writing the current system time.
+            // Without this, a delete-then-recreate leaves the virtual key
+            // with the magic timestamp and DoVirtOpen would return NOT_FOUND
+            // on the very next open.
+            {
+                struct { LARGE_INTEGER LastWriteTime; ULONG TitleIndex;
+                         ULONG NameLength; WCHAR Name[2]; } kbiC;
+                ULONG rLen = 0;
+                NTSTATUS qc = Real_NtQueryKey(hVirt, VlKeyBasicInformation,
+                                               &kbiC, (ULONG)sizeof(kbiC), &rLen);
+                if ((qc == VL_STATUS_SUCCESS || qc == VL_STATUS_BUFFER_OVERFLOW) &&
+                    VL_IS_KEY_DELETED(&kbiC.LastWriteTime) && Real_NtSetInformationKey)
+                {
+                    // Reset timestamp to "now" (0 = let kernel set current time).
+                    struct { LARGE_INTEGER LastWriteTime; } kwti = {{0, 0}};
+                    Real_NtSetInformationKey(hVirt, 0 /*KeyWriteTimeInformation*/,
+                                             &kwti, sizeof(kwti));
+                    VL_DBG(L"DoVirtOpen: CREATE cleared tombstone on virtPath=%s",
+                           virtPath.c_str());
+                }
+            }
+            // Preserve WOW64 view flags when opening the real shadow handle
             // Preserve WOW64 view flags when opening the real shadow handle
             ULONG realAccess = KEY_READ | (DesiredAccess & (KEY_WOW64_64KEY | KEY_WOW64_32KEY));
 
@@ -3189,20 +3212,65 @@ static NTSTATUS NTAPI Hook_NtSetValueKey(
     return st;
 }
 
-// ---- NtDeleteKey -- tombstone + delete from virtual store ----
+// Recursively create virtual tombstones for an entire real key subtree.
+// Called by Hook_NtDeleteKey for every real subkey of the deleted parent.
+static void RegTombstoneKeyRecursive(const std::wstring& logPath,
+                                      const std::wstring& virtPath)
+{
+    if (virtPath.empty() || logPath.empty()) return;
+
+    // Open the real key to enumerate its children.
+    VL_UNICODE_STRING rus; MakeUStr(&rus, logPath);
+    VL_OBJECT_ATTRIBUTES roa; MakeOA(&roa, &rus);
+    HANDLE hReal = NULL;
+    Real_NtOpenKey(&hReal, KEY_ENUMERATE_SUB_KEYS, &roa);
+
+    // Recurse into real children first (depth-first so children are stamped
+    // before parents, matching how del /s works).
+    if (hReal) {
+        std::vector<BYTE> buf(1024, 0);
+        for (ULONG ri = 0; ; ++ri) {
+            ULONG elen = 0;
+            NTSTATUS est = Real_NtEnumerateKey(hReal, ri, VlKeyBasicInformation,
+                                               &buf[0], (ULONG)buf.size(), &elen);
+            if (est == VL_STATUS_BUFFER_TOO_SMALL || est == VL_STATUS_BUFFER_OVERFLOW) {
+                buf.assign(elen + 4, 0);
+                est = Real_NtEnumerateKey(hReal, ri, VlKeyBasicInformation,
+                                          &buf[0], (ULONG)buf.size(), &elen);
+            }
+            if (!NT_SUCCESS(est)) break;
+            VL_KEY_BASIC_INFORMATION* kbi =
+                reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(&buf[0]);
+            std::wstring name(kbi->Name, kbi->NameLength / sizeof(WCHAR));
+            RegTombstoneKeyRecursive(logPath  + L"\\" + name,
+                                     virtPath + L"\\" + name);
+        }
+        Real_NtClose(hReal);
+    }
+
+    // Stamp tombstone on this node.
+    // RegEnsureVirtAndOpenWrite creates the virtual key if missing, then
+    // opens it with KEY_ALL_ACCESS so RegMarkKeyDeleted can set the timestamp.
+    HANDLE hVirt = RegEnsureVirtAndOpenWrite(virtPath);
+    if (hVirt) {
+        RegMarkKeyDeleted(hVirt);
+        Real_NtClose(hVirt);
+    }
+}
+
+// ---- NtDeleteKey -- tombstone the virtual key ----
 //
-// Sandboxie Key_NtDeleteKeyTreeImpl approach:
-//   1. Open (or create) the virtual copy.
-//   2. Verify the key has no visible subkeys (would get STATUS_CANNOT_DELETE).
-//   3. Stamp the delete-mark LastWriteTime onto the virtual copy.
-//   4. Physically delete the virtual copy from the virtual hive so it doesn't
-//      show up in enumeration -- the tombstone timestamp is the authoritative
-//      record of deletion.
+// The virtual key WITH the magic LastWriteTime stamp IS the tombstone.
+// We must NOT physically delete it -- DoVirtOpen Step 2 opens the virtual
+// key, reads LastWriteTime, sees VL_IS_KEY_DELETED, closes the handle and
+// returns NOT_FOUND.  The tombstone must remain on disk across sessions.
 //
-// If the key only exists in the real store (no virtual copy yet), we CoW it
-// first (EnsureVirtualPath + NtCreateKey) to have somewhere to stamp the mark.
+// This is the same principle as Sandboxie v1: the copy-path key is kept alive
+// with the magic timestamp; every subsequent open sees the mark.
 //
-// If a tracked handle is given (e.hVirt != NULL) we reuse that handle.
+// For recursive deletion (reg delete /f on a key with subkeys): we call
+// RegTombstoneKeyRecursive for every real subkey so children also vanish
+// from the merged view.  Virtual-only subkeys are physically deleted.
 static NTSTATUS NTAPI Hook_NtDeleteKey(HANDLE KeyHandle)
 {
     VirtKeyEntry e;
@@ -3214,25 +3282,19 @@ static NTSTATUS NTAPI Hook_NtDeleteKey(HANDLE KeyHandle)
     VL_DBG(L"Hook_NtDeleteKey: handle=%p virt=%p real=%p logPath=%s",
            KeyHandle, e.hVirt, e.hReal, e.logPath.c_str());
 
-    // --- Determine virtual path ---
     std::wstring virtPath;
     if (!e.logPath.empty())
         LogicalToVirtual(e.logPath, virtPath);
 
-    // --- If the key does NOT exist in the real store, just delete it from virt ---
+    // --- No real counterpart: physically delete from virtual store ---
+    // Key was created entirely inside the sandbox; no tombstone needed.
     if (!e.hReal) {
-        if (e.hVirt) {
-            Real_NtDeleteKey(e.hVirt);
-            if (!virtPath.empty()) {
-                // Clear the tombstone mark -- key never existed in real store,
-                // so there's nothing to hide.  Simply removing from virt is enough.
-            }
-        }
+        if (e.hVirt) Real_NtDeleteKey(e.hVirt);
+        VirtKeyEntry dummy; PopKeyEntry(KeyHandle, dummy);
         return VL_STATUS_SUCCESS;
     }
 
-    // --- Key exists in real store: we need a tombstone ---
-    // Get or create a write-access virtual handle.
+    // --- Key exists in real store: CoW and stamp tombstone ---
     HANDLE hWriteVirt = NULL;
     bool ownHandle = false;
     if (e.hVirt) {
@@ -3242,72 +3304,50 @@ static NTSTATUS NTAPI Hook_NtDeleteKey(HANDLE KeyHandle)
         ownHandle = (hWriteVirt != NULL);
     }
 
-    NTSTATUS st = VL_STATUS_ACCESS_DENIED;
-    if (hWriteVirt) {
-        // Check: the merged view must show no subkeys (mirrors Sandboxie's
-        // Key_NtQueryKeyImpl subkey check before deleting).  We call our own
-        // Hook_NtQueryKey through the tracked handle if available; otherwise
-        // just check the virtual copy directly.  This is a best-effort check --
-        // if subkeys exist in the real store only, they still block deletion.
-        //
-        // Note: Sandboxie's full check enumerates the merged subkey count and
-        // returns STATUS_CANNOT_DELETE if non-zero.  We do a quick probe here.
-        struct { LARGE_INTEGER LastWriteTime; ULONG TitleIndex; ULONG SubKeys;
-                 ULONG MaxNameLen; ULONG ClassOffset; ULONG ClassLength;
-                 ULONG MaxClassLen; ULONG Values; ULONG MaxValueNameLen;
-                 ULONG MaxValueDataLen; LARGE_INTEGER LastWriteTime2; ULONG NameLength; } kfi;
-        ULONG resLen = 0;
-        NTSTATUS qst = Real_NtQueryKey(hWriteVirt, VlKeyFullInformation,
-                                        &kfi, (ULONG)sizeof(kfi), &resLen);
-        // If the virtual key has subkeys (real subkeys not yet CoW'd are not
-        // counted here -- for a full check we'd need the merge view, but that
-        // requires a tracked handle; accept the limitation for now).
-        // Physical delete of virtual subkeys first:
-        while (NT_SUCCESS(qst) || qst == VL_STATUS_BUFFER_OVERFLOW) {
-            NTSTATUS est;
-            struct { LARGE_INTEGER LastWriteTime; ULONG TitleIndex;
-                     ULONG NameLength; WCHAR Name[256]; } kbi;
+    if (!hWriteVirt) {
+        VL_DBG(L"Hook_NtDeleteKey: cannot obtain virtual handle");
+        return VL_STATUS_ACCESS_DENIED;
+    }
+
+    // Recursively tombstone all real subkeys so they disappear from the
+    // merged enumeration view.
+    if (!e.logPath.empty()) {
+        std::vector<BYTE> buf(1024, 0);
+        for (ULONG ri = 0; ; ++ri) {
             ULONG elen = 0;
-            est = Real_NtEnumerateKey(hWriteVirt, 0, VlKeyBasicInformation,
-                                       &kbi, (ULONG)sizeof(kbi), &elen);
+            NTSTATUS est = Real_NtEnumerateKey(
+                e.hReal ? e.hReal : hWriteVirt,
+                ri, VlKeyBasicInformation,
+                &buf[0], (ULONG)buf.size(), &elen);
+            if (est == VL_STATUS_BUFFER_TOO_SMALL || est == VL_STATUS_BUFFER_OVERFLOW) {
+                buf.assign(elen + 4, 0);
+                est = Real_NtEnumerateKey(
+                    e.hReal ? e.hReal : hWriteVirt,
+                    ri, VlKeyBasicInformation,
+                    &buf[0], (ULONG)buf.size(), &elen);
+            }
             if (!NT_SUCCESS(est)) break;
-            std::wstring childName(kbi.Name, kbi.NameLength / sizeof(WCHAR));
-            VL_UNICODE_STRING cus; MakeUStr(&cus, childName);
-            VL_OBJECT_ATTRIBUTES coa;
-            coa.Length = sizeof(VL_OBJECT_ATTRIBUTES);
-            coa.RootDirectory = hWriteVirt;
-            coa.ObjectName = &cus;
-            coa.Attributes = OBJ_CASE_INSENSITIVE;
-            coa.SecurityDescriptor = NULL; coa.SecurityQualityOfService = NULL;
-            HANDLE hChild = NULL;
-            if (NT_SUCCESS(Real_NtOpenKey(&hChild, DELETE, &coa)) && hChild) {
-                Real_NtDeleteKey(hChild);
-                Real_NtClose(hChild);
-            } else break; // can't delete, stop
-        }
-
-        // Stamp the delete-mark timestamp.
-        RegMarkKeyDeleted(hWriteVirt);
-
-        // Physically delete the virtual copy from the virtual hive.
-        // The mark is gone with it -- but DoVirtOpen will re-check on next open
-        // by attempting Real_NtOpenKey on the virtPath and finding it absent,
-        // then falling through to hReal.  We prevent resurrection by checking
-        // RegKeyIsDeleted() in DoVirtOpen (added below).
-        st = Real_NtDeleteKey(hWriteVirt);
-        if (!ownHandle) {
-            // hWriteVirt is e.hVirt which is the tracked handle -- the tracking
-            // entry is now dangling.  Remove it.
-            VirtKeyEntry dummy;
-            PopKeyEntry(KeyHandle, dummy);
+            VL_KEY_BASIC_INFORMATION* kbi =
+                reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(&buf[0]);
+            std::wstring name(kbi->Name, kbi->NameLength / sizeof(WCHAR));
+            RegTombstoneKeyRecursive(e.logPath  + L"\\" + name,
+                                     virtPath + L"\\" + name);
         }
     }
 
-    if (ownHandle && hWriteVirt) Real_NtClose(hWriteVirt);
+    // Stamp delete-mark on this key and KEEP it alive.
+    // The live virtual key with the magic timestamp IS the tombstone.
+    bool marked = RegMarkKeyDeleted(hWriteVirt);
 
-    VL_DBG(L"Hook_NtDeleteKey: tombstone+delete st=0x%08X", (ULONG)st);
-    return NT_SUCCESS(st) ? VL_STATUS_SUCCESS : st;
+    if (ownHandle) Real_NtClose(hWriteVirt);
+    // Remove from tracking -- handle is now dangling (caller will close it).
+    VirtKeyEntry dummy; PopKeyEntry(KeyHandle, dummy);
+
+    VL_DBG(L"Hook_NtDeleteKey: tombstone stamped=%d virtPath=%s",
+           (int)marked, virtPath.c_str());
+    return marked ? VL_STATUS_SUCCESS : VL_STATUS_ACCESS_DENIED;
 }
+
 
 // ---- NtDeleteValueKey -- value tombstone ----
 //
