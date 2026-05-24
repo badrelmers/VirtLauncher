@@ -2126,7 +2126,8 @@ static void LoadConfig() {
 // Collect subkey/value names from a handle (for merge enumeration)
 // ============================================================
 
-static std::vector<std::wstring> CollectSubkeyNames(HANDLE h) {
+static std::vector<std::wstring> CollectSubkeyNames(HANDLE h,
+    std::vector<std::wstring>* pDeleted = NULL) {
     std::vector<std::wstring> names;
     if (!h) return names;
     std::vector<BYTE> buf(1024, 0);
@@ -2142,7 +2143,19 @@ static std::vector<std::wstring> CollectSubkeyNames(HANDLE h) {
         if (!NT_SUCCESS(st)) break;
         VL_KEY_BASIC_INFORMATION* kbi =
             reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(&buf[0]);
-        names.push_back(std::wstring(kbi->Name, kbi->NameLength / sizeof(WCHAR)));
+        std::wstring name(kbi->Name, kbi->NameLength / sizeof(WCHAR));
+
+        // Check if this virtual subkey is a tombstone by inspecting LastWriteTime.
+        // Tombstones have LastWriteTime == VL_KEY_DELETE_MARK magic value.
+        // Use the LastWriteTime already returned in KeyBasicInformation -- no
+        // extra open needed.
+        if (VL_IS_KEY_DELETED(&kbi->LastWriteTime)) {
+            // Tombstoned subkey: record in deleted list if requested, but
+            // do NOT add to live names.
+            if (pDeleted) pDeleted->push_back(name);
+        } else {
+            names.push_back(name);
+        }
     }
     return names;
 }
@@ -2665,15 +2678,16 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
                 // ----------------------------------------------------------
                 SetReentrant(true);
 
-                std::vector<std::wstring> virtSubkeys = CollectSubkeyNames(e.hVirt);
+                std::vector<std::wstring> deletedSubKeys; // tombstoned virtual subkeys
+                std::vector<std::wstring> virtSubkeys = CollectSubkeyNames(e.hVirt, &deletedSubKeys);
                 std::vector<std::wstring> deletedVals2;
                 std::vector<std::wstring> virtVals = CollectValueNames(e.hVirt, &deletedVals2);
 
                 ULONG exactSubKeys = (ULONG)virtSubkeys.size();
                 ULONG exactValues  = (ULONG)virtVals.size();
 
-                // Count real subkeys not shadowed by a virtual subkey,
-                // and not tombstoned (deleted in sandbox).
+                // Count real subkeys not shadowed by a live virtual subkey
+                // and not tombstoned (in deletedSubKeys).
                 {
                     std::vector<BYTE> tmpBuf(1024, 0);
                     for (ULONG ri = 0; ; ++ri) {
@@ -2692,16 +2706,9 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
                         VL_KEY_BASIC_INFORMATION* kbi =
                             reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(&tmpBuf[0]);
                         std::wstring name(kbi->Name, kbi->NameLength / sizeof(WCHAR));
-                        if (!NameInList(name, virtSubkeys)) {
-                            // Check tombstone for this real subkey.
-                            bool tombstoned = false;
-                            if (!e.logPath.empty()) {
-                                std::wstring subVirtPath;
-                                if (LogicalToVirtual(e.logPath + L"\\" + name, subVirtPath))
-                                    tombstoned = RegKeyIsDeleted(subVirtPath);
-                            }
-                            if (!tombstoned) exactSubKeys++;
-                        }
+                        if (!NameInList(name, virtSubkeys) &&
+                            !NameInList(name, deletedSubKeys))
+                            exactSubKeys++;
                     }
                 }
 
@@ -2910,15 +2917,40 @@ static NTSTATUS NTAPI Hook_NtEnumerateKey(
         return Real_NtEnumerateKey(hV, Index, KeyInformationClass,
                                     KeyInformation, Length, ResultLength);
 
-    // Merge: virtual first, then real entries not shadowed by virtual
+    // Merge: virtual-live first, then real entries not shadowed or deleted
     SetReentrant(true);
-    std::vector<std::wstring> virtNames = CollectSubkeyNames(hV);
+    std::vector<std::wstring> deletedNames; // tombstoned virtual subkeys
+    std::vector<std::wstring> virtNames = CollectSubkeyNames(hV, &deletedNames);
     SetReentrant(false);
 
+    // virtNames now contains ONLY live (non-tombstoned) virtual subkeys.
+    // deletedNames contains subkeys that were deleted inside the sandbox.
+
     ULONG virtCount = (ULONG)virtNames.size();
-    if (Index < virtCount)
-        return Real_NtEnumerateKey(hV, Index, KeyInformationClass,
-                                    KeyInformation, Length, ResultLength);
+    if (Index < virtCount) {
+        // Serve from virtual, but we must re-enumerate hV skipping tombstones
+        // to map the logical Index back to a physical index inside hV.
+        ULONG liveIdx = 0;
+        std::vector<BYTE> vBuf(1024, 0);
+        for (ULONG vi = 0; ; ++vi) {
+            ULONG vLen = 0;
+            NTSTATUS vs = Real_NtEnumerateKey(hV, vi, VlKeyBasicInformation,
+                                               &vBuf[0], (ULONG)vBuf.size(), &vLen);
+            if (vs == VL_STATUS_BUFFER_TOO_SMALL || vs == VL_STATUS_BUFFER_OVERFLOW) {
+                vBuf.assign(vLen + 4, 0);
+                vs = Real_NtEnumerateKey(hV, vi, VlKeyBasicInformation,
+                                          &vBuf[0], (ULONG)vBuf.size(), &vLen);
+            }
+            if (!NT_SUCCESS(vs)) return VL_STATUS_NO_MORE_ENTRIES;
+            VL_KEY_BASIC_INFORMATION* kbiV =
+                reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(&vBuf[0]);
+            if (VL_IS_KEY_DELETED(&kbiV->LastWriteTime)) continue; // skip tombstone
+            if (liveIdx == Index)
+                return Real_NtEnumerateKey(hV, vi, KeyInformationClass,
+                                            KeyInformation, Length, ResultLength);
+            ++liveIdx;
+        }
+    }
     ULONG want = Index - virtCount;
     ULONG skipped = 0;
     std::vector<BYTE> tmpBuf(1024, 0);
@@ -2939,16 +2971,10 @@ static NTSTATUS NTAPI Hook_NtEnumerateKey(
         std::wstring name(kbi->Name, kbi->NameLength / sizeof(WCHAR));
 
         if (!NameInList(name, virtNames)) {
-            // Check tombstone: if this real subkey was deleted in the sandbox,
-            // skip it. We check by looking for a tombstoned virtual key at the
-            // corresponding virtual path.
-            bool tombstoned = false;
-            if (!e.logPath.empty()) {
-                std::wstring subVirtPath;
-                std::wstring subLogPath = e.logPath + L"\\" + name;
-                if (LogicalToVirtual(subLogPath, subVirtPath))
-                    tombstoned = RegKeyIsDeleted(subVirtPath);
-            }
+            // Skip real subkeys that were deleted inside the sandbox.
+            // deletedNames was populated by CollectSubkeyNames from the
+            // tombstone-marked virtual keys -- no extra kernel open needed.
+            bool tombstoned = NameInList(name, deletedNames);
             if (!tombstoned) {
                 if (skipped == want)
                     return Real_NtEnumerateKey(hR, ri, KeyInformationClass,
