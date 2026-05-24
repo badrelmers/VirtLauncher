@@ -1187,45 +1187,37 @@ static void EnsureVirtualPath(const std::wstring& virtPath) {
 // Registry tombstone helpers
 // ============================================================
 
-// Check whether the virtual copy of a key carries the delete-mark timestamp.
-// Returns true  => key is tombstoned (treat as deleted / not found).
-// Returns false => key is live or has no virtual copy.
+// Magic sentinel value written inside a virtual key to mark it as
+// "deleted inside the sandbox".  The name starts with SOH (U+0001)
+// so it cannot collide with any normal application value name.
+// The type is VL_VALUE_DELETED_TYPE (0x1337DEAD), the same magic used
+// for value tombstones, so CollectValueNames / Hook_NtEnumerateValueKey
+// already hide it automatically.
 //
-// Opens the virtual path directly with Real_NtOpenKey (bypasses our hook to
-// avoid re-entrancy), queries KeyBasicInformation, inspects LastWriteTime.
-static bool RegKeyIsDeleted(const std::wstring& virtPath)
-{
-    if (virtPath.empty()) return false;
-    VL_UNICODE_STRING us; MakeUStr(&us, virtPath);
-    VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
-    HANDLE h = NULL;
-    NTSTATUS st = Real_NtOpenKey(&h, KEY_READ, &oa);
-    if (!NT_SUCCESS(st) || !h) return false;
-    // KEY_BASIC_INFORMATION: LARGE_INTEGER LastWriteTime, ULONG TitleIndex,
-    //                        ULONG NameLength, WCHAR Name[1]
-    struct { LARGE_INTEGER LastWriteTime; ULONG TitleIndex; ULONG NameLength; WCHAR Name[2]; } kbi;
-    ULONG resLen = 0;
-    st = Real_NtQueryKey(h, VlKeyBasicInformation, &kbi, (ULONG)sizeof(kbi), &resLen);
-    Real_NtClose(h);
-    if (st != VL_STATUS_SUCCESS && st != VL_STATUS_BUFFER_OVERFLOW) return false;
-    return VL_IS_KEY_DELETED(&kbi.LastWriteTime);
-}
+// WHY NOT NtSetInformationKey(KeyWriteTimeInformation)?
+// -------------------------------------------------------
+// The original implementation set LastWriteTime to a magic value using
+// NtSetInformationKey(KeyWriteTimeInformation).  This is the approach
+// used by Sandboxie — but Sandboxie runs as a privileged service (SYSTEM).
+// KeyWriteTimeInformation requires SeRestorePrivilege, which normal user
+// processes DO NOT have.  The call silently fails with
+// STATUS_PRIVILEGE_NOT_HELD (0xC0000061), the return value was never
+// checked, and no tombstone was ever actually written.  That is the bug.
+//
+// NtSetValueKey requires only KEY_SET_VALUE (already obtained via
+// RegEnsureVirtAndOpenWrite → KEY_ALL_ACCESS), so it works for any user.
+static const wchar_t kVlKeyDeletedMarker[] = L"\x0001VL_KEY_DELETED";
 
-// Write the delete-mark timestamp to an already-open virtual key handle.
-// Returns true on success.
-static bool RegMarkKeyDeleted(HANDLE hVirt)
-{
-    if (!hVirt || !Real_NtSetInformationKey) return false;
-    struct { LARGE_INTEGER LastWriteTime; } kwti;
-    kwti.LastWriteTime.HighPart = (LONG)VL_KEY_DELETE_MARK_HIGH;
-    kwti.LastWriteTime.LowPart  = VL_KEY_DELETE_MARK_LOW;
-    NTSTATUS st = Real_NtSetInformationKey(hVirt, 0 /*KeyWriteTimeInformation*/,
-                                            &kwti, (ULONG)sizeof(kwti));
-    return NT_SUCCESS(st);
+static inline void MakeKeyDeletedMarkerUStr(VL_UNICODE_STRING* us) {
+    // Length excludes the NUL terminator.
+    us->Length        = (USHORT)((sizeof(kVlKeyDeletedMarker)/sizeof(wchar_t) - 1) * sizeof(wchar_t));
+    us->MaximumLength = us->Length + sizeof(wchar_t);
+    us->Buffer        = const_cast<wchar_t*>(kVlKeyDeletedMarker);
 }
 
 // Check whether a value in the virtual key has the deleted-value tombstone type.
 // hVirt must be an open handle to the VIRTUAL key (not our tracked handle).
+// Defined first because RegKeyIsDeleted and RegMarkKeyDeleted both call it.
 static bool RegValueIsDeleted(HANDLE hVirt, PVL_UNICODE_STRING valueName)
 {
     if (!hVirt || !valueName) return false;
@@ -1237,6 +1229,37 @@ static bool RegValueIsDeleted(HANDLE hVirt, PVL_UNICODE_STRING valueName)
                                         &kvpi, (ULONG)sizeof(kvpi), &resLen);
     if (!NT_SUCCESS(st) && st != VL_STATUS_BUFFER_OVERFLOW) return false;
     return kvpi.Type == VL_VALUE_DELETED_TYPE;
+}
+
+// Check whether the virtual copy of a key carries the key-deleted sentinel.
+// Returns true  => key is tombstoned (treat as deleted / not found).
+// Returns false => key is live or has no virtual copy.
+//
+// Opens the virtual path with Real_NtOpenKey (bypasses our hook to avoid
+// re-entrancy), then queries the sentinel value.
+static bool RegKeyIsDeleted(const std::wstring& virtPath)
+{
+    if (virtPath.empty()) return false;
+    VL_UNICODE_STRING us; MakeUStr(&us, virtPath);
+    VL_OBJECT_ATTRIBUTES oa; MakeOA(&oa, &us);
+    HANDLE h = NULL;
+    NTSTATUS st = Real_NtOpenKey(&h, KEY_QUERY_VALUE, &oa);
+    if (!NT_SUCCESS(st) || !h) return false;
+    VL_UNICODE_STRING markerUs; MakeKeyDeletedMarkerUStr(&markerUs);
+    bool deleted = RegValueIsDeleted(h, &markerUs);
+    Real_NtClose(h);
+    return deleted;
+}
+
+// Write the key-deleted sentinel value into an already-open virtual key handle.
+// Returns true on success.  Requires only KEY_SET_VALUE access (no privileges).
+static bool RegMarkKeyDeleted(HANDLE hVirt)
+{
+    if (!hVirt) return false;
+    VL_UNICODE_STRING markerUs; MakeKeyDeletedMarkerUStr(&markerUs);
+    NTSTATUS st = Real_NtSetValueKey(hVirt, &markerUs, 0,
+                                      VL_VALUE_DELETED_TYPE, NULL, 0);
+    return NT_SUCCESS(st);
 }
 
 // Ensure the virtual key exists and open it with write access.
@@ -2145,11 +2168,32 @@ static std::vector<std::wstring> CollectSubkeyNames(HANDLE h,
             reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(&buf[0]);
         std::wstring name(kbi->Name, kbi->NameLength / sizeof(WCHAR));
 
-        // Check if this virtual subkey is a tombstone by inspecting LastWriteTime.
-        // Tombstones have LastWriteTime == VL_KEY_DELETE_MARK magic value.
-        // Use the LastWriteTime already returned in KeyBasicInformation -- no
-        // extra open needed.
-        if (VL_IS_KEY_DELETED(&kbi->LastWriteTime)) {
+        // Check if this virtual subkey is a tombstone by opening it with a
+        // relative path and looking for the key-deleted sentinel value.
+        // This replaces the old LastWriteTime magic-value approach which
+        // silently failed for non-privileged processes (SeRestorePrivilege
+        // is required to set KeyWriteTimeInformation, but tombstones must
+        // work for all users).
+        bool isTombstoned = false;
+        {
+            VL_UNICODE_STRING subUs; MakeUStr(&subUs, name);
+            VL_OBJECT_ATTRIBUTES subOa;
+            subOa.Length                   = sizeof(VL_OBJECT_ATTRIBUTES);
+            subOa.RootDirectory            = h;   // relative open under parent virt handle
+            subOa.ObjectName               = &subUs;
+            subOa.Attributes               = OBJ_CASE_INSENSITIVE;
+            subOa.SecurityDescriptor       = NULL;
+            subOa.SecurityQualityOfService = NULL;
+            HANDLE hSub = NULL;
+            NTSTATUS subSt = Real_NtOpenKey(&hSub, KEY_QUERY_VALUE, &subOa);
+            if (NT_SUCCESS(subSt) && hSub) {
+                VL_UNICODE_STRING markerUs; MakeKeyDeletedMarkerUStr(&markerUs);
+                isTombstoned = RegValueIsDeleted(hSub, &markerUs);
+                Real_NtClose(hSub);
+            }
+        }
+
+        if (isTombstoned) {
             // Tombstoned subkey: record in deleted list if requested, but
             // do NOT add to live names.
             if (pDeleted) pDeleted->push_back(name);
@@ -2247,27 +2291,15 @@ static NTSTATUS DoVirtOpen(
             st = Real_NtCreateKey(&hVirt, DesiredAccess, &voa,
                                    TitleIndex, Class, 1 /*REG_OPTION_VOLATILE*/, Disposition);
         if (NT_SUCCESS(st)) {
-            // If this key was previously tombstoned (delete-mark timestamp),
-            // clear the stamp by writing the current system time.
-            // Without this, a delete-then-recreate leaves the virtual key
-            // with the magic timestamp and DoVirtOpen would return NOT_FOUND
-            // on the very next open.
+            // If this key was previously tombstoned (sentinel value present),
+            // delete the sentinel so the re-created key is live.
+            // Without this, a delete-then-recreate would re-open the virtual key
+            // that still has the marker and DoVirtOpen would return NOT_FOUND.
             {
-                struct { LARGE_INTEGER LastWriteTime; ULONG TitleIndex;
-                         ULONG NameLength; WCHAR Name[2]; } kbiC;
-                ULONG rLen = 0;
-                NTSTATUS qc = Real_NtQueryKey(hVirt, VlKeyBasicInformation,
-                                               &kbiC, (ULONG)sizeof(kbiC), &rLen);
-                if ((qc == VL_STATUS_SUCCESS || qc == VL_STATUS_BUFFER_OVERFLOW) &&
-                    VL_IS_KEY_DELETED(&kbiC.LastWriteTime) && Real_NtSetInformationKey)
-                {
-                    // Reset timestamp to "now" (0 = let kernel set current time).
-                    struct { LARGE_INTEGER LastWriteTime; } kwti = {{0, 0}};
-                    Real_NtSetInformationKey(hVirt, 0 /*KeyWriteTimeInformation*/,
-                                             &kwti, sizeof(kwti));
-                    VL_DBG(L"DoVirtOpen: CREATE cleared tombstone on virtPath=%s",
-                           virtPath.c_str());
-                }
+                VL_UNICODE_STRING markerUs; MakeKeyDeletedMarkerUStr(&markerUs);
+                Real_NtDeleteValueKey(hVirt, &markerUs); // no-op if absent
+                VL_DBG(L"DoVirtOpen: CREATE cleared tombstone marker on virtPath=%s",
+                       virtPath.c_str());
             }
             // Preserve WOW64 view flags when opening the real shadow handle
             // Preserve WOW64 view flags when opening the real shadow handle
@@ -2331,19 +2363,14 @@ static NTSTATUS DoVirtOpen(
     if (!NT_SUCCESS(stV)) hVirt = NULL; // guard against garbage handle
 
     // Step 2: if virtual exists, check for tombstone before returning.
-    // A tombstone is a virtual key whose LastWriteTime was stamped with the
-    // delete-mark magic value by Hook_NtDeleteKey.  Returning it as a live
-    // handle would resurrect a key that the sandbox deleted.
+    // A tombstone is a virtual key that has the key-deleted sentinel value
+    // written by Hook_NtDeleteKey.  Returning it as a live handle would
+    // resurrect a key the sandbox deleted.
     HANDLE hReal = NULL;
     if (hVirt) {
-        // Inspect LastWriteTime of the virtual key.
-        struct { LARGE_INTEGER LastWriteTime; ULONG TitleIndex; ULONG NameLength; WCHAR Name[2]; } kbiDov;
-        ULONG resLen2 = 0;
-        NTSTATUS qst = Real_NtQueryKey(hVirt, VlKeyBasicInformation,
-                                        &kbiDov, (ULONG)sizeof(kbiDov), &resLen2);
-        if ((qst == VL_STATUS_SUCCESS || qst == VL_STATUS_BUFFER_OVERFLOW) &&
-            VL_IS_KEY_DELETED(&kbiDov.LastWriteTime))
-        {
+        // Check for the key-deleted sentinel value inside the virtual key.
+        VL_UNICODE_STRING markerUs; MakeKeyDeletedMarkerUStr(&markerUs);
+        if (RegValueIsDeleted(hVirt, &markerUs)) {
             // Tombstone -- key was deleted inside the sandbox.
             Real_NtClose(hVirt);
             VL_DBG(L"DoVirtOpen: OPEN virtual is TOMBSTONE -> NOT_FOUND virtPath=%s",
@@ -2944,7 +2971,26 @@ static NTSTATUS NTAPI Hook_NtEnumerateKey(
             if (!NT_SUCCESS(vs)) return VL_STATUS_NO_MORE_ENTRIES;
             VL_KEY_BASIC_INFORMATION* kbiV =
                 reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(&vBuf[0]);
-            if (VL_IS_KEY_DELETED(&kbiV->LastWriteTime)) continue; // skip tombstone
+            // Skip tombstoned virtual subkeys (sentinel value check).
+            {
+                std::wstring subName(kbiV->Name, kbiV->NameLength / sizeof(WCHAR));
+                VL_UNICODE_STRING subUs; MakeUStr(&subUs, subName);
+                VL_OBJECT_ATTRIBUTES subOa;
+                subOa.Length                   = sizeof(VL_OBJECT_ATTRIBUTES);
+                subOa.RootDirectory            = hV;
+                subOa.ObjectName               = &subUs;
+                subOa.Attributes               = OBJ_CASE_INSENSITIVE;
+                subOa.SecurityDescriptor       = NULL;
+                subOa.SecurityQualityOfService = NULL;
+                HANDLE hSubV = NULL;
+                bool isTombed = false;
+                if (NT_SUCCESS(Real_NtOpenKey(&hSubV, KEY_QUERY_VALUE, &subOa)) && hSubV) {
+                    VL_UNICODE_STRING markerUs; MakeKeyDeletedMarkerUStr(&markerUs);
+                    isTombed = RegValueIsDeleted(hSubV, &markerUs);
+                    Real_NtClose(hSubV);
+                }
+                if (isTombed) continue;
+            }
             if (liveIdx == Index)
                 return Real_NtEnumerateKey(hV, vi, KeyInformationClass,
                                             KeyInformation, Length, ResultLength);
