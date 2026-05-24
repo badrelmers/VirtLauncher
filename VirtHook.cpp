@@ -3056,6 +3056,82 @@ static NTSTATUS NTAPI Hook_NtEnumerateValueKey(
 {
     VirtKeyEntry e;
     if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
+        // Untracked handle: resolve via NtQueryObject.  If the handle points to
+        // (or can be mapped to) a virtual store key, open the virtual key and
+        // perform a tombstone-aware enumeration so deleted values are hidden.
+        if (g_RegEnabled) {
+            SetReentrant(true);
+            std::wstring resolvedPath = GetHandleLogicalPath(KeyHandle);
+            std::wstring virtPath;
+            bool inScope = false;
+            if (!resolvedPath.empty()) {
+                if (StartsWithI(resolvedPath, g_VirtNtBase)) {
+                    virtPath = resolvedPath; inScope = true;  // Case B
+                } else {
+                    inScope = LogicalToVirtual(resolvedPath, virtPath); // Case A
+                }
+            }
+            SetReentrant(false);
+
+            if (inScope && !virtPath.empty()) {
+                VL_DBG(L"Hook_NtEnumerateValueKey: untracked in-scope virtPath=%s index=%u",
+                       virtPath.c_str(), Index);
+                HANDLE hVirtCheck = NULL;
+                VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
+                VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus, OBJ_CASE_INSENSITIVE);
+                if (NT_SUCCESS(Real_NtOpenKey(&hVirtCheck, KEY_QUERY_VALUE, &voa))) {
+                    // Collect tombstoned value names from the virtual key.
+                    std::vector<std::wstring> deletedVals;
+                    std::vector<BYTE> scanBuf(512, 0);
+                    for (ULONG vi = 0; ; ++vi) {
+                        ULONG vLen = 0;
+                        NTSTATUS vs = Real_NtEnumerateValueKey(hVirtCheck, vi,
+                                          VlKeyValueBasicInformation,
+                                          &scanBuf[0], (ULONG)scanBuf.size(), &vLen);
+                        if (vs == VL_STATUS_BUFFER_TOO_SMALL || vs == VL_STATUS_BUFFER_OVERFLOW) {
+                            scanBuf.assign(vLen + 4, 0);
+                            vs = Real_NtEnumerateValueKey(hVirtCheck, vi,
+                                     VlKeyValueBasicInformation,
+                                     &scanBuf[0], (ULONG)scanBuf.size(), &vLen);
+                        }
+                        if (!NT_SUCCESS(vs)) break;
+                        VL_KEY_VALUE_BASIC_INFORMATION* kvbi =
+                            reinterpret_cast<VL_KEY_VALUE_BASIC_INFORMATION*>(&scanBuf[0]);
+                        if (kvbi->Type == VL_VALUE_DELETED_TYPE)
+                            deletedVals.push_back(std::wstring(kvbi->Name, kvbi->NameLength / sizeof(WCHAR)));
+                    }
+                    Real_NtClose(hVirtCheck);
+
+                    if (!deletedVals.empty()) {
+                        // Enumerate real key, skipping tombstoned values.
+                        ULONG liveIdx = 0;
+                        std::vector<BYTE> eBuf(1024, 0);
+                        for (ULONG ri = 0; ; ++ri) {
+                            ULONG rLen = 0;
+                            NTSTATUS rs = Real_NtEnumerateValueKey(KeyHandle, ri,
+                                              VlKeyValueBasicInformation,
+                                              &eBuf[0], (ULONG)eBuf.size(), &rLen);
+                            if (rs == VL_STATUS_BUFFER_TOO_SMALL || rs == VL_STATUS_BUFFER_OVERFLOW) {
+                                eBuf.assign(rLen + 4, 0);
+                                rs = Real_NtEnumerateValueKey(KeyHandle, ri,
+                                         VlKeyValueBasicInformation,
+                                         &eBuf[0], (ULONG)eBuf.size(), &rLen);
+                            }
+                            if (!NT_SUCCESS(rs)) return VL_STATUS_NO_MORE_ENTRIES;
+                            VL_KEY_VALUE_BASIC_INFORMATION* kvbi =
+                                reinterpret_cast<VL_KEY_VALUE_BASIC_INFORMATION*>(&eBuf[0]);
+                            std::wstring vname(kvbi->Name, kvbi->NameLength / sizeof(WCHAR));
+                            if (NameInList(vname, deletedVals)) continue; // skip tombstone
+                            if (liveIdx == Index)
+                                return Real_NtEnumerateValueKey(KeyHandle, ri,
+                                           KeyValueInformationClass, KeyValueInformation,
+                                           Length, ResultLength);
+                            ++liveIdx;
+                        }
+                    }
+                }
+            }
+        }
         return Real_NtEnumerateValueKey(KeyHandle, Index,
                     KeyValueInformationClass, KeyValueInformation,
                     Length, ResultLength);
@@ -3178,6 +3254,42 @@ static NTSTATUS NTAPI Hook_NtQueryValueKey(
 {
     VirtKeyEntry e;
     if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
+        // Untracked handle: same Case A/B resolution as Hook_NtDeleteValueKey.
+        // If the handle resolves to (or can be mapped to) a virtual store key,
+        // we must check for a value tombstone before falling through, otherwise
+        // a tombstoned value would be visible to the caller via the real API.
+        if (g_RegEnabled && ValueName) {
+            SetReentrant(true);
+            std::wstring resolvedPath = GetHandleLogicalPath(KeyHandle);
+            std::wstring virtPath;
+            bool inScope = false;
+
+            if (!resolvedPath.empty()) {
+                if (StartsWithI(resolvedPath, g_VirtNtBase)) {
+                    virtPath = resolvedPath; inScope = true;  // Case B
+                } else {
+                    inScope = LogicalToVirtual(resolvedPath, virtPath); // Case A
+                }
+            }
+            SetReentrant(false);
+
+            if (inScope && !virtPath.empty()) {
+                VL_DBG(L"Hook_NtQueryValueKey: untracked in-scope virtPath=%s name=%s",
+                       virtPath.c_str(), FromUStr(ValueName).c_str());
+                // Open the virtual key read-only and check for a value tombstone.
+                HANDLE hVirtCheck = NULL;
+                VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
+                VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus, OBJ_CASE_INSENSITIVE);
+                if (NT_SUCCESS(Real_NtOpenKey(&hVirtCheck, KEY_QUERY_VALUE, &voa))) {
+                    bool tombstoned = RegValueIsDeleted(hVirtCheck, ValueName);
+                    Real_NtClose(hVirtCheck);
+                    if (tombstoned) {
+                        VL_DBG(L"Hook_NtQueryValueKey: untracked value tombstoned -> NOT_FOUND");
+                        return VL_STATUS_OBJECT_NAME_NOT_FOUND;
+                    }
+                }
+            }
+        }
         return Real_NtQueryValueKey(KeyHandle, ValueName,
                     KeyValueInformationClass, KeyValueInformation,
                     Length, ResultLength);
