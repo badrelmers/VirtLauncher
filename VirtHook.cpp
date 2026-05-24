@@ -3369,6 +3369,33 @@ static NTSTATUS NTAPI Hook_NtDeleteKey(HANDLE KeyHandle)
     VirtKeyEntry e;
     if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
         VL_DBG(L"Hook_NtDeleteKey: untracked handle=%p", KeyHandle);
+
+        // Same untracked-but-in-scope case as Hook_NtDeleteValueKey: advapi32
+        // may hold a handle to an HKLM\Software\Classes key that was opened
+        // before injection or through a path we didn't intercept.  Resolve
+        // the path and tombstone if it is in our virtualisation scope.
+        if (g_RegEnabled) {
+            SetReentrant(true);
+            std::wstring logPath = GetHandleLogicalPath(KeyHandle);
+            std::wstring virtPath;
+            bool inScope = !logPath.empty() && LogicalToVirtual(logPath, virtPath);
+            SetReentrant(false);
+
+            if (inScope && !virtPath.empty()) {
+                VL_DBG(L"Hook_NtDeleteKey: untracked but in-scope logPath=%s virtPath=%s",
+                       logPath.c_str(), virtPath.c_str());
+                // Stamp tombstone on the virtual path (creates it if absent).
+                HANDLE hStamp = RegEnsureVirtAndOpenWrite(virtPath);
+                if (hStamp) {
+                    RegMarkKeyDeleted(hStamp);
+                    Real_NtClose(hStamp);
+                    VL_DBG(L"Hook_NtDeleteKey: untracked tombstone stamped virtPath=%s",
+                           virtPath.c_str());
+                }
+                return VL_STATUS_SUCCESS;
+            }
+        }
+
         return Real_NtDeleteKey(KeyHandle);
     }
 
@@ -3448,6 +3475,44 @@ static NTSTATUS NTAPI Hook_NtDeleteValueKey(
     if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
         VL_DBG(L"Hook_NtDeleteValueKey: untracked handle=%p name=%s",
                KeyHandle, ValueName ? FromUStr(ValueName).c_str() : L"(null)");
+
+        // The handle was not opened through our hook (e.g. advapi32's internal
+        // HKCR merge-view opens the underlying HKLM\Software\Classes key via a
+        // pre-existing or directly-opened handle that bypassed our NtOpenKey
+        // intercept).  We must still sandbox the delete: resolve the handle's
+        // real path, check if it falls in our virtualisation scope, and if so
+        // write a value tombstone into the virtual store instead of letting the
+        // real delete go through unvirtualised.
+        if (g_RegEnabled && ValueName) {
+            SetReentrant(true);
+            std::wstring logPath = GetHandleLogicalPath(KeyHandle);
+            std::wstring virtPath;
+            bool inScope = !logPath.empty() && LogicalToVirtual(logPath, virtPath);
+            SetReentrant(false);
+
+            if (inScope && !virtPath.empty()) {
+                VL_DBG(L"Hook_NtDeleteValueKey: untracked but in-scope logPath=%s virtPath=%s name=%s",
+                       logPath.c_str(), virtPath.c_str(),
+                       FromUStr(ValueName).c_str());
+                // CoW the virtual key (creates it if absent) and write tombstone.
+                HANDLE hVirt = RegEnsureVirtAndOpenWrite(virtPath);
+                if (hVirt) {
+                    // Remove any real value data that was CoW'd into the virtual key.
+                    Real_NtDeleteValueKey(hVirt, ValueName);
+                    // Write value tombstone so the real value is hidden on next read.
+                    NTSTATUS st = Real_NtSetValueKey(hVirt, ValueName, 0,
+                                                      VL_VALUE_DELETED_TYPE, NULL, 0);
+                    Real_NtClose(hVirt);
+                    VL_DBG(L"Hook_NtDeleteValueKey: untracked tombstone write st=0x%08X",
+                           (ULONG)st);
+                    return NT_SUCCESS(st) ? VL_STATUS_SUCCESS
+                                          : VL_STATUS_OBJECT_NAME_NOT_FOUND;
+                }
+                // Virtual store unreachable -- fall through to real delete as
+                // best-effort (sandbox may be inconsistent but caller won't hang).
+            }
+        }
+
         return Real_NtDeleteValueKey(KeyHandle, ValueName);
     }
 
