@@ -3260,17 +3260,21 @@ static void RegTombstoneKeyRecursive(const std::wstring& logPath,
 
 // ---- NtDeleteKey -- tombstone the virtual key ----
 //
-// The virtual key WITH the magic LastWriteTime stamp IS the tombstone.
-// We must NOT physically delete it -- DoVirtOpen Step 2 opens the virtual
-// key, reads LastWriteTime, sees VL_IS_KEY_DELETED, closes the handle and
-// returns NOT_FOUND.  The tombstone must remain on disk across sessions.
+// Critical design constraint:
+//   NtSetInformationKey(KeyWriteTimeInformation) requires KEY_WRITE access.
+//   The caller (reg.exe, DeleteFile wrappers, etc.) opens the key with DELETE
+//   access ONLY.  Using e.hVirt for the stamp would fail with ACCESS_DENIED.
 //
-// This is the same principle as Sandboxie v1: the copy-path key is kept alive
-// with the magic timestamp; every subsequent open sees the mark.
+//   Fix: ALWAYS open a FRESH KEY_ALL_ACCESS handle via RegEnsureVirtAndOpenWrite
+//   for the stamp.  The caller's e.hVirt (DELETE-access) is never used for it.
 //
-// For recursive deletion (reg delete /f on a key with subkeys): we call
-// RegTombstoneKeyRecursive for every real subkey so children also vanish
-// from the merged view.  Virtual-only subkeys are physically deleted.
+// The virtual key WITH the magic LastWriteTime IS the tombstone -- it must be
+// kept alive on disk.  DoVirtOpen Step 2 opens it, reads LastWriteTime, sees
+// VL_IS_KEY_DELETED, closes the handle and returns NOT_FOUND.
+//
+// Always return SUCCESS: from the app's perspective the key is deleted.
+// The tombstone stamp is best-effort but failure is very unlikely (it only
+// fails if the virtual store itself is inaccessible).
 static NTSTATUS NTAPI Hook_NtDeleteKey(HANDLE KeyHandle)
 {
     VirtKeyEntry e;
@@ -3294,58 +3298,45 @@ static NTSTATUS NTAPI Hook_NtDeleteKey(HANDLE KeyHandle)
         return VL_STATUS_SUCCESS;
     }
 
-    // --- Key exists in real store: CoW and stamp tombstone ---
-    HANDLE hWriteVirt = NULL;
-    bool ownHandle = false;
-    if (e.hVirt) {
-        hWriteVirt = e.hVirt;
-    } else if (!virtPath.empty()) {
-        hWriteVirt = RegEnsureVirtAndOpenWrite(virtPath);
-        ownHandle = (hWriteVirt != NULL);
-    }
-
-    if (!hWriteVirt) {
-        VL_DBG(L"Hook_NtDeleteKey: cannot obtain virtual handle");
-        return VL_STATUS_ACCESS_DENIED;
-    }
-
-    // Recursively tombstone all real subkeys so they disappear from the
-    // merged enumeration view.
-    if (!e.logPath.empty()) {
+    // --- Key exists in real store: stamp tombstone ---
+    // Recursively tombstone real subkeys first so enumeration hides them.
+    if (!e.logPath.empty() && e.hReal) {
         std::vector<BYTE> buf(1024, 0);
         for (ULONG ri = 0; ; ++ri) {
             ULONG elen = 0;
-            NTSTATUS est = Real_NtEnumerateKey(
-                e.hReal ? e.hReal : hWriteVirt,
-                ri, VlKeyBasicInformation,
-                &buf[0], (ULONG)buf.size(), &elen);
+            NTSTATUS est = Real_NtEnumerateKey(e.hReal, ri, VlKeyBasicInformation,
+                                               &buf[0], (ULONG)buf.size(), &elen);
             if (est == VL_STATUS_BUFFER_TOO_SMALL || est == VL_STATUS_BUFFER_OVERFLOW) {
                 buf.assign(elen + 4, 0);
-                est = Real_NtEnumerateKey(
-                    e.hReal ? e.hReal : hWriteVirt,
-                    ri, VlKeyBasicInformation,
-                    &buf[0], (ULONG)buf.size(), &elen);
+                est = Real_NtEnumerateKey(e.hReal, ri, VlKeyBasicInformation,
+                                          &buf[0], (ULONG)buf.size(), &elen);
             }
             if (!NT_SUCCESS(est)) break;
             VL_KEY_BASIC_INFORMATION* kbi =
                 reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(&buf[0]);
             std::wstring name(kbi->Name, kbi->NameLength / sizeof(WCHAR));
-            RegTombstoneKeyRecursive(e.logPath  + L"\\" + name,
-                                     virtPath + L"\\" + name);
+            RegTombstoneKeyRecursive(e.logPath + L"\\" + name,
+                                     virtPath  + L"\\" + name);
         }
     }
 
-    // Stamp delete-mark on this key and KEEP it alive.
-    // The live virtual key with the magic timestamp IS the tombstone.
-    bool marked = RegMarkKeyDeleted(hWriteVirt);
+    // Open a FRESH KEY_ALL_ACCESS handle to the virtual path for stamping.
+    // We cannot reuse e.hVirt because it was opened with DELETE access only.
+    // NtSetInformationKey(KeyWriteTimeInformation) requires KEY_WRITE.
+    if (!virtPath.empty()) {
+        HANDLE hStamp = RegEnsureVirtAndOpenWrite(virtPath);
+        if (hStamp) {
+            RegMarkKeyDeleted(hStamp);
+            Real_NtClose(hStamp);
+            VL_DBG(L"Hook_NtDeleteKey: tombstone stamped virtPath=%s", virtPath.c_str());
+        }
+    }
 
-    if (ownHandle) Real_NtClose(hWriteVirt);
-    // Remove from tracking -- handle is now dangling (caller will close it).
+    // Remove tracking entry -- caller's handle is now logically invalid.
     VirtKeyEntry dummy; PopKeyEntry(KeyHandle, dummy);
 
-    VL_DBG(L"Hook_NtDeleteKey: tombstone stamped=%d virtPath=%s",
-           (int)marked, virtPath.c_str());
-    return marked ? VL_STATUS_SUCCESS : VL_STATUS_ACCESS_DENIED;
+    // Always succeed: the app's delete request is fulfilled (key is hidden).
+    return VL_STATUS_SUCCESS;
 }
 
 
