@@ -3370,21 +3370,34 @@ static NTSTATUS NTAPI Hook_NtDeleteKey(HANDLE KeyHandle)
     if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
         VL_DBG(L"Hook_NtDeleteKey: untracked handle=%p", KeyHandle);
 
-        // Same untracked-but-in-scope case as Hook_NtDeleteValueKey: advapi32
-        // may hold a handle to an HKLM\Software\Classes key that was opened
-        // before injection or through a path we didn't intercept.  Resolve
-        // the path and tombstone if it is in our virtualisation scope.
+        // Same two-case logic as Hook_NtDeleteValueKey (see that function for
+        // full explanation).  Case A: real logical path remapped via
+        // LogicalToVirtual.  Case B: handle already resolves to a virtual store
+        // path (NtQueryObject returns a path under VirtNtBase) -- use it directly.
         if (g_RegEnabled) {
             SetReentrant(true);
-            std::wstring logPath = GetHandleLogicalPath(KeyHandle);
+            std::wstring resolvedPath = GetHandleLogicalPath(KeyHandle);
             std::wstring virtPath;
-            bool inScope = !logPath.empty() && LogicalToVirtual(logPath, virtPath);
+            bool inScope = false;
+
+            if (!resolvedPath.empty()) {
+                if (StartsWithI(resolvedPath, g_VirtNtBase)) {
+                    // Case B: handle IS a virtual store key.
+                    virtPath = resolvedPath;
+                    inScope  = true;
+                    VL_DBG(L"Hook_NtDeleteKey: untracked handle IS virtual store path=%s",
+                           virtPath.c_str());
+                } else {
+                    // Case A: logical path -- remap to virtual.
+                    inScope = LogicalToVirtual(resolvedPath, virtPath);
+                    if (inScope)
+                        VL_DBG(L"Hook_NtDeleteKey: untracked in-scope logPath=%s virtPath=%s",
+                               resolvedPath.c_str(), virtPath.c_str());
+                }
+            }
             SetReentrant(false);
 
             if (inScope && !virtPath.empty()) {
-                VL_DBG(L"Hook_NtDeleteKey: untracked but in-scope logPath=%s virtPath=%s",
-                       logPath.c_str(), virtPath.c_str());
-                // Stamp tombstone on the virtual path (creates it if absent).
                 HANDLE hStamp = RegEnsureVirtAndOpenWrite(virtPath);
                 if (hStamp) {
                     RegMarkKeyDeleted(hStamp);
@@ -3477,39 +3490,57 @@ static NTSTATUS NTAPI Hook_NtDeleteValueKey(
                KeyHandle, ValueName ? FromUStr(ValueName).c_str() : L"(null)");
 
         // The handle was not opened through our hook (e.g. advapi32's internal
-        // HKCR merge-view opens the underlying HKLM\Software\Classes key via a
-        // pre-existing or directly-opened handle that bypassed our NtOpenKey
+        // HKCR merge-view holds a handle to the underlying HKLM\Software\Classes
+        // key that was opened before injection or via a code path we didn't
         // intercept).  We must still sandbox the delete: resolve the handle's
-        // real path, check if it falls in our virtualisation scope, and if so
-        // write a value tombstone into the virtual store instead of letting the
-        // real delete go through unvirtualised.
+        // real path and write the value tombstone into the virtual store.
+        //
+        // Two cases after resolving via NtQueryObject:
+        //
+        //   Case A -- path is OUTSIDE VirtNtBase (a real logical path):
+        //     LogicalToVirtual maps it to a virtual path then write tombstone there.
+        //
+        //   Case B -- path is ALREADY INSIDE VirtNtBase:
+        //     NtQueryObject returned the virtual store path directly, meaning the
+        //     kernel handle IS a virtual store key (advapi32 or another layer
+        //     duplicated/re-opened our virtual handle).  LogicalToVirtual SKIPs
+        //     this path to avoid recursion, so inScope would be false.  We detect
+        //     this case separately and use the resolved path as virtPath directly.
         if (g_RegEnabled && ValueName) {
             SetReentrant(true);
-            std::wstring logPath = GetHandleLogicalPath(KeyHandle);
+            std::wstring resolvedPath = GetHandleLogicalPath(KeyHandle);
             std::wstring virtPath;
-            bool inScope = !logPath.empty() && LogicalToVirtual(logPath, virtPath);
+            bool inScope = false;
+
+            if (!resolvedPath.empty()) {
+                if (StartsWithI(resolvedPath, g_VirtNtBase)) {
+                    // Case B: handle already points into the virtual store.
+                    virtPath  = resolvedPath;
+                    inScope   = true;
+                    VL_DBG(L"Hook_NtDeleteValueKey: untracked handle IS virtual store path=%s name=%s",
+                           virtPath.c_str(), FromUStr(ValueName).c_str());
+                } else {
+                    // Case A: logical path outside virtual store -- remap.
+                    inScope = LogicalToVirtual(resolvedPath, virtPath);
+                    if (inScope)
+                        VL_DBG(L"Hook_NtDeleteValueKey: untracked in-scope logPath=%s virtPath=%s name=%s",
+                               resolvedPath.c_str(), virtPath.c_str(),
+                               FromUStr(ValueName).c_str());
+                }
+            }
             SetReentrant(false);
 
             if (inScope && !virtPath.empty()) {
-                VL_DBG(L"Hook_NtDeleteValueKey: untracked but in-scope logPath=%s virtPath=%s name=%s",
-                       logPath.c_str(), virtPath.c_str(),
-                       FromUStr(ValueName).c_str());
-                // CoW the virtual key (creates it if absent) and write tombstone.
                 HANDLE hVirt = RegEnsureVirtAndOpenWrite(virtPath);
                 if (hVirt) {
-                    // Remove any real value data that was CoW'd into the virtual key.
                     Real_NtDeleteValueKey(hVirt, ValueName);
-                    // Write value tombstone so the real value is hidden on next read.
                     NTSTATUS st = Real_NtSetValueKey(hVirt, ValueName, 0,
                                                       VL_VALUE_DELETED_TYPE, NULL, 0);
                     Real_NtClose(hVirt);
-                    VL_DBG(L"Hook_NtDeleteValueKey: untracked tombstone write st=0x%08X",
-                           (ULONG)st);
+                    VL_DBG(L"Hook_NtDeleteValueKey: untracked tombstone write st=0x%08X", (ULONG)st);
                     return NT_SUCCESS(st) ? VL_STATUS_SUCCESS
                                           : VL_STATUS_OBJECT_NAME_NOT_FOUND;
                 }
-                // Virtual store unreachable -- fall through to real delete as
-                // best-effort (sandbox may be inconsistent but caller won't hang).
             }
         }
 
