@@ -159,8 +159,21 @@ typedef LONG NTSTATUS;
 // STATUS_END_OF_FILE -- returned by NtReadFile at EOF
 #define VL_STATUS_END_OF_FILE            ((NTSTATUS)0xC0000011L)
 
-// Compatibility alias used by older registry code
-#define VL_STATUS_OBJECT_NOT_FOUND       VL_STATUS_OBJECT_NAME_NOT_FOUND
+// Private sentinel returned by DoVirtOpen when the path is outside the
+// virtualisation scope (LogicalToVirtual returned false).  The hook wrappers
+// use this to decide whether to fall through to the real NT API.
+//
+// MUST be different from every real NTSTATUS that DoVirtOpen can return
+// legitimately (in particular VL_STATUS_OBJECT_NAME_NOT_FOUND / 0xC0000034
+// which is what tombstoned and genuinely-missing keys return).  We use
+// facility 0x1FF (private/customer bit set) so the kernel will never
+// generate this value itself.
+#define VL_STATUS_NOT_IN_SCOPE           ((NTSTATUS)0xE1FF0001L)
+
+// Legacy alias -- kept so nothing outside DoVirtOpen accidentally uses it
+// with the wrong meaning.  DoVirtOpen now returns VL_STATUS_NOT_IN_SCOPE
+// for "not in scope" and VL_STATUS_OBJECT_NAME_NOT_FOUND for everything else.
+#define VL_STATUS_OBJECT_NOT_FOUND       VL_STATUS_NOT_IN_SCOPE
 #define VL_STATUS_CANNOT_DELETE          ((NTSTATUS)0xC0000121L)
 
 // ============================================================
@@ -2397,9 +2410,13 @@ static NTSTATUS DoVirtOpen(
     if (!NT_SUCCESS(sr)) hReal = NULL;
 
     // Step 4: nothing found.
+    // Return the real STATUS_OBJECT_NAME_NOT_FOUND -- NOT the private
+    // VL_STATUS_NOT_IN_SCOPE sentinel.  Returning the sentinel here would
+    // cause the hook wrappers to fall through to the real NT API, which
+    // would then open the real key -- exactly the tombstone bypass bug.
     if (!hReal) {
         VL_DBG(L"DoVirtOpen: OPEN neither exists -> NOT_FOUND");
-        return VL_STATUS_OBJECT_NOT_FOUND;
+        return VL_STATUS_OBJECT_NAME_NOT_FOUND;
     }
 
     // Step 5: read-only bypass -- real key exists, no virtual data, caller
