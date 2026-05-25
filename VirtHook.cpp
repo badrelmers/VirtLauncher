@@ -3839,6 +3839,61 @@ static void RegTombstoneKeyRecursive(const std::wstring& logPath,
     }
 }
 
+// Tombstone the "other side" of an HKCR key in the virtual store.
+//
+// HKCR is advapi32's merge of two NT backing paths:
+//   \REGISTRY\USER\<SID>_Classes\<subkey>       (per-user)
+//   \REGISTRY\MACHINE\SOFTWARE\Classes\<subkey> (machine-wide)
+//
+// NtDeleteKey only fires once (on whichever handle advapi32 used), so a
+// tombstone placed on one side leaves the other side visible.  This helper
+// computes the mirror NT path and stamps a full recursive tombstone there.
+//
+// logPath: the real NT path of the key being tombstoned (either the _Classes
+//          or the HKLM\Software\Classes backing path).
+static void RegTombstoneHkcrMirror(const std::wstring& logPath)
+{
+    if (logPath.empty() || g_RealNtBase.empty() || g_VirtNtBase.empty()) return;
+
+    static const std::wstring kHklmClassesNt   = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Classes";
+    static const std::wstring kHklmClassesVirt = L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Classes";
+
+    std::wstring classesRoot = g_RealNtBase + L"_Classes"; // \Registry\User\<SID>_Classes
+
+    std::wstring mirrorLogPath, mirrorVirtPath;
+
+    // Case 1: deleted via HKU\_Classes path -> stamp mirror on HKLM side.
+    if (StartsWithI(logPath, classesRoot) &&
+        logPath.size() > classesRoot.size() &&
+        logPath[classesRoot.size()] == L'\\')
+    {
+        std::wstring suffix = logPath.substr(classesRoot.size()); // e.g. "\\realSubA"
+        mirrorLogPath  = kHklmClassesNt   + suffix;
+        mirrorVirtPath = g_VirtNtBase + L"\\" + kHklmClassesVirt + suffix;
+        VL_DBG(L"RegTombstoneHkcrMirror: Classes->HKLM mirror virtPath=%s", mirrorVirtPath.c_str());
+    }
+    // Case 2: deleted via HKLM\Software\Classes path -> stamp mirror on _Classes side.
+    else if (StartsWithI(logPath, kHklmClassesNt) &&
+             logPath.size() > kHklmClassesNt.size() &&
+             logPath[kHklmClassesNt.size()] == L'\\')
+    {
+        std::wstring suffix = logPath.substr(kHklmClassesNt.size()); // e.g. "\\realSubA"
+        std::wstring sidClasses;
+        std::wstring::size_type p = g_RealNtBase.rfind(L'\\');
+        if (p != std::wstring::npos)
+            sidClasses = g_RealNtBase.substr(p + 1) + L"_Classes";
+        mirrorLogPath  = classesRoot + suffix;
+        mirrorVirtPath = g_VirtNtBase + L"\\HKEY_USERS\\" + sidClasses + suffix;
+        VL_DBG(L"RegTombstoneHkcrMirror: HKLM->Classes mirror virtPath=%s", mirrorVirtPath.c_str());
+    }
+
+    if (mirrorLogPath.empty() || mirrorVirtPath.empty()) return;
+
+    // RegTombstoneKeyRecursive enumerates real children under mirrorLogPath,
+    // stamps each one recursively, and finally stamps mirrorVirtPath itself.
+    RegTombstoneKeyRecursive(mirrorLogPath, mirrorVirtPath);
+}
+
 // ---- NtDeleteKey -- tombstone the virtual key ----
 //
 // Critical design constraint:
@@ -3897,6 +3952,9 @@ static NTSTATUS NTAPI Hook_NtDeleteKey(HANDLE KeyHandle)
                     VL_DBG(L"Hook_NtDeleteKey: untracked tombstone stamped virtPath=%s",
                            virtPath.c_str());
                 }
+                // Mirror tombstone: HKCR delete must also stamp the other
+                // NT backing path (_Classes <-> HKLM\Software\Classes).
+                RegTombstoneHkcrMirror(resolvedPath);
                 return VL_STATUS_SUCCESS;
             }
         }
@@ -3952,6 +4010,12 @@ static NTSTATUS NTAPI Hook_NtDeleteKey(HANDLE KeyHandle)
             VL_DBG(L"Hook_NtDeleteKey: tombstone stamped virtPath=%s", virtPath.c_str());
         }
     }
+
+    // Mirror tombstone: if this key lives under one HKCR NT backing path
+    // (_Classes or HKLM\Software\Classes), stamp the other side too so
+    // advapi32's merge-view fallback cannot reveal the deleted key.
+    if (!e.logPath.empty())
+        RegTombstoneHkcrMirror(e.logPath);
 
     // Remove tracking entry -- caller's handle is now logically invalid.
     VirtKeyEntry dummy; PopKeyEntry(KeyHandle, dummy);
