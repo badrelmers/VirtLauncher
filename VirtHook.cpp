@@ -2945,8 +2945,63 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
         return stReal;
     }
 
-    // -----------------------------------------------------------------------
-    // FIX C: KeyHandleTagsInformation (class 7) -- ALWAYS return 0 for any
+    // Virtual-only case (hVirt set, hReal NULL): the virtual key contains all
+    // data but may have tombstone values (VL_VALUE_DELETED_TYPE) that must not
+    // be counted.  Subtract them from the reported Values field so that callers
+    // who pre-allocate exactly Values slots don't over-loop and hit
+    // NO_MORE_ENTRIES mid-enumeration.
+    if ((KeyInformationClass == VlKeyFullInformation ||
+         KeyInformationClass == VlKeyCachedInformation) &&
+        e.hVirt && !e.hReal)
+    {
+        NTSTATUS stVirt = Real_NtQueryKey(e.hVirt, KeyInformationClass,
+                                          KeyInformation, Length, ResultLength);
+        if ((NT_SUCCESS(stVirt) || stVirt == VL_STATUS_BUFFER_OVERFLOW) &&
+            KeyInformation && Length > 0)
+        {
+            // Count tombstone values.
+            ULONG tombCount = 0;
+            SetReentrant(true);
+            std::vector<BYTE> scanBuf(512, 0);
+            for (ULONG vi = 0; ; ++vi) {
+                ULONG vLen = 0;
+                NTSTATUS vs = Real_NtEnumerateValueKey(e.hVirt, vi,
+                                  VlKeyValueBasicInformation,
+                                  &scanBuf[0], (ULONG)scanBuf.size(), &vLen);
+                if (vs == VL_STATUS_BUFFER_TOO_SMALL ||
+                    vs == VL_STATUS_BUFFER_OVERFLOW) {
+                    scanBuf.assign(vLen + 4, 0);
+                    vs = Real_NtEnumerateValueKey(e.hVirt, vi,
+                             VlKeyValueBasicInformation,
+                             &scanBuf[0], (ULONG)scanBuf.size(), &vLen);
+                }
+                if (!NT_SUCCESS(vs)) break;
+                VL_KEY_VALUE_BASIC_INFORMATION* kvbi =
+                    reinterpret_cast<VL_KEY_VALUE_BASIC_INFORMATION*>(&scanBuf[0]);
+                if (kvbi->Type == VL_VALUE_DELETED_TYPE) ++tombCount;
+            }
+            SetReentrant(false);
+
+            if (tombCount > 0) {
+                if (KeyInformationClass == VlKeyFullInformation) {
+                    const ULONG kMinFull = sizeof(LARGE_INTEGER) + sizeof(ULONG) * 9;
+                    if (Length >= kMinFull) {
+                        VL_KEY_FULL_INFORMATION* fi =
+                            reinterpret_cast<VL_KEY_FULL_INFORMATION*>(KeyInformation);
+                        fi->Values = (fi->Values >= tombCount) ? fi->Values - tombCount : 0;
+                    }
+                } else {
+                    if (Length >= sizeof(VL_KEY_CACHED_INFORMATION)) {
+                        VL_KEY_CACHED_INFORMATION* ci =
+                            reinterpret_cast<VL_KEY_CACHED_INFORMATION*>(KeyInformation);
+                        ci->Values = (ci->Values >= tombCount) ? ci->Values - tombCount : 0;
+                    }
+                }
+                VL_DBG(L"Hook_NtQueryKey: virtual-only tombCount=%u subtracted from Values", tombCount);
+            }
+        }
+        return stVirt;
+    }
     // handle tracked by VirtHook.
     //
     // Background
@@ -3261,9 +3316,30 @@ static NTSTATUS NTAPI Hook_NtEnumerateValueKey(
         return Real_NtEnumerateValueKey(hR ? hR : KeyHandle, Index,
                     KeyValueInformationClass, KeyValueInformation,
                     Length, ResultLength);
-    if (!hR)
-        return Real_NtEnumerateValueKey(hV, Index, KeyValueInformationClass,
-                                         KeyValueInformation, Length, ResultLength);
+    if (!hR) {
+        // Virtual-only (no real key): must still skip tombstoned values and
+        // re-index so the caller sees a contiguous 0..N-1 sequence of live values.
+        ULONG liveIdx = 0;
+        std::vector<BYTE> scanBuf(512, 0);
+        for (ULONG vi = 0; ; ++vi) {
+            ULONG vLen = 0;
+            NTSTATUS vs = Real_NtEnumerateValueKey(hV, vi, VlKeyValueBasicInformation,
+                              &scanBuf[0], (ULONG)scanBuf.size(), &vLen);
+            if (vs == VL_STATUS_BUFFER_TOO_SMALL || vs == VL_STATUS_BUFFER_OVERFLOW) {
+                scanBuf.assign(vLen + 4, 0);
+                vs = Real_NtEnumerateValueKey(hV, vi, VlKeyValueBasicInformation,
+                         &scanBuf[0], (ULONG)scanBuf.size(), &vLen);
+            }
+            if (!NT_SUCCESS(vs)) return VL_STATUS_NO_MORE_ENTRIES;
+            VL_KEY_VALUE_BASIC_INFORMATION* kvbi =
+                reinterpret_cast<VL_KEY_VALUE_BASIC_INFORMATION*>(&scanBuf[0]);
+            if (kvbi->Type == VL_VALUE_DELETED_TYPE) continue; // skip tombstone
+            if (liveIdx == Index)
+                return Real_NtEnumerateValueKey(hV, vi, KeyValueInformationClass,
+                                                 KeyValueInformation, Length, ResultLength);
+            ++liveIdx;
+        }
+    }
 
     SetReentrant(true);
     // Build list of virtual value names, excluding tombstoned values.
@@ -3383,6 +3459,27 @@ static NTSTATUS NTAPI Hook_NtQueryValueKey(
                     virtPath = resolvedPath; inScope = true;  // Case B
                 } else {
                     inScope = LogicalToVirtual(resolvedPath, virtPath); // Case A
+                    if (!inScope) {
+                        // Special case: _Classes root is SKIPped by LogicalToVirtual
+                        // but we must still serve virtualised values from it.
+                        // Map exact _Classes root -> HKEY_USERS\SID_CLASSES virtual
+                        // path (where Hook_NtSetValueKey writes root-level values).
+                        std::wstring classesRoot = g_RealNtBase + L"_Classes";
+                        if (_wcsnicmp(resolvedPath.c_str(),
+                                      classesRoot.c_str(),
+                                      classesRoot.size()) == 0 &&
+                            resolvedPath.size() == classesRoot.size())
+                        {
+                            std::wstring sidClasses;
+                            std::wstring::size_type p = g_RealNtBase.rfind(L'\\');
+                            if (p != std::wstring::npos)
+                                sidClasses = g_RealNtBase.substr(p + 1) + L"_Classes";
+                            virtPath = g_VirtNtBase + L"\\HKEY_USERS\\" + sidClasses;
+                            inScope  = true;
+                            VL_DBG(L"Hook_NtQueryValueKey: untracked _Classes-root -> HKU virtPath=%s name=%s",
+                                   virtPath.c_str(), FromUStr(ValueName).c_str());
+                        }
+                    }
                 }
             }
             SetReentrant(false);
@@ -3390,17 +3487,28 @@ static NTSTATUS NTAPI Hook_NtQueryValueKey(
             if (inScope && !virtPath.empty()) {
                 VL_DBG(L"Hook_NtQueryValueKey: untracked in-scope virtPath=%s name=%s",
                        virtPath.c_str(), FromUStr(ValueName).c_str());
-                // Open the virtual key read-only and check for a value tombstone.
+                // Open the virtual key and handle both live values and tombstones.
                 HANDLE hVirtCheck = NULL;
                 VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
                 VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus, OBJ_CASE_INSENSITIVE);
                 if (NT_SUCCESS(Real_NtOpenKey(&hVirtCheck, KEY_QUERY_VALUE, &voa))) {
-                    bool tombstoned = RegValueIsDeleted(hVirtCheck, ValueName);
-                    Real_NtClose(hVirtCheck);
-                    if (tombstoned) {
+                    if (RegValueIsDeleted(hVirtCheck, ValueName)) {
+                        // Value tombstone: hidden inside sandbox.
+                        Real_NtClose(hVirtCheck);
                         VL_DBG(L"Hook_NtQueryValueKey: untracked value tombstoned -> NOT_FOUND");
                         return VL_STATUS_OBJECT_NAME_NOT_FOUND;
                     }
+                    // Try to return the live virtual value directly.
+                    NTSTATUS st = Real_NtQueryValueKey(hVirtCheck, ValueName,
+                                      KeyValueInformationClass, KeyValueInformation,
+                                      Length, ResultLength);
+                    Real_NtClose(hVirtCheck);
+                    if (NT_SUCCESS(st) || st == VL_STATUS_BUFFER_TOO_SMALL ||
+                        st == VL_STATUS_BUFFER_OVERFLOW) {
+                        VL_DBG(L"Hook_NtQueryValueKey: untracked live virtual value returned st=0x%08X", (ULONG)st);
+                        return st;
+                    }
+                    // Value not in virtual key -- fall through to real API.
                 } else {
                     // Virtual key doesn't exist at the exact path.  Check if any
                     // ancestor is tombstoned -- a deleted parent key must make all
@@ -3514,31 +3622,68 @@ static NTSTATUS NTAPI Hook_NtSetValueKey(
                     inScope = LogicalToVirtual(resolvedPath, virtPath); // Case A
                     if (!inScope) {
                         // Special case: LogicalToVirtual SKIPs the _Classes hive
-                        // root to protect COM KCB stability, but writes to the
-                        // _Classes root must still be sandboxed.
+                        // root to protect COM KCB stability, but writes to it
+                        // must still be sandboxed.
                         //
-                        // Root-level HKCR values are stored by Windows in
-                        // HKLM\SOFTWARE\Classes.  Hook_NtQueryValueKey's read
-                        // path already looks in VirtNtBase\HKEY_LOCAL_MACHINE\
-                        // SOFTWARE\Classes for the same untracked HKLM handle,
-                        // so we must write there too to keep write and read
-                        // destinations consistent.
+                        // Windows stores root-level HKCR values in the per-user
+                        // _Classes hive (HKEY_USERS\SID_Classes).  We must write
+                        // to BOTH virtual destinations so that all read paths find
+                        // the value:
                         //
-                        // Match ONLY the exact _Classes root path:
+                        //   1. VirtNtBase\HKEY_USERS\SID_CLASSES
+                        //      Read by: direct HKU\SID_Classes access (reg query
+                        //      HKEY_USERS\SID_Classes /v ...) whose hook sees the
+                        //      _Classes root handle and uses this path.
+                        //
+                        //   2. VirtNtBase\HKEY_LOCAL_MACHINE\SOFTWARE\Classes
+                        //      Read by: HKCR access (reg query HKEY_CLASSES_ROOT
+                        //      /v ...) where advapi32 uses the HKLM\Software\Classes
+                        //      handle, which LogicalToVirtual maps to this path.
+                        //
+                        // Match ONLY the exact _Classes root:
                         //   \REGISTRY\USER\<CurrentSID>_Classes  (any case)
-                        // Do NOT match the HKCU root, HKU root, or other SID
-                        // prefixes -- those would be wrong destinations.
                         std::wstring classesRoot = g_RealNtBase + L"_Classes";
                         if (_wcsnicmp(resolvedPath.c_str(),
                                       classesRoot.c_str(),
                                       classesRoot.size()) == 0 &&
                             resolvedPath.size() == classesRoot.size())
                         {
-                            virtPath = g_VirtNtBase +
-                                       L"\\HKEY_LOCAL_MACHINE\\SOFTWARE\\Classes";
-                            inScope  = true;
-                            VL_DBG(L"Hook_NtSetValueKey: untracked _Classes-root -> HKLM\\SOFTWARE\\Classes virtPath=%s name=%s",
-                                   virtPath.c_str(), FromUStr(ValueName).c_str());
+                            // Destination 1: per-user classes hive in virtual store
+                            std::wstring virtPathHKU = g_VirtNtBase + L"\\HKEY_USERS" +
+                                resolvedPath.substr(g_RealNtBase.size() - // strip \Registry\User
+                                    (g_RealNtBase.size() - resolvedPath.find(L'\\', 1)));
+                            // Simpler: build from known components
+                            std::wstring sidClasses; // SID_Classes suffix
+                            {
+                                std::wstring::size_type p = g_RealNtBase.rfind(L'\\');
+                                if (p != std::wstring::npos)
+                                    sidClasses = g_RealNtBase.substr(p + 1) + L"_Classes";
+                            }
+                            virtPathHKU = g_VirtNtBase + L"\\HKEY_USERS\\" + sidClasses;
+
+                            // Destination 2: HKLM\SOFTWARE\Classes (HKCR read path)
+                            std::wstring virtPathHKLM = g_VirtNtBase +
+                                                        L"\\HKEY_LOCAL_MACHINE\\SOFTWARE\\Classes";
+
+                            VL_DBG(L"Hook_NtSetValueKey: untracked _Classes-root write to HKU=%s AND HKLM=%s name=%s",
+                                   virtPathHKU.c_str(), virtPathHKLM.c_str(),
+                                   FromUStr(ValueName).c_str());
+
+                            // Write to both; if either succeeds the value is readable.
+                            NTSTATUS stBoth = VL_STATUS_OBJECT_NAME_NOT_FOUND;
+                            for (int dest = 0; dest < 2; ++dest) {
+                                const std::wstring& vp = (dest == 0) ? virtPathHKU : virtPathHKLM;
+                                HANDLE hD = RegEnsureVirtAndOpenWrite(vp);
+                                if (hD) {
+                                    NTSTATUS s = Real_NtSetValueKey(hD, ValueName,
+                                                                     TitleIndex, Type,
+                                                                     Data, DataSize);
+                                    Real_NtClose(hD);
+                                    if (NT_SUCCESS(s)) stBoth = s;
+                                }
+                            }
+                            SetReentrant(false);
+                            return stBoth;
                         }
                     }
                 }
