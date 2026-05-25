@@ -1,9 +1,17 @@
 
 
+☐ reg query is slow with the big hives
+    The current time is: 23:02:50.77
+    > VirtLauncher64.exe -r -e reg query "HKEY_LOCAL_MACHINE\SOFTWARE\Classes" 2>nul | findstr "EnumA"
+    The current time is: 23:03:09.48
+
+
+
 ☐ do like sandboxie it writes directly to HKEY_USERS\Sandbox_badr_paltalk not HKCU
 
 ☐ sandboxie allow to write to the virtual HKEY_LOCAL_MACHINE without admin, my tool was able to do it too but i removed it, i do not know which one is better, so maybe it s good to add a new flag that allow to write to it , or maybe just allow without flags? TODO:decide
 
+☐ Application Hives (\REGISTRY\A): Modern Windows uses this for UWP/AppX isolated hives. Your code will return false for these because they don't start with MACHINE or USER. Sandboxie handles these with some highly specific hooks, but for a standard Win32 desktop application sandbox, it is perfectly safe to let them fail to resolve or pass through, as Win32 desktop apps generally do not have the permissions or context to write to \REGISTRY\A anyway.
 
 _____________________________________
 https://gemini.google.com/app/9303131e71d3eb50   alkorsan

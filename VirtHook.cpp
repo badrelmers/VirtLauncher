@@ -638,6 +638,28 @@ struct VirtKeyEntry {
 static std::map<HANDLE, VirtKeyEntry> g_KeyMap;
 static CRITICAL_SECTION g_KeyMapLock;
 
+// ============================================================
+// Per-handle merged subkey enumeration cache   (PERF FIX)
+//
+// Problem: Hook_NtEnumerateKey's merge path restarted its real-side scan
+// loop from ri=0 on every single call.  For a key with N subkeys this
+// costs O(N²) total kernel calls — ~16 M calls for HKLM\SOFTWARE\Classes
+// (~5 700 subkeys) → 20 s instead of ~1 s.
+//
+// Fix: build the complete merged (hSrc, physIdx) list ONCE on first access
+// and cache it keyed by the logical handle.  Subsequent calls are O(1).
+// The cache is invalidated when the handle is closed (PopKeyEntry).
+// ============================================================
+struct MergedSubkeyEntry {
+    HANDLE hSrc;      // hVirt or hReal — which physical handle to query
+    ULONG  physIdx;   // physical index inside hSrc
+};
+struct MergedSubkeyCache {
+    std::vector<MergedSubkeyEntry> entries;
+};
+// Guarded by g_KeyMapLock (same lock as g_KeyMap).
+static std::map<HANDLE, MergedSubkeyCache> g_SubkeyEnumCache;
+
 // Case-insensitive comparator for filename sets (NTFS is case-insensitive)
 struct CiLess {
     bool operator()(const std::wstring& a, const std::wstring& b) const {
@@ -751,11 +773,23 @@ static bool PopKeyEntry(HANDLE h, VirtKeyEntry& out) {
     if (it != g_KeyMap.end()) { 
         out = it->second; 
         g_KeyMap.erase(it);
+        g_SubkeyEnumCache.erase(h);   // invalidate merged-subkey cache for this handle
         LeaveCriticalSection(&g_KeyMapLock);
         return true;
     }
     LeaveCriticalSection(&g_KeyMapLock);
     return false;
+}
+
+// Evict ALL per-handle subkey caches.
+// Called after any structural mutation (key create, delete, rename) so that
+// the next NtEnumerateKey on any parent handle rebuilds a fresh merged list.
+// Writes are rare compared to reads, so clearing everything is cheap in
+// practice and is far simpler than tracking which parents are affected.
+static void InvalidateAllSubkeyCaches() {
+    EnterCriticalSection(&g_KeyMapLock);
+    g_SubkeyEnumCache.clear();
+    LeaveCriticalSection(&g_KeyMapLock);
 }
 
 static bool GetEntry(HANDLE h, VirtKeyEntry& out) {
@@ -2347,6 +2381,9 @@ static NTSTATUS DoVirtOpen(
 
             *KeyHandle = hVirt;
             TrackHandle(hVirt, hVirt, hReal, fullPath);
+            // A new subkey was created: invalidate all parent-handle enum caches
+            // so the next NtEnumerateKey on any parent sees this new entry.
+            InvalidateAllSubkeyCaches();
             VL_DBG(L"DoVirtOpen: CREATE OK hVirt=%p hReal=%p", hVirt, hReal);
             return VL_STATUS_SUCCESS;
         }
@@ -3281,91 +3318,145 @@ static NTSTATUS NTAPI Hook_NtEnumerateKey(
         }
     }
 
-    // Merge: virtual-live first, then real entries not shadowed or deleted
-    SetReentrant(true);
-    std::vector<std::wstring> deletedNames; // tombstoned virtual subkeys
-    std::vector<std::wstring> virtNames = CollectSubkeyNames(hV, &deletedNames);
-    SetReentrant(false);
+    // -----------------------------------------------------------------------
+    // PERF FIX: O(N) cached merge  (was O(N²))
+    //
+    // Old code: for every call with Index=I, looped the real side from ri=0
+    // up to the I-th unfiltered entry.  With N=5700 subkeys (HKLM\SOFTWARE\
+    // Classes) that is N*(N-1)/2 ≈ 16 M kernel calls → 20 s elapsed.
+    //
+    // New code: on the first call for a given handle we enumerate both sides
+    // once and store the complete merged (hSrc, physIdx) list in
+    // g_SubkeyEnumCache[KeyHandle].  All subsequent calls are a single
+    // Real_NtEnumerateKey targeting the pre-computed physical slot → O(1).
+    // The cache is erased in PopKeyEntry when the handle is closed.
+    //
+    // Correctness notes:
+    //   • Uses std::set<std::wstring, CiLess> for O(log V) shadowing checks
+    //     during the build pass instead of the original O(V) NameInList scan.
+    //   • Virtual tombstone checks are still performed per-entry (same logic
+    //     as before), but only once per handle lifetime, not per Index.
+    //   • Non-sequential index access (random-access callers) is handled
+    //     correctly because the full list is stored upfront.
+    //   • g_SubkeyEnumCache is protected by g_KeyMapLock (same lock as
+    //     g_KeyMap) to avoid races between build, read, and close.
+    // -----------------------------------------------------------------------
 
-    // virtNames now contains ONLY live (non-tombstoned) virtual subkeys.
-    // deletedNames contains subkeys that were deleted inside the sandbox.
+    // ── Step 1: look up or build the cache under the lock ──────────────────
+    EnterCriticalSection(&g_KeyMapLock);
+    std::map<HANDLE, MergedSubkeyCache>::iterator cit =
+        g_SubkeyEnumCache.find(KeyHandle);
 
-    ULONG virtCount = (ULONG)virtNames.size();
-    if (Index < virtCount) {
-        // Serve from virtual, but we must re-enumerate hV skipping tombstones
-        // to map the logical Index back to a physical index inside hV.
-        ULONG liveIdx = 0;
-        std::vector<BYTE> vBuf(1024, 0);
-        for (ULONG vi = 0; ; ++vi) {
-            ULONG vLen = 0;
-            NTSTATUS vs = Real_NtEnumerateKey(hV, vi, VlKeyBasicInformation,
-                                               &vBuf[0], (ULONG)vBuf.size(), &vLen);
-            if (vs == VL_STATUS_BUFFER_TOO_SMALL || vs == VL_STATUS_BUFFER_OVERFLOW) {
-                vBuf.assign(vLen + 4, 0);
-                vs = Real_NtEnumerateKey(hV, vi, VlKeyBasicInformation,
-                                          &vBuf[0], (ULONG)vBuf.size(), &vLen);
-            }
-            if (!NT_SUCCESS(vs)) return VL_STATUS_NO_MORE_ENTRIES;
-            VL_KEY_BASIC_INFORMATION* kbiV =
-                reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(&vBuf[0]);
-            // Skip tombstoned virtual subkeys (sentinel value check).
-            {
-                std::wstring subName(kbiV->Name, kbiV->NameLength / sizeof(WCHAR));
-                VL_UNICODE_STRING subUs; MakeUStr(&subUs, subName);
-                VL_OBJECT_ATTRIBUTES subOa;
-                subOa.Length                   = sizeof(VL_OBJECT_ATTRIBUTES);
-                subOa.RootDirectory            = hV;
-                subOa.ObjectName               = &subUs;
-                subOa.Attributes               = OBJ_CASE_INSENSITIVE;
-                subOa.SecurityDescriptor       = NULL;
-                subOa.SecurityQualityOfService = NULL;
-                HANDLE hSubV = NULL;
-                bool isTombed = false;
-                if (NT_SUCCESS(Real_NtOpenKey(&hSubV, KEY_QUERY_VALUE, &subOa)) && hSubV) {
-                    VL_UNICODE_STRING markerUs; MakeKeyDeletedMarkerUStr(&markerUs);
-                    isTombed = RegValueIsDeleted(hSubV, &markerUs);
-                    Real_NtClose(hSubV);
+    if (cit == g_SubkeyEnumCache.end()) {
+        // Cache miss: build the full merged list now.
+        MergedSubkeyCache newCache;
+
+        // Use case-insensitive sets for O(log V) shadow/tombstone lookups
+        // when processing the (potentially large) real-side entry list.
+        std::set<std::wstring, CiLess> liveVirtNames;   // live virtual subkeys
+        std::set<std::wstring, CiLess> tombedVirtNames; // tombstoned virtual subkeys
+
+        SetReentrant(true);
+
+        // Pass 1 — virtual subkeys (skip tombstones, record both sets)
+        {
+            std::vector<BYTE> vBuf(1024, 0);
+            for (ULONG vi = 0; ; ++vi) {
+                ULONG vLen = 0;
+                NTSTATUS vs = Real_NtEnumerateKey(hV, vi, VlKeyBasicInformation,
+                                  &vBuf[0], (ULONG)vBuf.size(), &vLen);
+                if (vs == VL_STATUS_BUFFER_TOO_SMALL ||
+                    vs == VL_STATUS_BUFFER_OVERFLOW) {
+                    vBuf.assign(vLen + 4, 0);
+                    vs = Real_NtEnumerateKey(hV, vi, VlKeyBasicInformation,
+                             &vBuf[0], (ULONG)vBuf.size(), &vLen);
                 }
-                if (isTombed) continue;
-            }
-            if (liveIdx == Index)
-                return Real_NtEnumerateKey(hV, vi, KeyInformationClass,
-                                            KeyInformation, Length, ResultLength);
-            ++liveIdx;
-        }
-    }
-    ULONG want = Index - virtCount;
-    ULONG skipped = 0;
-    std::vector<BYTE> tmpBuf(1024, 0);
+                if (!NT_SUCCESS(vs)) break;
 
-    for (ULONG ri = 0; ; ++ri) {
-        ULONG resLen = 0;
-        NTSTATUS st = Real_NtEnumerateKey(hR, ri, VlKeyBasicInformation,
-                                           &tmpBuf[0], (ULONG)tmpBuf.size(), &resLen);
-        if (st == VL_STATUS_BUFFER_TOO_SMALL || st == VL_STATUS_BUFFER_OVERFLOW) {
-            tmpBuf.assign(resLen + 4, 0);
-            st = Real_NtEnumerateKey(hR, ri, VlKeyBasicInformation,
-                                      &tmpBuf[0], (ULONG)tmpBuf.size(), &resLen);
-        }
-        if (!NT_SUCCESS(st)) return VL_STATUS_NO_MORE_ENTRIES;
+                VL_KEY_BASIC_INFORMATION* kbiV =
+                    reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(&vBuf[0]);
+                std::wstring name(kbiV->Name, kbiV->NameLength / sizeof(WCHAR));
 
-        VL_KEY_BASIC_INFORMATION* kbi =
-            reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(&tmpBuf[0]);
-        std::wstring name(kbi->Name, kbi->NameLength / sizeof(WCHAR));
+                // Tombstone check: open the subkey relative to hV and probe
+                // for the key-deleted sentinel value.
+                bool isTombed = false;
+                {
+                    VL_UNICODE_STRING subUs; MakeUStr(&subUs, name);
+                    VL_OBJECT_ATTRIBUTES subOa;
+                    subOa.Length                   = sizeof(VL_OBJECT_ATTRIBUTES);
+                    subOa.RootDirectory            = hV;
+                    subOa.ObjectName               = &subUs;
+                    subOa.Attributes               = OBJ_CASE_INSENSITIVE;
+                    subOa.SecurityDescriptor       = NULL;
+                    subOa.SecurityQualityOfService = NULL;
+                    HANDLE hSubV = NULL;
+                    if (NT_SUCCESS(Real_NtOpenKey(&hSubV, KEY_QUERY_VALUE, &subOa))
+                        && hSubV) {
+                        VL_UNICODE_STRING markerUs;
+                        MakeKeyDeletedMarkerUStr(&markerUs);
+                        isTombed = RegValueIsDeleted(hSubV, &markerUs);
+                        Real_NtClose(hSubV);
+                    }
+                }
 
-        if (!NameInList(name, virtNames)) {
-            // Skip real subkeys that were deleted inside the sandbox.
-            // deletedNames was populated by CollectSubkeyNames from the
-            // tombstone-marked virtual keys -- no extra kernel open needed.
-            bool tombstoned = NameInList(name, deletedNames);
-            if (!tombstoned) {
-                if (skipped == want)
-                    return Real_NtEnumerateKey(hR, ri, KeyInformationClass,
-                                                KeyInformation, Length, ResultLength);
-                ++skipped;
+                if (isTombed) {
+                    tombedVirtNames.insert(name);
+                } else {
+                    liveVirtNames.insert(name);
+                    MergedSubkeyEntry me; me.hSrc = hV; me.physIdx = vi;
+                    newCache.entries.push_back(me);
+                }
             }
         }
+
+        // Pass 2 — real subkeys: include only those not shadowed by a live
+        // virtual entry and not tombstoned (deleted inside the sandbox).
+        {
+            std::vector<BYTE> rBuf(1024, 0);
+            for (ULONG ri = 0; ; ++ri) {
+                ULONG rLen = 0;
+                NTSTATUS rs = Real_NtEnumerateKey(hR, ri, VlKeyBasicInformation,
+                                  &rBuf[0], (ULONG)rBuf.size(), &rLen);
+                if (rs == VL_STATUS_BUFFER_TOO_SMALL ||
+                    rs == VL_STATUS_BUFFER_OVERFLOW) {
+                    rBuf.assign(rLen + 4, 0);
+                    rs = Real_NtEnumerateKey(hR, ri, VlKeyBasicInformation,
+                             &rBuf[0], (ULONG)rBuf.size(), &rLen);
+                }
+                if (!NT_SUCCESS(rs)) break;
+
+                VL_KEY_BASIC_INFORMATION* kbi =
+                    reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(&rBuf[0]);
+                std::wstring name(kbi->Name, kbi->NameLength / sizeof(WCHAR));
+
+                // O(log V) set lookups — no linear scan
+                if (liveVirtNames.count(name) || tombedVirtNames.count(name))
+                    continue;
+
+                MergedSubkeyEntry me; me.hSrc = hR; me.physIdx = ri;
+                newCache.entries.push_back(me);
+            }
+        }
+
+        SetReentrant(false);
+
+        g_SubkeyEnumCache[KeyHandle] = newCache;
+        cit = g_SubkeyEnumCache.find(KeyHandle);
     }
+
+    // Take a local copy of the needed entry so we can drop the lock before
+    // calling into the kernel (which may re-enter other hooks).
+    if (Index >= (ULONG)cit->second.entries.size()) {
+        LeaveCriticalSection(&g_KeyMapLock);
+        return VL_STATUS_NO_MORE_ENTRIES;
+    }
+    const MergedSubkeyEntry ce = cit->second.entries[Index];
+    LeaveCriticalSection(&g_KeyMapLock);
+
+    // ── Step 2: single targeted kernel call — O(1) ─────────────────────────
+    return Real_NtEnumerateKey(ce.hSrc, ce.physIdx,
+                                KeyInformationClass, KeyInformation,
+                                Length, ResultLength);
 }
 
 // ---- NtEnumerateValueKey -- merged view ----
@@ -4298,6 +4389,9 @@ static NTSTATUS NTAPI Hook_NtDeleteKey(HANDLE KeyHandle)
     // Remove tracking entry -- caller's handle is now logically invalid.
     VirtKeyEntry dummy; PopKeyEntry(KeyHandle, dummy);
 
+    // Invalidate all parent-handle enum caches: a subkey just disappeared.
+    InvalidateAllSubkeyCaches();
+
     // Always succeed: the app's delete request is fulfilled (key is hidden).
     return VL_STATUS_SUCCESS;
 }
@@ -4499,7 +4593,10 @@ static NTSTATUS NTAPI Hook_NtRenameKey(
            KeyHandle, useH,
            NewName ? FromUStr(NewName).c_str() : L"(null)");
 
-    return Real_NtRenameKey(useH, NewName);
+    NTSTATUS stRename = Real_NtRenameKey(useH, NewName);
+    if (NT_SUCCESS(stRename))
+        InvalidateAllSubkeyCaches(); // subkey name changed: invalidate parent caches
+    return stRename;
 }
 
 // ---- NtReplaceKey -- complex (hive replacement); pass through with log ----
@@ -7944,6 +8041,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
                 Real_NtClose(it->second.hReal);
         }
         g_KeyMap.clear();
+        g_SubkeyEnumCache.clear();   // release merged-subkey cache memory
         LeaveCriticalSection(&g_KeyMapLock);
         DeleteCriticalSection(&g_KeyMapLock);
 
