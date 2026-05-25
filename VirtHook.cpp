@@ -4018,6 +4018,68 @@ static NTSTATUS NTAPI Hook_NtDeleteValueKey(
                         VL_DBG(L"Hook_NtDeleteValueKey: untracked in-scope logPath=%s virtPath=%s name=%s",
                                resolvedPath.c_str(), virtPath.c_str(),
                                FromUStr(ValueName).c_str());
+
+                    // Special case A: LogicalToVirtual SKIPs the HKCU hive root to
+                    // avoid re-entrancy, but a value-delete on it must still be
+                    // sandboxed.  Map exact HKCU root -> VirtNtBase\HKEY_CURRENT_USER.
+                    if (!inScope) {
+                        if (_wcsnicmp(resolvedPath.c_str(),
+                                      g_RealNtBase.c_str(),
+                                      g_RealNtBase.size()) == 0 &&
+                            resolvedPath.size() == g_RealNtBase.size())
+                        {
+                            virtPath = g_VirtNtBase + L"\\HKEY_CURRENT_USER";
+                            inScope  = true;
+                            VL_DBG(L"Hook_NtDeleteValueKey: untracked HKCU-root tombstone virtPath=%s name=%s",
+                                   virtPath.c_str(), FromUStr(ValueName).c_str());
+                        }
+                    }
+
+                    // Special case B: LogicalToVirtual SKIPs the _Classes hive root
+                    // (same reason as NtSetValueKey).  A delete on HKCR root-level
+                    // values must write tombstones to BOTH virtual destinations where
+                    // NtSetValueKey wrote the live value, otherwise the value remains
+                    // visible on the next query:
+                    //   1. VirtNtBase\HKEY_USERS\<SID>_Classes   (direct HKU path)
+                    //   2. VirtNtBase\HKEY_LOCAL_MACHINE\SOFTWARE\Classes  (HKCR path)
+                    if (!inScope) {
+                        std::wstring classesRoot = g_RealNtBase + L"_Classes";
+                        if (_wcsnicmp(resolvedPath.c_str(),
+                                      classesRoot.c_str(),
+                                      classesRoot.size()) == 0 &&
+                            resolvedPath.size() == classesRoot.size())
+                        {
+                            std::wstring sidClasses;
+                            {
+                                std::wstring::size_type p = g_RealNtBase.rfind(L'\\');
+                                if (p != std::wstring::npos)
+                                    sidClasses = g_RealNtBase.substr(p + 1) + L"_Classes";
+                            }
+                            std::wstring virtPathHKU  = g_VirtNtBase + L"\\HKEY_USERS\\" + sidClasses;
+                            std::wstring virtPathHKLM = g_VirtNtBase + L"\\HKEY_LOCAL_MACHINE\\SOFTWARE\\Classes";
+
+                            VL_DBG(L"Hook_NtDeleteValueKey: untracked _Classes-root tombstone HKU=%s AND HKLM=%s name=%s",
+                                   virtPathHKU.c_str(), virtPathHKLM.c_str(),
+                                   FromUStr(ValueName).c_str());
+
+                            SetReentrant(false);
+                            NTSTATUS stBoth = VL_STATUS_OBJECT_NAME_NOT_FOUND;
+                            for (int dest = 0; dest < 2; ++dest) {
+                                const std::wstring& vp = (dest == 0) ? virtPathHKU : virtPathHKLM;
+                                HANDLE hD = RegEnsureVirtAndOpenWrite(vp);
+                                if (hD) {
+                                    Real_NtDeleteValueKey(hD, ValueName);
+                                    NTSTATUS s = Real_NtSetValueKey(hD, ValueName, 0,
+                                                                     VL_VALUE_DELETED_TYPE, NULL, 0);
+                                    Real_NtClose(hD);
+                                    if (NT_SUCCESS(s)) stBoth = s;
+                                }
+                            }
+                            VL_DBG(L"Hook_NtDeleteValueKey: untracked _Classes-root tombstone write stBoth=0x%08X", (ULONG)stBoth);
+                            return NT_SUCCESS(stBoth) ? VL_STATUS_SUCCESS
+                                                      : VL_STATUS_OBJECT_NAME_NOT_FOUND;
+                        }
+                    }
                 }
             }
             SetReentrant(false);
