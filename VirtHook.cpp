@@ -3513,17 +3513,31 @@ static NTSTATUS NTAPI Hook_NtSetValueKey(
                 } else {
                     inScope = LogicalToVirtual(resolvedPath, virtPath); // Case A
                     if (!inScope) {
-                        // Special case: LogicalToVirtual SKIPs _Classes hive root
-                        // to protect COM KCB stability, but writes to it must
-                        // still be sandboxed.  Construct the virtual path manually:
-                        //   \REGISTRY\USER\<SID>_Classes
-                        //   → VirtNtBase\HKEY_USERS\<SID>_Classes
-                        static const std::wstring kUser = L"\\REGISTRY\\USER\\";
-                        if (StartsWithI(resolvedPath, kUser)) {
-                            std::wstring sub = resolvedPath.substr(kUser.size() - 1); // keep leading '\'
-                            virtPath = g_VirtNtBase + L"\\HKEY_USERS" + sub;
+                        // Special case: LogicalToVirtual SKIPs the _Classes hive
+                        // root to protect COM KCB stability, but writes to the
+                        // _Classes root must still be sandboxed.
+                        //
+                        // Root-level HKCR values are stored by Windows in
+                        // HKLM\SOFTWARE\Classes.  Hook_NtQueryValueKey's read
+                        // path already looks in VirtNtBase\HKEY_LOCAL_MACHINE\
+                        // SOFTWARE\Classes for the same untracked HKLM handle,
+                        // so we must write there too to keep write and read
+                        // destinations consistent.
+                        //
+                        // Match ONLY the exact _Classes root path:
+                        //   \REGISTRY\USER\<CurrentSID>_Classes  (any case)
+                        // Do NOT match the HKCU root, HKU root, or other SID
+                        // prefixes -- those would be wrong destinations.
+                        std::wstring classesRoot = g_RealNtBase + L"_Classes";
+                        if (_wcsnicmp(resolvedPath.c_str(),
+                                      classesRoot.c_str(),
+                                      classesRoot.size()) == 0 &&
+                            resolvedPath.size() == classesRoot.size())
+                        {
+                            virtPath = g_VirtNtBase +
+                                       L"\\HKEY_LOCAL_MACHINE\\SOFTWARE\\Classes";
                             inScope  = true;
-                            VL_DBG(L"Hook_NtSetValueKey: untracked _Classes-root special-case virtPath=%s name=%s",
+                            VL_DBG(L"Hook_NtSetValueKey: untracked _Classes-root -> HKLM\\SOFTWARE\\Classes virtPath=%s name=%s",
                                    virtPath.c_str(), FromUStr(ValueName).c_str());
                         }
                     }
