@@ -2651,6 +2651,32 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
                         virtPath = resolvedPath; inScope = true;  // Case B
                     } else {
                         inScope = LogicalToVirtual(resolvedPath, virtPath); // Case A
+                        if (!inScope) {
+                            // HKCU root special case
+                            if (_wcsnicmp(resolvedPath.c_str(), g_RealNtBase.c_str(),
+                                          g_RealNtBase.size()) == 0 &&
+                                resolvedPath.size() == g_RealNtBase.size())
+                            {
+                                virtPath = g_VirtNtBase + L"\\HKEY_CURRENT_USER";
+                                inScope  = true;
+                            }
+                        }
+                        if (!inScope) {
+                            // _Classes root special case
+                            std::wstring classesRoot = g_RealNtBase + L"_Classes";
+                            if (_wcsnicmp(resolvedPath.c_str(), classesRoot.c_str(),
+                                          classesRoot.size()) == 0 &&
+                                resolvedPath.size() == classesRoot.size())
+                            {
+                                std::wstring::size_type p = g_RealNtBase.rfind(L'\\');
+                                std::wstring sidClasses = (p != std::wstring::npos)
+                                    ? g_RealNtBase.substr(p + 1) + L"_Classes" : L"";
+                                if (!sidClasses.empty()) {
+                                    virtPath = g_VirtNtBase + L"\\HKEY_USERS\\" + sidClasses;
+                                    inScope  = true;
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -3113,6 +3139,94 @@ static NTSTATUS NTAPI Hook_NtEnumerateKey(
 {
     VirtKeyEntry e;
     if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
+        // Untracked handle: resolve via NtQueryObject, and if in scope perform
+        // a tombstone-aware subkey enumeration so deleted subkeys are hidden.
+        if (g_RegEnabled) {
+            SetReentrant(true);
+            std::wstring resolvedPath = GetHandleLogicalPath(KeyHandle);
+            std::wstring virtPath;
+            bool inScope = false;
+            if (!resolvedPath.empty()) {
+                if (StartsWithI(resolvedPath, g_VirtNtBase)) {
+                    virtPath = resolvedPath; inScope = true;  // Case B
+                } else {
+                    inScope = LogicalToVirtual(resolvedPath, virtPath); // Case A
+                    if (!inScope) {
+                        // HKCU root special case
+                        if (_wcsnicmp(resolvedPath.c_str(), g_RealNtBase.c_str(),
+                                      g_RealNtBase.size()) == 0 &&
+                            resolvedPath.size() == g_RealNtBase.size())
+                        {
+                            virtPath = g_VirtNtBase + L"\\HKEY_CURRENT_USER";
+                            inScope  = true;
+                        }
+                    }
+                    if (!inScope) {
+                        // _Classes root special case
+                        std::wstring classesRoot = g_RealNtBase + L"_Classes";
+                        if (_wcsnicmp(resolvedPath.c_str(), classesRoot.c_str(),
+                                      classesRoot.size()) == 0 &&
+                            resolvedPath.size() == classesRoot.size())
+                        {
+                            std::wstring::size_type p = g_RealNtBase.rfind(L'\\');
+                            std::wstring sidClasses = (p != std::wstring::npos)
+                                ? g_RealNtBase.substr(p + 1) + L"_Classes" : L"";
+                            if (!sidClasses.empty()) {
+                                virtPath = g_VirtNtBase + L"\\HKEY_USERS\\" + sidClasses;
+                                inScope  = true;
+                            }
+                        }
+                    }
+                }
+            }
+            SetReentrant(false);
+
+            if (inScope && !virtPath.empty()) {
+                VL_DBG(L"Hook_NtEnumerateKey: untracked in-scope virtPath=%s index=%u",
+                       virtPath.c_str(), Index);
+                // Build list of tombstoned subkey names from the virtual key.
+                std::vector<std::wstring> deletedNames;
+                HANDLE hVirtCheck = NULL;
+                VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
+                VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus, OBJ_CASE_INSENSITIVE);
+                if (NT_SUCCESS(Real_NtOpenKey(&hVirtCheck, KEY_ENUMERATE_SUB_KEYS, &voa))) {
+                    SetReentrant(true);
+                    std::vector<std::wstring> liveNames;
+                    liveNames = CollectSubkeyNames(hVirtCheck, &deletedNames);
+                    SetReentrant(false);
+                    Real_NtClose(hVirtCheck);
+                }
+
+                if (!deletedNames.empty()) {
+                    // Re-enumerate real key, skipping tombstoned subkeys.
+                    ULONG liveIdx = 0;
+                    std::vector<BYTE> eBuf(1024, 0);
+                    for (ULONG ri = 0; ; ++ri) {
+                        ULONG rLen = 0;
+                        NTSTATUS rs = Real_NtEnumerateKey(KeyHandle, ri,
+                                          VlKeyBasicInformation,
+                                          &eBuf[0], (ULONG)eBuf.size(), &rLen);
+                        if (rs == VL_STATUS_BUFFER_TOO_SMALL ||
+                            rs == VL_STATUS_BUFFER_OVERFLOW) {
+                            eBuf.assign(rLen + 4, 0);
+                            rs = Real_NtEnumerateKey(KeyHandle, ri,
+                                     VlKeyBasicInformation,
+                                     &eBuf[0], (ULONG)eBuf.size(), &rLen);
+                        }
+                        if (!NT_SUCCESS(rs)) return VL_STATUS_NO_MORE_ENTRIES;
+                        VL_KEY_BASIC_INFORMATION* kbi =
+                            reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(&eBuf[0]);
+                        std::wstring name(kbi->Name, kbi->NameLength / sizeof(WCHAR));
+                        if (NameInList(name, deletedNames)) continue;
+                        if (liveIdx == Index)
+                            return Real_NtEnumerateKey(KeyHandle, ri,
+                                       KeyInformationClass, KeyInformation,
+                                       Length, ResultLength);
+                        ++liveIdx;
+                    }
+                }
+            }
+        }
         return Real_NtEnumerateKey(KeyHandle, Index, KeyInformationClass,
                                     KeyInformation, Length, ResultLength);
     }
@@ -3126,9 +3240,46 @@ static NTSTATUS NTAPI Hook_NtEnumerateKey(
     if (!hV)
         return Real_NtEnumerateKey(hR ? hR : KeyHandle, Index, KeyInformationClass,
                                     KeyInformation, Length, ResultLength);
-    if (!hR)
-        return Real_NtEnumerateKey(hV, Index, KeyInformationClass,
-                                    KeyInformation, Length, ResultLength);
+    if (!hR) {
+        // Virtual-only: must skip tombstoned subkeys and re-index.
+        ULONG liveIdx = 0;
+        std::vector<BYTE> vBuf(1024, 0);
+        for (ULONG vi = 0; ; ++vi) {
+            ULONG vLen = 0;
+            NTSTATUS vs = Real_NtEnumerateKey(hV, vi, VlKeyBasicInformation,
+                              &vBuf[0], (ULONG)vBuf.size(), &vLen);
+            if (vs == VL_STATUS_BUFFER_TOO_SMALL || vs == VL_STATUS_BUFFER_OVERFLOW) {
+                vBuf.assign(vLen + 4, 0);
+                vs = Real_NtEnumerateKey(hV, vi, VlKeyBasicInformation,
+                         &vBuf[0], (ULONG)vBuf.size(), &vLen);
+            }
+            if (!NT_SUCCESS(vs)) return VL_STATUS_NO_MORE_ENTRIES;
+            VL_KEY_BASIC_INFORMATION* kbiV =
+                reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(&vBuf[0]);
+            // Check if this subkey carries the key-deleted tombstone marker.
+            {
+                std::wstring subName(kbiV->Name, kbiV->NameLength / sizeof(WCHAR));
+                VL_UNICODE_STRING subUs; MakeUStr(&subUs, subName);
+                VL_OBJECT_ATTRIBUTES subOa;
+                subOa.Length = sizeof(VL_OBJECT_ATTRIBUTES);
+                subOa.RootDirectory = hV; subOa.ObjectName = &subUs;
+                subOa.Attributes = OBJ_CASE_INSENSITIVE;
+                subOa.SecurityDescriptor = subOa.SecurityQualityOfService = NULL;
+                HANDLE hSubV = NULL;
+                bool isTombed = false;
+                if (NT_SUCCESS(Real_NtOpenKey(&hSubV, KEY_QUERY_VALUE, &subOa)) && hSubV) {
+                    VL_UNICODE_STRING markerUs; MakeKeyDeletedMarkerUStr(&markerUs);
+                    isTombed = RegValueIsDeleted(hSubV, &markerUs);
+                    Real_NtClose(hSubV);
+                }
+                if (isTombed) continue;
+            }
+            if (liveIdx == Index)
+                return Real_NtEnumerateKey(hV, vi, KeyInformationClass,
+                                            KeyInformation, Length, ResultLength);
+            ++liveIdx;
+        }
+    }
 
     // Merge: virtual-live first, then real entries not shadowed or deleted
     SetReentrant(true);
@@ -3238,6 +3389,32 @@ static NTSTATUS NTAPI Hook_NtEnumerateValueKey(
                     virtPath = resolvedPath; inScope = true;  // Case B
                 } else {
                     inScope = LogicalToVirtual(resolvedPath, virtPath); // Case A
+                    if (!inScope) {
+                        // HKCU root special case
+                        if (_wcsnicmp(resolvedPath.c_str(), g_RealNtBase.c_str(),
+                                      g_RealNtBase.size()) == 0 &&
+                            resolvedPath.size() == g_RealNtBase.size())
+                        {
+                            virtPath = g_VirtNtBase + L"\\HKEY_CURRENT_USER";
+                            inScope  = true;
+                        }
+                    }
+                    if (!inScope) {
+                        // _Classes root special case — check HKU\SID_Classes virtual path
+                        std::wstring classesRoot = g_RealNtBase + L"_Classes";
+                        if (_wcsnicmp(resolvedPath.c_str(), classesRoot.c_str(),
+                                      classesRoot.size()) == 0 &&
+                            resolvedPath.size() == classesRoot.size())
+                        {
+                            std::wstring::size_type p = g_RealNtBase.rfind(L'\\');
+                            std::wstring sidClasses = (p != std::wstring::npos)
+                                ? g_RealNtBase.substr(p + 1) + L"_Classes" : L"";
+                            if (!sidClasses.empty()) {
+                                virtPath = g_VirtNtBase + L"\\HKEY_USERS\\" + sidClasses;
+                                inScope  = true;
+                            }
+                        }
+                    }
                 }
             }
             SetReentrant(false);
@@ -3589,6 +3766,77 @@ static NTSTATUS NTAPI Hook_NtQueryMultipleValueKey(
 {
     VirtKeyEntry e;
     if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
+        // Untracked handle: resolve and check for tombstoned values before
+        // falling through.  NtQueryMultipleValueKey queries several values at
+        // once; we must block any that are tombstoned in the virtual store.
+        if (g_RegEnabled && ValueEntries && EntryCount > 0) {
+            SetReentrant(true);
+            std::wstring resolvedPath = GetHandleLogicalPath(KeyHandle);
+            std::wstring virtPath;
+            bool inScope = false;
+            if (!resolvedPath.empty()) {
+                if (StartsWithI(resolvedPath, g_VirtNtBase)) {
+                    virtPath = resolvedPath; inScope = true;
+                } else {
+                    inScope = LogicalToVirtual(resolvedPath, virtPath);
+                    if (!inScope) {
+                        if (_wcsnicmp(resolvedPath.c_str(), g_RealNtBase.c_str(),
+                                      g_RealNtBase.size()) == 0 &&
+                            resolvedPath.size() == g_RealNtBase.size())
+                        { virtPath = g_VirtNtBase + L"\\HKEY_CURRENT_USER"; inScope = true; }
+                    }
+                    if (!inScope) {
+                        std::wstring classesRoot = g_RealNtBase + L"_Classes";
+                        if (_wcsnicmp(resolvedPath.c_str(), classesRoot.c_str(),
+                                      classesRoot.size()) == 0 &&
+                            resolvedPath.size() == classesRoot.size())
+                        {
+                            std::wstring::size_type p = g_RealNtBase.rfind(L'\\');
+                            std::wstring sc = (p != std::wstring::npos)
+                                ? g_RealNtBase.substr(p + 1) + L"_Classes" : L"";
+                            if (!sc.empty()) {
+                                virtPath = g_VirtNtBase + L"\\HKEY_USERS\\" + sc;
+                                inScope  = true;
+                            }
+                        }
+                    }
+                }
+            }
+            SetReentrant(false);
+
+            if (inScope && !virtPath.empty()) {
+                HANDLE hVirtCheck = NULL;
+                VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
+                VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus, OBJ_CASE_INSENSITIVE);
+                if (NT_SUCCESS(Real_NtOpenKey(&hVirtCheck, KEY_QUERY_VALUE, &voa))) {
+                    // For each requested value: if a live virtual value exists
+                    // return it; if tombstoned return NOT_FOUND for that entry.
+                    // If not in virtual at all, fall through to real below.
+                    NTSTATUS stAll = VL_STATUS_SUCCESS;
+                    for (ULONG i = 0; i < EntryCount; ++i) {
+                        PVL_KEY_VALUE_ENTRY ve = &ValueEntries[i];
+                        if (!ve->ValueName) continue;
+                        if (RegValueIsDeleted(hVirtCheck, ve->ValueName)) {
+                            stAll = VL_STATUS_OBJECT_NAME_NOT_FOUND;
+                        }
+                        // Live virtual values are served by the Real call below
+                        // on the virtual handle, so we don't need to do anything
+                        // extra here.
+                    }
+                    if (stAll == VL_STATUS_OBJECT_NAME_NOT_FOUND) {
+                        Real_NtClose(hVirtCheck);
+                        return VL_STATUS_OBJECT_NAME_NOT_FOUND;
+                    }
+                    // Try virtual store first, fall back to real if needed.
+                    NTSTATUS st = Real_NtQueryMultipleValueKey(hVirtCheck, ValueEntries,
+                                      EntryCount, ValueBuffer, BufferLength,
+                                      RequiredBufferLength);
+                    Real_NtClose(hVirtCheck);
+                    if (NT_SUCCESS(st)) return st;
+                    // Fall through to real API.
+                }
+            }
+        }
         return Real_NtQueryMultipleValueKey(KeyHandle, ValueEntries, EntryCount,
                                              ValueBuffer, BufferLength,
                                              RequiredBufferLength);
