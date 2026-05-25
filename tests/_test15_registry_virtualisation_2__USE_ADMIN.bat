@@ -2,10 +2,17 @@
 setlocal EnableDelayedExpansion
 CD /D "%~dp0"
 
-
 REM check admin
+rem we need admin because we write to some previliged keys directly without virtlauncher
 fltmc >nul 2>&1 || ( color 4F & echo. & echo RUNME AS ADMIN & echo. & pause & exit )
 
+
+:: ============================================================
+REM set VLAUNCHER_VERBOSE=true
+set VLAUNCHER_DEBUG=true
+
+
+:: ============================================================
 cd /d "..\build"
 color 2F
 
@@ -60,7 +67,7 @@ echo === TEST 2: HKLM Write Isolation ===
 call :AssertKeyMissing "%REAL_HKLM%\Test2" "Real HKLM should not leak"
 call :AssertKeyExists "%VIRT_HKLM%\Test2" "Virtual HKLM should capture write"
 
-pause
+
 :: =====================================================================
 :: TEST 3: Deep Nested Path Creation (HKLM)
 :: =====================================================================

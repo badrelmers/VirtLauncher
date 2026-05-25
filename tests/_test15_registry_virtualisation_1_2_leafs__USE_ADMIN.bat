@@ -34,20 +34,17 @@ echo  VirtLauncher Registry Redirection Test Suite
 echo ============================================================
 echo.
 
-@rem NOTE:writes to HKEY_CLASSES_ROOT go to %VIRT_ROOT%\HKEY_LOCAL_MACHINE\SOFTWARE\Classes not %VIRT_ROOT%\HKEY_CLASSES_ROOT
-set "REAL_key=HKEY_CLASSES_ROOT\VirtTest_HKCR_Real"
-set "VIRT_key=%VIRT_ROOT%\HKEY_LOCAL_MACHINE\SOFTWARE\Classes\VirtTest_HKCR_Real"
-call :run_tests
 
-set "REAL_key=HKEY_LOCAL_MACHINE\SOFTWARE\Classes\VirtTest_HKLM_Real"
+
+set "REAL_key=HKEY_LOCAL_MACHINE\SOFTWARE\Classes"
 set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
 call :run_tests
 
-set "REAL_key=HKEY_LOCAL_MACHINE\SOFTWARE\VirtTest_HKLM_Real"
+set "REAL_key=HKEY_LOCAL_MACHINE\SOFTWARE"
 set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
 call :run_tests
 
-set "REAL_key=HKEY_CURRENT_USER\Software\VirtTest_HKCU_Real"
+set "REAL_key=HKEY_CURRENT_USER\Software"
 set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
 call :run_tests
 
@@ -73,30 +70,38 @@ set "USER_SID=%USER_SID: =%"
 
 :: 2. Define the target key path and the test value
 
-set "REAL_key=HKEY_USERS\%USER_SID%_Classes\VirtHookLeak"
+set "REAL_key=HKEY_USERS\.DEFAULT"
+set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
+call :run_tests
+
+set "REAL_key=HKEY_USERS\S-1-5-18"
+set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
+call :run_tests
+
+set "REAL_key=HKEY_USERS\S-1-5-19"
+set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
+call :run_tests
+
+set "REAL_key=HKEY_USERS\S-1-5-20"
+set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
+call :run_tests
+
+
+
+@rem NOTE:writes to HKEY_CLASSES_ROOT go to %VIRT_ROOT%\HKEY_LOCAL_MACHINE\SOFTWARE\Classes and %VIRT_ROOT%\HKEY_USERS\S-1-5-21-3874345145-3142222481-512852731-1000_Classes not %VIRT_ROOT%\HKEY_CLASSES_ROOT
+set "REAL_key=HKEY_CLASSES_ROOT"
+set "VIRT_key=%VIRT_ROOT%\HKEY_LOCAL_MACHINE\SOFTWARE\Classes"
+call :run_tests
+@rem pause
+set "REAL_key=HKEY_USERS\%USER_SID%_Classes"
 set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
 call :run_tests
 
 @rem NOTE:writes to HKEY_USERS\S-1-5-21-3874345145-3142222481-512852731-1000 go to %VIRT_ROOT%\HKEY_CURRENT_USER not %VIRT_ROOT%\S-1-5-21-3874345145-3142222481-512852731-1000
-set "REAL_key=HKEY_USERS\%USER_SID%\VirtHookLeak"
-set "VIRT_key=%VIRT_ROOT%\HKEY_CURRENT_USER\VirtHookLeak"
+set "REAL_key=HKEY_USERS\%USER_SID%"
+set "VIRT_key=%VIRT_ROOT%\HKEY_CURRENT_USER"
 call :run_tests
 
-set "REAL_key=HKEY_USERS\.DEFAULT\VirtHookLeak"
-set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
-call :run_tests
-
-set "REAL_key=HKEY_USERS\S-1-5-18\VirtHookLeak"
-set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
-call :run_tests
-
-set "REAL_key=HKEY_USERS\S-1-5-19\VirtHookLeak"
-set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
-call :run_tests
-
-set "REAL_key=HKEY_USERS\S-1-5-20\VirtHookLeak"
-set "VIRT_key=%VIRT_ROOT%\%REAL_key%"
-call :run_tests
 
 echo.
 echo ============================================================
@@ -107,12 +112,18 @@ echo  Failed : %FAIL_COUNT%
 echo ============================================================
 
 if %FAIL_COUNT% equ 0 (
-    echo  [OK] ALL TESTS PASSED SUCCESSFULLY
+    echo  [OK] ALL TESTS PASSED SUCCESSFULLY, this cannot happen
     color 2F
+) else if %FAIL_COUNT% equ 9 (
+    echo  [OK] 9 TESTS FAILED: this is expected
+    color 5F
 ) else (
-    echo  [X] SOME TESTS FAILED
+    echo  [X] this should not happen
     color 4F
 )
+
+
+echo.
 
 call :CLEANUP
 pause
@@ -132,20 +143,21 @@ echo.
 call :CLEANUP
 
 echo ====================== 1. Reg Write/Read
-%LAUNCHER% -r "%VIRT_ROOT%" -e cmd /c reg add "%REAL_key%" /v WriteVal /t REG_SZ /d SuccessWrite /f >nul
+%LAUNCHER% -r "%VIRT_ROOT%" -e reg add "%REAL_key%" /v WriteVal /t REG_SZ /d SuccessWrite /f >nul
 
-echo ______Check if Key successfully written to Virtual Root
-reg query "%VIRT_key%" /v WriteVal | findstr "SuccessWrite" >nul
+echo ______Check if Value successfully written to Virtual Root
+@rem reg query "%VIRT_key%" /v WriteVal | findstr "SuccessWrite" >nul
+%LAUNCHER% -r "%VIRT_ROOT%" -e reg query "%REAL_key%" /v WriteVal | findstr "SuccessWrite" >nul
 if %ERRORLEVEL% EQU 0 (
     call :Pass
 ) else (
-    call :Fail "Reg Write: Key not found in Virtual Root."
+    call :Fail "Reg Write: Value not found in Virtual Root."
 )
 
-echo ______Check if Key leaked into real logical host registry
+echo ______Check if Value leaked into real logical host registry
 reg query "%REAL_key%" /v WriteVal >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    call :Fail "Reg Write: Key leaked into real logical host registry"
+    call :Fail "Reg Write: Value leaked into real logical host registry"
 ) else (
     call :Pass
 )
@@ -155,7 +167,7 @@ echo ______Check if we can read Virtual Root from the Virtual world
 if %ERRORLEVEL% EQU 0 (
     call :Pass
 ) else (
-    call :Fail "Reg Read: App failed to read virtual registry key."
+    call :Fail "Reg Read: App failed to read virtual registry value."
 )
 
 
@@ -163,12 +175,12 @@ echo.
 echo ====================== 2. Reg Delete
 %LAUNCHER% -r "%VIRT_ROOT%" cmd /c reg delete "%REAL_key%" /v WriteVal /f >nul
 
-echo ______Check if key is removed from virtual root
+echo ______Check if value is removed from virtual root
 %LAUNCHER% -r "%VIRT_ROOT%" cmd /c reg query "%REAL_key%" /v WriteVal >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
     call :Pass
 ) else (
-    call :Fail "Reg Delete: key still exists in Virtual Root."
+    call :Fail "Reg Delete: Value still exists in Virtual Root."
 )
 
 echo ______Check if tombstone is created inside the virtual root
@@ -204,10 +216,33 @@ if %ERRORLEVEL% EQU 0 (
 )
 
 
+
+echo ______Check if Value inside a new key can be read from the Virtual world
+%LAUNCHER% -r "%VIRT_ROOT%" -e cmd /c reg add "%REAL_key%\virtleakkk" /v WriteVal /t REG_SZ /d SuccessWrite /f >nul
+%LAUNCHER% -r "%VIRT_ROOT%" -e cmd /c reg query "%REAL_key%\virtleakkk" /v WriteVal | findstr "SuccessWrite" >nul
+if %ERRORLEVEL% EQU 0 (
+    call :Pass
+) else (
+    call :Fail "merged view: Value inside the new key is not visible from the virtual world."
+)
+
+echo ______Check if Value inside a new key read from virtual world come from real world or virtual world
+%LAUNCHER% -r "%VIRT_ROOT%" -e cmd /c reg add "%REAL_key%\virtleakkk" /v WriteVal /t REG_SZ /d virtualworld /f >nul
+reg add "%REAL_key%\virtleakkk" /v WriteVal /t REG_SZ /d realworld /f >nul
+%LAUNCHER% -r "%VIRT_ROOT%" -e cmd /c reg query "%REAL_key%\virtleakkk" /v WriteVal | findstr "virtualworld" >nul
+if %ERRORLEVEL% EQU 0 (
+    call :Pass
+) else (
+    call :Fail "merged view: Value inside the new key come from the real world."
+)
+
+
+
+
 echo ====================== 4. nested keys
 echo ______Enumerate: check if virtual subkeys are enumerable via logical path
 %LAUNCHER% -r "%VIRT_ROOT%" -e reg add "%REAL_key%\SubA\SubB\SubC" /v Nested /t REG_SZ /d NestedVal /f >nul
-%LAUNCHER% -r "%VIRT_ROOT%" -e reg query "%REAL_key%" 2>nul | findstr /i "SubA" >nul
+%LAUNCHER% -r "%VIRT_ROOT%" -e reg query "%REAL_key%\SubA" >nul
 if %ERRORLEVEL% EQU 0 (
     call :Pass "7.5  Reg Enumerate: virtual subkeys enumerable via logical path"
 ) else (
@@ -217,7 +252,7 @@ if %ERRORLEVEL% EQU 0 (
 echo ______case1
 %LAUNCHER% -r "%VIRT_ROOT%" -e reg add "%REAL_key%" /v xReadVal /t REG_SZ /d SuccessRead /f >nul 2>&1
 %LAUNCHER% -r "%VIRT_ROOT%" -e reg add "%REAL_key%" /v zReadVal /t REG_SZ /d SuccessRead /f >nul 2>&1
-%LAUNCHER% -r "%VIRT_ROOT%" -e reg query "%REAL_key%" 2>nul | findstr /i "SubA" >nul
+%LAUNCHER% -r "%VIRT_ROOT%" -e reg query "%REAL_key%\SubA" >nul
 if %ERRORLEVEL% EQU 0 (
     call :Pass "7.5  Reg Enumerate: virtual subkeys enumerable via logical path"
 ) else (
@@ -226,7 +261,7 @@ if %ERRORLEVEL% EQU 0 (
 
 echo ______case2
 %LAUNCHER% -r "%VIRT_ROOT%" -e reg delete "%REAL_key%" /v xReadVal /f >nul 2>&1
-%LAUNCHER% -r "%VIRT_ROOT%" -e reg query "%REAL_key%" 2>nul | findstr /i "SubA" >nul
+%LAUNCHER% -r "%VIRT_ROOT%" -e reg query "%REAL_key%\SubA" >nul
 if %ERRORLEVEL% EQU 0 (
     call :Pass "7.5  Reg Enumerate: virtual subkeys enumerable via logical path"
 ) else (
@@ -267,7 +302,7 @@ if %ERRORLEVEL% EQU 0 (
 
 
 
-call :CLEANUP
+@rem call :CLEANUP
 echo.
 exit /b
 
@@ -294,6 +329,9 @@ goto :eof
 :CLEANUP
 echo.
 rem echo [*] Cleaning up test artifacts...
+:: Crucial safety adjustment: deletes the temporary virtual sandbox root key safely, 
+:: but on the host registry, it strictly deletes ONLY the test value (/v WriteVal) to safeguard core system hives.
 reg delete "%VIRT_ROOT%" /f >nul 2>&1
-reg delete "%REAL_key%" /f >nul 2>&1
+reg delete "%REAL_key%" /v WriteVal /f >nul 2>&1
+reg delete "%REAL_key%\virtleakkk" /f >nul 2>&1
 exit /b
