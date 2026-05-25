@@ -3493,6 +3493,56 @@ static NTSTATUS NTAPI Hook_NtSetValueKey(
 {
     VirtKeyEntry e;
     if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
+        // Untracked handle recovery: same Case A/B as Hook_NtDeleteValueKey.
+        //
+        // Additionally handle the _Classes hive ROOT, which LogicalToVirtual
+        // intentionally SKIPs (COM requires the real hive-root KCB for
+        // NtSetInformationKey stability).  For WRITES however we must still
+        // sandbox the value.  The virtual destination for _CLASSES root is
+        // VirtNtBase\HKEY_USERS\<SID>_Classes  (identical to what block 3 of
+        // LogicalToVirtual computes for _Classes subkeys, minus the subkey part).
+        if (g_RegEnabled && ValueName) {
+            SetReentrant(true);
+            std::wstring resolvedPath = GetHandleLogicalPath(KeyHandle);
+            std::wstring virtPath;
+            bool inScope = false;
+
+            if (!resolvedPath.empty()) {
+                if (StartsWithI(resolvedPath, g_VirtNtBase)) {
+                    virtPath = resolvedPath; inScope = true;  // Case B
+                } else {
+                    inScope = LogicalToVirtual(resolvedPath, virtPath); // Case A
+                    if (!inScope) {
+                        // Special case: LogicalToVirtual SKIPs _Classes hive root
+                        // to protect COM KCB stability, but writes to it must
+                        // still be sandboxed.  Construct the virtual path manually:
+                        //   \REGISTRY\USER\<SID>_Classes
+                        //   → VirtNtBase\HKEY_USERS\<SID>_Classes
+                        static const std::wstring kUser = L"\\REGISTRY\\USER\\";
+                        if (StartsWithI(resolvedPath, kUser)) {
+                            std::wstring sub = resolvedPath.substr(kUser.size() - 1); // keep leading '\'
+                            virtPath = g_VirtNtBase + L"\\HKEY_USERS" + sub;
+                            inScope  = true;
+                            VL_DBG(L"Hook_NtSetValueKey: untracked _Classes-root special-case virtPath=%s name=%s",
+                                   virtPath.c_str(), FromUStr(ValueName).c_str());
+                        }
+                    }
+                }
+            }
+            SetReentrant(false);
+
+            if (inScope && !virtPath.empty()) {
+                VL_DBG(L"Hook_NtSetValueKey: untracked in-scope virtPath=%s name=%s",
+                       virtPath.c_str(), FromUStr(ValueName).c_str());
+                HANDLE hVirtNew = RegEnsureVirtAndOpenWrite(virtPath);
+                if (hVirtNew) {
+                    NTSTATUS st = Real_NtSetValueKey(hVirtNew, ValueName,
+                                                      TitleIndex, Type, Data, DataSize);
+                    Real_NtClose(hVirtNew);
+                    return st;
+                }
+            }
+        }
         return Real_NtSetValueKey(KeyHandle, ValueName, TitleIndex,
                                    Type, Data, DataSize);
     }
@@ -3500,6 +3550,30 @@ static NTSTATUS NTAPI Hook_NtSetValueKey(
     VL_DBG(L"Hook_NtSetValueKey: name=%s handle=%p virt=%p",
            ValueName ? FromUStr(ValueName).c_str() : L"(null)",
            KeyHandle, e.hVirt);
+
+    // If hVirt is NULL the handle was opened via the read-only bypass
+    // (DoVirtOpen step 5).  The bypass optimisation assumes the caller will
+    // only read, but MAXIMUM_ALLOWED handles can have write access granted by
+    // the kernel even though no explicit write bits were requested.  When a
+    // write arrives on such a handle we must CoW lazily rather than letting
+    // the write go directly to the real key via e.hReal.
+    if (!e.hVirt && !e.logPath.empty()) {
+        std::wstring virtPath;
+        SetReentrant(true);
+        bool inScope = LogicalToVirtual(e.logPath, virtPath);
+        SetReentrant(false);
+        if (inScope && !virtPath.empty()) {
+            VL_DBG(L"Hook_NtSetValueKey: lazy CoW for read-only-bypass handle virtPath=%s name=%s",
+                   virtPath.c_str(), ValueName ? FromUStr(ValueName).c_str() : L"(null)");
+            HANDLE hVirtNew = RegEnsureVirtAndOpenWrite(virtPath);
+            if (hVirtNew) {
+                NTSTATUS st = Real_NtSetValueKey(hVirtNew, ValueName,
+                                                  TitleIndex, Type, Data, DataSize);
+                Real_NtClose(hVirtNew);
+                return st;
+            }
+        }
+    }
 
     HANDLE writeH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : KeyHandle);
     NTSTATUS st = Real_NtSetValueKey(writeH, ValueName, TitleIndex, Type, Data, DataSize);

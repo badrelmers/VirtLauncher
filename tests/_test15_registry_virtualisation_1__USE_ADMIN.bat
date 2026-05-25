@@ -256,10 +256,10 @@ if %ERRORLEVEL% EQU 0 (
     call :Fail "Reg Delete: tombstone does not exist in Virtual Root."
 )
 
-echo ______Check if the nested and non deleted keys inside a deleted key is not visible inside the virtual root
+echo ______Check if the real nested non deleted keys inside a deleted key is not visible inside the virtual root
 %LAUNCHER% -r "%VIRT_ROOT%" reg query "%REAL_key%\realSubA\realSubB\realSubC" /v realNested 2>nul | findstr "realNestedVal" >nul
 if %ERRORLEVEL% EQU 0 (
-    call :Fail "nested and non deleted keys inside a deleted key is visible inside the virtual root"
+    call :Fail "real nested non deleted keys inside a deleted key is visible inside the virtual root"
 ) else (
     call :Pass
 )

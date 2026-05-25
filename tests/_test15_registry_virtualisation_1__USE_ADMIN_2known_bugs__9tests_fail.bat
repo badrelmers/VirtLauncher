@@ -15,7 +15,7 @@ set VLAUNCHER_DEBUG=true
 
 
 :: ============================================================
-cd "..\build"
+cd /d "..\build"
 
 set LAUNCHER=VirtLauncher64.exe
 
@@ -166,10 +166,11 @@ echo.
 call :CLEANUP
 
 echo ====================== 1. Reg Write/Read
-%LAUNCHER% -r "%VIRT_ROOT%" -e cmd /c reg add "%REAL_key%" /v WriteVal /t REG_SZ /d SuccessWrite /f >nul
+%LAUNCHER% -r "%VIRT_ROOT%" -e reg add "%REAL_key%" /v WriteVal /t REG_SZ /d SuccessWrite /f >nul
 
 echo ______Check if Value successfully written to Virtual Root
-reg query "%VIRT_key%" /v WriteVal | findstr "SuccessWrite" >nul
+@rem reg query "%VIRT_key%" /v WriteVal | findstr "SuccessWrite" >nul
+%LAUNCHER% -r "%VIRT_ROOT%" -e reg query "%REAL_key%" /v WriteVal | findstr "SuccessWrite" >nul
 if %ERRORLEVEL% EQU 0 (
     call :Pass
 ) else (
@@ -198,11 +199,20 @@ echo ====================== 2. Reg Delete
 %LAUNCHER% -r "%VIRT_ROOT%" cmd /c reg delete "%REAL_key%" /v WriteVal /f >nul
 
 echo ______Check if value is removed from virtual root
-reg query "%VIRT_key%" /v WriteVal >nul 2>nul
+%LAUNCHER% -r "%VIRT_ROOT%" cmd /c reg query "%REAL_key%" /v WriteVal >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
     call :Pass
 ) else (
     call :Fail "Reg Delete: Value still exists in Virtual Root."
+)
+
+echo ______Check if tombstone is created inside the virtual root
+@rem value have a type of 0x1337DEAD by reg.exe return REG_NONE, when value exist it return REG_SZ
+reg query "%VIRT_key%" /v WriteVal 2>nul | findstr /C:"WriteVal    REG_NONE" >nul 
+if %ERRORLEVEL% NEQ 0 (
+    call :Fail "Reg Delete: tombstone does not exist in Virtual Root."
+) else (
+    call :Pass
 )
 
 
