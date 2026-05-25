@@ -1264,6 +1264,29 @@ static bool RegKeyIsDeleted(const std::wstring& virtPath)
     return deleted;
 }
 
+// Check whether any ancestor of virtPath (or virtPath itself) carries the
+// key-deleted sentinel.  This is required for the HKCR / untracked-handle
+// case: when a parent key is tombstoned, opening a deeply-nested real
+// subkey must still return NOT_FOUND -- even though the subkey's own
+// virtual path carries no tombstone.
+//
+// Walk upward from virtPath, stopping before g_VirtNtBase itself.
+static bool RegAncestorIsDeleted(const std::wstring& virtPath)
+{
+    std::wstring path = virtPath;
+    while (true) {
+        if (RegKeyIsDeleted(path)) return true;
+        // Strip the last path component.
+        std::wstring::size_type sep = path.rfind(L'\\');
+        if (sep == std::wstring::npos) break;
+        std::wstring parent = path.substr(0, sep);
+        // Stop once we've reached or gone above VirtNtBase.
+        if (parent.size() <= g_VirtNtBase.size()) break;
+        path = parent;
+    }
+    return false;
+}
+
 // Write the key-deleted sentinel value into an already-open virtual key handle.
 // Returns true on success.  Requires only KEY_SET_VALUE access (no privileges).
 static bool RegMarkKeyDeleted(HANDLE hVirt)
@@ -2399,11 +2422,13 @@ static NTSTATUS DoVirtOpen(
     }
 
     // Step 3: virtual doesn't exist, try real.
-    // Even without a live virtual key, the virtual path may have had a
-    // tombstone that was already physically deleted.  Check whether the
-    // virtual path carries a delete mark so we don't resurrect deleted keys.
-    if (RegKeyIsDeleted(virtPath)) {
-        VL_DBG(L"DoVirtOpen: OPEN virtPath tombstoned (no live virt key) -> NOT_FOUND");
+    // Check whether the virtual path itself OR any of its ancestors carries a
+    // key-deleted sentinel.  Checking only the exact path is insufficient: if
+    // a parent key (e.g. VirtTest_HKCR_Real) is tombstoned, all of its
+    // children must also be invisible -- even deeply nested real subkeys whose
+    // own virtual paths have no tombstone entry.
+    if (RegAncestorIsDeleted(virtPath)) {
+        VL_DBG(L"DoVirtOpen: OPEN virtPath (or ancestor) tombstoned -> NOT_FOUND virtPath=%s", virtPath.c_str());
         return VL_STATUS_OBJECT_NAME_NOT_FOUND;
     }
     NTSTATUS sr = Real_NtOpenKey(&hReal, realAccess, &realOa);
@@ -3374,6 +3399,15 @@ static NTSTATUS NTAPI Hook_NtQueryValueKey(
                     Real_NtClose(hVirtCheck);
                     if (tombstoned) {
                         VL_DBG(L"Hook_NtQueryValueKey: untracked value tombstoned -> NOT_FOUND");
+                        return VL_STATUS_OBJECT_NAME_NOT_FOUND;
+                    }
+                } else {
+                    // Virtual key doesn't exist at the exact path.  Check if any
+                    // ancestor is tombstoned -- a deleted parent key must make all
+                    // of its children invisible, even if they have no own virtual entry.
+                    if (RegAncestorIsDeleted(virtPath)) {
+                        VL_DBG(L"Hook_NtQueryValueKey: untracked ancestor tombstoned -> NOT_FOUND virtPath=%s",
+                               virtPath.c_str());
                         return VL_STATUS_OBJECT_NAME_NOT_FOUND;
                     }
                 }
