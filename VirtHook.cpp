@@ -3954,7 +3954,37 @@ static NTSTATUS NTAPI Hook_NtDeleteKey(HANDLE KeyHandle)
                 }
                 // Mirror tombstone: HKCR delete must also stamp the other
                 // NT backing path (_Classes <-> HKLM\Software\Classes).
-                RegTombstoneHkcrMirror(resolvedPath);
+                //
+                // In Case A (untracked, real logical path), resolvedPath is
+                // already the real NT path that RegTombstoneHkcrMirror expects.
+                //
+                // In Case B (untracked, handle already points into the virtual
+                // store), resolvedPath == virtPath, i.e. it starts with
+                // g_VirtNtBase.  RegTombstoneHkcrMirror checks for the prefixes
+                //   \Registry\User\<SID>_Classes          (per-user HKCR)
+                //   \REGISTRY\MACHINE\SOFTWARE\Classes    (machine HKCR)
+                // Neither matches a virtual-store path, so the mirror was never
+                // stamped and the other backing path remained visible -- causing
+                // the deleted HKCR key to reappear via the HKLM fallback.
+                //
+                // Fix: reverse-map the virtual store path back to the real
+                // logical NT path before calling the mirror helper.
+                // Mapping rule: VirtNtBase\HKEY_USERS\<rest>
+                //               -> \REGISTRY\USER\<rest>
+                {
+                    std::wstring mirrorLogPath = resolvedPath;
+                    const std::wstring virtHkuPrefix = g_VirtNtBase + L"\\HKEY_USERS";
+                    if (StartsWithI(resolvedPath, virtHkuPrefix) &&
+                        resolvedPath.size() > virtHkuPrefix.size() &&
+                        resolvedPath[virtHkuPrefix.size()] == L'\\')
+                    {
+                        mirrorLogPath = L"\\REGISTRY\\USER" +
+                                        resolvedPath.substr(virtHkuPrefix.size());
+                        VL_DBG(L"Hook_NtDeleteKey: untracked CaseB reverse-mapped"
+                               L" mirror logPath=%s", mirrorLogPath.c_str());
+                    }
+                    RegTombstoneHkcrMirror(mirrorLogPath);
+                }
                 return VL_STATUS_SUCCESS;
             }
         }
