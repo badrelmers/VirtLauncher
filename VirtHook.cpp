@@ -3460,7 +3460,24 @@ static NTSTATUS NTAPI Hook_NtQueryValueKey(
                 } else {
                     inScope = LogicalToVirtual(resolvedPath, virtPath); // Case A
                     if (!inScope) {
-                        // Special case: _Classes root is SKIPped by LogicalToVirtual
+                        // Special case A: HKCU hive root is SKIPped by
+                        // LogicalToVirtual to avoid re-entrancy, but reads from
+                        // it (reg query HKEY_USERS\SID /v ...) must still be
+                        // served from the virtual store.
+                        // Map exact HKCU root → VirtNtBase\HKEY_CURRENT_USER.
+                        if (_wcsnicmp(resolvedPath.c_str(),
+                                      g_RealNtBase.c_str(),
+                                      g_RealNtBase.size()) == 0 &&
+                            resolvedPath.size() == g_RealNtBase.size())
+                        {
+                            virtPath = g_VirtNtBase + L"\\HKEY_CURRENT_USER";
+                            inScope  = true;
+                            VL_DBG(L"Hook_NtQueryValueKey: untracked HKCU-root -> HKEY_CURRENT_USER virtPath=%s name=%s",
+                                   virtPath.c_str(), FromUStr(ValueName).c_str());
+                        }
+                    }
+                    if (!inScope) {
+                        // Special case B: _Classes root is SKIPped by LogicalToVirtual
                         // but we must still serve virtualised values from it.
                         // Map exact _Classes root -> HKEY_USERS\SID_CLASSES virtual
                         // path (where Hook_NtSetValueKey writes root-level values).
@@ -3621,7 +3638,23 @@ static NTSTATUS NTAPI Hook_NtSetValueKey(
                 } else {
                     inScope = LogicalToVirtual(resolvedPath, virtPath); // Case A
                     if (!inScope) {
-                        // Special case: LogicalToVirtual SKIPs the _Classes hive
+                        // Special case A: LogicalToVirtual SKIPs the HKCU hive root
+                        // (\REGISTRY\USER\SID) to avoid re-entrancy.  But a write
+                        // to it (reg add HKEY_USERS\SID /v ...) must still be
+                        // sandboxed.  Map exact HKCU root → VirtNtBase\HKEY_CURRENT_USER.
+                        if (_wcsnicmp(resolvedPath.c_str(),
+                                      g_RealNtBase.c_str(),
+                                      g_RealNtBase.size()) == 0 &&
+                            resolvedPath.size() == g_RealNtBase.size())
+                        {
+                            virtPath = g_VirtNtBase + L"\\HKEY_CURRENT_USER";
+                            inScope  = true;
+                            VL_DBG(L"Hook_NtSetValueKey: untracked HKCU-root -> HKEY_CURRENT_USER virtPath=%s name=%s",
+                                   virtPath.c_str(), FromUStr(ValueName).c_str());
+                        }
+                    }
+                    if (!inScope) {
+                        // Special case B: LogicalToVirtual SKIPs the _Classes hive
                         // root to protect COM KCB stability, but writes to it
                         // must still be sandboxed.
                         //
@@ -3648,28 +3681,19 @@ static NTSTATUS NTAPI Hook_NtSetValueKey(
                                       classesRoot.size()) == 0 &&
                             resolvedPath.size() == classesRoot.size())
                         {
-                            // Destination 1: per-user classes hive in virtual store
-                            std::wstring virtPathHKU = g_VirtNtBase + L"\\HKEY_USERS" +
-                                resolvedPath.substr(g_RealNtBase.size() - // strip \Registry\User
-                                    (g_RealNtBase.size() - resolvedPath.find(L'\\', 1)));
-                            // Simpler: build from known components
-                            std::wstring sidClasses; // SID_Classes suffix
+                            std::wstring sidClasses;
                             {
                                 std::wstring::size_type p = g_RealNtBase.rfind(L'\\');
                                 if (p != std::wstring::npos)
                                     sidClasses = g_RealNtBase.substr(p + 1) + L"_Classes";
                             }
-                            virtPathHKU = g_VirtNtBase + L"\\HKEY_USERS\\" + sidClasses;
-
-                            // Destination 2: HKLM\SOFTWARE\Classes (HKCR read path)
-                            std::wstring virtPathHKLM = g_VirtNtBase +
-                                                        L"\\HKEY_LOCAL_MACHINE\\SOFTWARE\\Classes";
+                            std::wstring virtPathHKU  = g_VirtNtBase + L"\\HKEY_USERS\\" + sidClasses;
+                            std::wstring virtPathHKLM = g_VirtNtBase + L"\\HKEY_LOCAL_MACHINE\\SOFTWARE\\Classes";
 
                             VL_DBG(L"Hook_NtSetValueKey: untracked _Classes-root write to HKU=%s AND HKLM=%s name=%s",
                                    virtPathHKU.c_str(), virtPathHKLM.c_str(),
                                    FromUStr(ValueName).c_str());
 
-                            // Write to both; if either succeeds the value is readable.
                             NTSTATUS stBoth = VL_STATUS_OBJECT_NAME_NOT_FOUND;
                             for (int dest = 0; dest < 2; ++dest) {
                                 const std::wstring& vp = (dest == 0) ? virtPathHKU : virtPathHKLM;
