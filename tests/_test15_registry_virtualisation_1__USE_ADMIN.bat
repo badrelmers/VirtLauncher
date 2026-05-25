@@ -179,7 +179,7 @@ if %ERRORLEVEL% NEQ 0 (
 ) else (
     call :Pass
 )
-pause
+
 
 echo.
 echo ====================== 3. merged view
@@ -202,6 +202,68 @@ if %ERRORLEVEL% EQU 0 (
 ) else (
     call :Fail "merged view: Value come from the real world."
 )
+
+
+echo ====================== 4. nested keys
+echo ______Enumerate: check if virtual subkeys are enumerable via logical path
+%LAUNCHER% -r "%VIRT_ROOT%" -e reg add "%REAL_key%\SubA\SubB\SubC" /v Nested /t REG_SZ /d NestedVal /f >nul
+%LAUNCHER% -r "%VIRT_ROOT%" -e reg query "%REAL_key%" 2>nul | findstr /i "SubA" >nul
+if %ERRORLEVEL% EQU 0 (
+    call :Pass "7.5  Reg Enumerate: virtual subkeys enumerable via logical path"
+) else (
+    call :Fail "7.5  Reg Enumerate: virtual subkeys not visible under logical path"
+)
+
+echo ______case1
+%LAUNCHER% -r "%VIRT_ROOT%" -e reg add "%REAL_key%" /v xReadVal /t REG_SZ /d SuccessRead /f >nul 2>&1
+%LAUNCHER% -r "%VIRT_ROOT%" -e reg add "%REAL_key%" /v zReadVal /t REG_SZ /d SuccessRead /f >nul 2>&1
+%LAUNCHER% -r "%VIRT_ROOT%" -e reg query "%REAL_key%" 2>nul | findstr /i "SubA" >nul
+if %ERRORLEVEL% EQU 0 (
+    call :Pass "7.5  Reg Enumerate: virtual subkeys enumerable via logical path"
+) else (
+    call :Fail "7.5  Reg Enumerate: virtual subkeys not visible under logical path"
+)
+
+echo ______case2
+%LAUNCHER% -r "%VIRT_ROOT%" -e reg delete "%REAL_key%" /v xReadVal /f >nul 2>&1
+%LAUNCHER% -r "%VIRT_ROOT%" -e reg query "%REAL_key%" 2>nul | findstr /i "SubA" >nul
+if %ERRORLEVEL% EQU 0 (
+    call :Pass "7.5  Reg Enumerate: virtual subkeys enumerable via logical path"
+) else (
+    call :Fail "7.5  Reg Enumerate: virtual subkeys not visible under logical path"
+)
+
+
+echo ______Check if deleted real key appear as removed inside the virtual root
+@rem create nested keys in the real store
+reg add "%REAL_key%\realSubA\realSubB\realSubC" /v realNested /t REG_SZ /d realNestedVal /f >nul
+
+%LAUNCHER% -r "%VIRT_ROOT%" reg delete "%REAL_key%\realSubA" /f >nul
+
+%LAUNCHER% -r "%VIRT_ROOT%" cmd /c reg query "%REAL_key%\realSubA" >nul 2>nul
+if %ERRORLEVEL% NEQ 0 (
+    call :Pass
+) else (
+    call :Fail "Reg Delete: key still exists in Virtual Root."
+)
+
+echo ______Check if tombstone is created inside the virtual root
+@rem deleted keys have a value VL_KEY_DELETED with content type of 0x1337DEAD but reg.exe return REG_NONE, when value exist it return REG_SZ, so we check here for REG_NONE
+reg query "%VIRT_key%\realSubA" /v VL_KEY_DELETED 2>nul | findstr /C:"VL_KEY_DELETED    REG_NONE" >nul 
+if %ERRORLEVEL% EQU 0 (
+    call :Pass
+) else (
+    call :Fail "Reg Delete: tombstone does not exist in Virtual Root."
+)
+
+echo ______Check if the nested and non deleted keys inside a deleted key is not visible inside the virtual root
+%LAUNCHER% -r "%VIRT_ROOT%" reg query "%REAL_key%\realSubA\realSubB\realSubC" /v realNested 2>nul | findstr "realNestedVal" >nul
+if %ERRORLEVEL% EQU 0 (
+    call :Fail "nested and non deleted keys inside a deleted key is visible inside the virtual root"
+) else (
+    call :Pass
+)
+
 
 
 

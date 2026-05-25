@@ -2600,6 +2600,95 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
 {
     VirtKeyEntry e;
     if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
+        // Untracked handle: same Case A/B resolution as the other hooks.
+        // For KeyFullInformation / KeyCachedInformation, the raw virtual key
+        // count includes tombstone values (VL_VALUE_DELETED_TYPE entries).
+        // reg.exe / .NET pre-allocate exactly Values slots and loop that many
+        // times; if our enumeration hook hides tombstones but NtQueryKey still
+        // reports the inflated count, callers get ERROR_NO_MORE_DATA mid-loop
+        // and abort (the "No more data is available" symptom).
+        // Fix: subtract the tombstone count from Values before returning.
+        if (g_RegEnabled &&
+            (KeyInformationClass == VlKeyFullInformation ||
+             KeyInformationClass == VlKeyCachedInformation))
+        {
+            NTSTATUS st = Real_NtQueryKey(KeyHandle, KeyInformationClass,
+                                          KeyInformation, Length, ResultLength);
+            if ((NT_SUCCESS(st) || st == VL_STATUS_BUFFER_OVERFLOW) &&
+                KeyInformation && Length > 0)
+            {
+                SetReentrant(true);
+                std::wstring resolvedPath = GetHandleLogicalPath(KeyHandle);
+                std::wstring virtPath;
+                bool inScope = false;
+                if (!resolvedPath.empty()) {
+                    if (StartsWithI(resolvedPath, g_VirtNtBase)) {
+                        virtPath = resolvedPath; inScope = true;  // Case B
+                    } else {
+                        inScope = LogicalToVirtual(resolvedPath, virtPath); // Case A
+                    }
+                }
+
+                if (inScope && !virtPath.empty()) {
+                    // Count tombstoned values in the virtual key.
+                    ULONG tombCount = 0;
+                    HANDLE hVirtCheck = NULL;
+                    VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
+                    VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus, OBJ_CASE_INSENSITIVE);
+                    if (NT_SUCCESS(Real_NtOpenKey(&hVirtCheck, KEY_QUERY_VALUE, &voa))) {
+                        std::vector<BYTE> scanBuf(512, 0);
+                        for (ULONG vi = 0; ; ++vi) {
+                            ULONG vLen = 0;
+                            NTSTATUS vs = Real_NtEnumerateValueKey(hVirtCheck, vi,
+                                              VlKeyValueBasicInformation,
+                                              &scanBuf[0], (ULONG)scanBuf.size(), &vLen);
+                            if (vs == VL_STATUS_BUFFER_TOO_SMALL ||
+                                vs == VL_STATUS_BUFFER_OVERFLOW) {
+                                scanBuf.assign(vLen + 4, 0);
+                                vs = Real_NtEnumerateValueKey(hVirtCheck, vi,
+                                         VlKeyValueBasicInformation,
+                                         &scanBuf[0], (ULONG)scanBuf.size(), &vLen);
+                            }
+                            if (!NT_SUCCESS(vs)) break;
+                            VL_KEY_VALUE_BASIC_INFORMATION* kvbi =
+                                reinterpret_cast<VL_KEY_VALUE_BASIC_INFORMATION*>(&scanBuf[0]);
+                            if (kvbi->Type == VL_VALUE_DELETED_TYPE)
+                                ++tombCount;
+                        }
+                        Real_NtClose(hVirtCheck);
+                    }
+
+                    if (tombCount > 0) {
+                        VL_DBG(L"Hook_NtQueryKey: untracked in-scope virtPath=%s tombCount=%u",
+                               virtPath.c_str(), tombCount);
+                        if (KeyInformationClass == VlKeyFullInformation) {
+                            const ULONG kMinFull =
+                                sizeof(LARGE_INTEGER) + sizeof(ULONG) * 9;
+                            if (Length >= kMinFull) {
+                                VL_KEY_FULL_INFORMATION* fi =
+                                    reinterpret_cast<VL_KEY_FULL_INFORMATION*>(KeyInformation);
+                                if (fi->Values >= tombCount)
+                                    fi->Values -= tombCount;
+                                else
+                                    fi->Values = 0;
+                            }
+                        } else { // VlKeyCachedInformation
+                            if (Length >= sizeof(VL_KEY_CACHED_INFORMATION)) {
+                                VL_KEY_CACHED_INFORMATION* ci =
+                                    reinterpret_cast<VL_KEY_CACHED_INFORMATION*>(KeyInformation);
+                                if (ci->Values >= tombCount)
+                                    ci->Values -= tombCount;
+                                else
+                                    ci->Values = 0;
+                            }
+                        }
+                    }
+                }
+                SetReentrant(false);
+            }
+            return st;
+        }
+
         return Real_NtQueryKey(KeyHandle, KeyInformationClass,
                                KeyInformation, Length, ResultLength);
     }
