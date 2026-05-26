@@ -9,13 +9,9 @@ CD /D "%~dp0"
 
 ::_______________________________________________
 
-@rem dont use tasklist to list exe dll, it does not list all dll of x32 exe!! use listdlls
-
-
 :: --- Configuration ---
 set "TEST32_PATH=F:\_bin\_code\_kickstart\____shortcuts\_appz\_explorer\TablacusExplorer\_last\TE32.exe"
 set "TEST64_PATH=F:\_bin\_code\_kickstart\____shortcuts\_appz\_explorer\TablacusExplorer\_last\TE64.exe"
-set "LISTDLLS_EXE=%~dp0ListDlls\listdlls64.exe"
 set "BUILD_DIR=..\build"
 
 @rem ___________________________________________________________

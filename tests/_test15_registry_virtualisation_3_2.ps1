@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    VirtRegTest-NtLevel.ps1  –  Direct NT-API Registry Virtualisation Tests
+    VirtRegTest-NtLevel.ps1  -  Direct NT-API Registry Virtualisation Tests
     for VirtLauncher / VirtHook
 
 .DESCRIPTION
@@ -79,7 +79,7 @@ if ($NtBase -eq "") {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2.  P/Invoke – NT API definitions
+# 2.  P/Invoke - NT API definitions
 # ─────────────────────────────────────────────────────────────────────────────
 Add-Type -TypeDefinition @'
 using System;
@@ -312,8 +312,10 @@ function MakeUS([string]$s) {
     $us.MaximumLength = [uint16]($bytes.Length + 2)
     $us.Buffer        = $bufPtr
 
+    # $usPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(
+                # [System.Runtime.InteropServices.Marshal]::SizeOf([UNICODE_STRING]))
     $usPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(
-                [System.Runtime.InteropServices.Marshal]::SizeOf([UNICODE_STRING]))
+                [System.Runtime.InteropServices.Marshal]::SizeOf($us))
     [System.Runtime.InteropServices.Marshal]::StructureToPtr($us, $usPtr, $false)
     return $usPtr, $bufPtr   # both must be freed
 }
@@ -326,7 +328,8 @@ function MakeOA([string]$ntPath, [IntPtr]$root = [IntPtr]::Zero) {
     $bufPtr  = $usPtrs[1]
 
     $oa = [OBJECT_ATTRIBUTES]::new()
-    $oa.Length                   = [System.Runtime.InteropServices.Marshal]::SizeOf([OBJECT_ATTRIBUTES])
+    # $oa.Length                   = [System.Runtime.InteropServices.Marshal]::SizeOf([OBJECT_ATTRIBUTES])
+    $oa.Length                   = [System.Runtime.InteropServices.Marshal]::SizeOf($oa)
     $oa.RootDirectory            = $root
     $oa.ObjectName               = $usPtr
     $oa.Attributes               = [OBJECT_ATTRIBUTES]::OBJ_CASE_INSENSITIVE
@@ -334,6 +337,7 @@ function MakeOA([string]$ntPath, [IntPtr]$root = [IntPtr]::Zero) {
     $oa.SecurityQualityOfService = [IntPtr]::Zero
 
     $oaPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($oa.Length)
+    
     [System.Runtime.InteropServices.Marshal]::StructureToPtr($oa, $oaPtr, $false)
     return $oaPtr, $usPtr, $bufPtr  # caller frees all three
 }
@@ -347,11 +351,26 @@ function FreeAll([IntPtr[]]$ptrs) {
 }
 
 # Open an NT registry key; returns handle or [IntPtr]::Zero on failure
+# function NtOpen([string]$ntPath, [uint32]$access = 0x20019) {
+#     $ptrs = MakeOA $ntPath
+#     try {
+#         $h = [IntPtr]::Zero
+#         $st = [NtReg]::NtOpenKey([ref]$h, $access, [ref][System.Runtime.InteropServices.Marshal]::PtrToStructure($ptrs[0], [OBJECT_ATTRIBUTES]))
+#         if (NT_SUCCESS $st) { return $h }
+#         return [IntPtr]::Zero
+#     } finally {
+#         FreeAll $ptrs
+#     }
+# }
+
+# Open an NT registry key; returns handle or [IntPtr]::Zero on failure
 function NtOpen([string]$ntPath, [uint32]$access = 0x20019) {
     $ptrs = MakeOA $ntPath
     try {
         $h = [IntPtr]::Zero
-        $st = [NtReg]::NtOpenKey([ref]$h, $access, [ref][System.Runtime.InteropServices.Marshal]::PtrToStructure($ptrs[0], [OBJECT_ATTRIBUTES]))
+        # Force the Type overload and extract to a variable
+        $oa = [System.Runtime.InteropServices.Marshal]::PtrToStructure($ptrs[0], [type][OBJECT_ATTRIBUTES])
+        $st = [NtReg]::NtOpenKey([ref]$h, $access, [ref]$oa)
         if (NT_SUCCESS $st) { return $h }
         return [IntPtr]::Zero
     } finally {
@@ -360,15 +379,32 @@ function NtOpen([string]$ntPath, [uint32]$access = 0x20019) {
 }
 
 # Create an NT key; returns [handle, disposition] or [Zero, 0] on failure
+# function NtCreate([string]$ntPath, [uint32]$access = 0xF003F) {
+#     $ptrs = MakeOA $ntPath
+#     try {
+#         $h    = [IntPtr]::Zero
+#         $disp = [uint32]0
+#         $st   = [NtReg]::NtCreateKey([ref]$h, $access, [ref][System.Runtime.InteropServices.Marshal]::PtrToStructure($ptrs[0], [OBJECT_ATTRIBUTES]),
+#                                       0, [IntPtr]::Zero, 0, [ref]$disp)
+#         if (NT_SUCCESS $st) { return $h, $disp }
+#         # return [IntPtr]::Zero, 0u
+#         return [IntPtr]::Zero, [uint32]0
+#     } finally {
+#         FreeAll $ptrs
+#     }
+# }
+
+# Create an NT key; returns [handle, disposition] or [Zero, 0] on failure
 function NtCreate([string]$ntPath, [uint32]$access = 0xF003F) {
     $ptrs = MakeOA $ntPath
     try {
         $h    = [IntPtr]::Zero
         $disp = [uint32]0
-        $st   = [NtReg]::NtCreateKey([ref]$h, $access, [ref][System.Runtime.InteropServices.Marshal]::PtrToStructure($ptrs[0], [OBJECT_ATTRIBUTES]),
-                                      0, [IntPtr]::Zero, 0, [ref]$disp)
+        # Force the Type overload and extract to a variable
+        $oa = [System.Runtime.InteropServices.Marshal]::PtrToStructure($ptrs[0], [type][OBJECT_ATTRIBUTES])
+        $st   = [NtReg]::NtCreateKey([ref]$h, $access, [ref]$oa, 0, [IntPtr]::Zero, 0, [ref]$disp)
         if (NT_SUCCESS $st) { return $h, $disp }
-        return [IntPtr]::Zero, 0u
+        return [IntPtr]::Zero, [uint32]0
     } finally {
         FreeAll $ptrs
     }
@@ -393,7 +429,7 @@ function QueryKeyFull([IntPtr]$h) {
                                          $buf, $resLen + 8, [ref]$resLen)
         }
         if (-not (NT_SUCCESS $st)) { return $null }
-        $fi = [System.Runtime.InteropServices.Marshal]::PtrToStructure($buf, [KEY_FULL_INFORMATION_FIXED])
+        $fi = [System.Runtime.InteropServices.Marshal]::PtrToStructure($buf, [type][KEY_FULL_INFORMATION_FIXED])
         return @{ SubKeys = $fi.SubKeys; Values = $fi.Values
                   MaxNameLen = $fi.MaxNameLen; MaxValueNameLen = $fi.MaxValueNameLen
                   MaxValueDataLen = $fi.MaxValueDataLen }
@@ -466,7 +502,7 @@ function EnumValues([IntPtr]$h) {
 function QueryValue([IntPtr]$h, [string]$valueName) {
     $usPtrs = MakeUS $valueName
     try {
-        $us = [System.Runtime.InteropServices.Marshal]::PtrToStructure($usPtrs[0], [UNICODE_STRING])
+        $us = [System.Runtime.InteropServices.Marshal]::PtrToStructure($usPtrs[0], [type][UNICODE_STRING])
         $buf = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(1024)
         try {
             $resLen = 0
@@ -501,7 +537,7 @@ function QueryValue([IntPtr]$h, [string]$valueName) {
 function SetValueSZ([IntPtr]$h, [string]$name, [string]$value) {
     $usPtrs = MakeUS $name
     try {
-        $us = [System.Runtime.InteropServices.Marshal]::PtrToStructure($usPtrs[0], [UNICODE_STRING])
+        $us = [System.Runtime.InteropServices.Marshal]::PtrToStructure($usPtrs[0], [type][UNICODE_STRING])
         $data = [System.Text.Encoding]::Unicode.GetBytes($value + "`0")  # include NUL terminator
         return [NtReg]::NtSetValueKey($h, [ref]$us, 0, 1, $data, [uint32]$data.Length)  # type 1 = REG_SZ
     } finally {
@@ -513,7 +549,7 @@ function SetValueSZ([IntPtr]$h, [string]$name, [string]$value) {
 function DeleteValue([IntPtr]$h, [string]$name) {
     $usPtrs = MakeUS $name
     try {
-        $us = [System.Runtime.InteropServices.Marshal]::PtrToStructure($usPtrs[0], [UNICODE_STRING])
+        $us = [System.Runtime.InteropServices.Marshal]::PtrToStructure($usPtrs[0], [type][UNICODE_STRING])
         return [NtReg]::NtDeleteValueKey($h, [ref]$us)
     } finally {
         FreeAll $usPtrs
@@ -534,7 +570,7 @@ function ReadSZ([IntPtr]$h, [string]$name) {
 # ─────────────────────────────────────────────────────────────────────────────
 
 Log "================================================================"
-Log "  VirtRegTest-NtLevel.ps1 – Direct NT API Tests"
+Log "  VirtRegTest-NtLevel.ps1 - Direct NT API Tests"
 Log "  VirtStore (NT): $VirtNtBase"
 Log "  NtBase   (NT): $NtBase"
 Log "================================================================"
@@ -615,7 +651,7 @@ $sid = $id.User.Value
 $hkcuRoot = "\Registry\User\$sid"
 $hRoot = NtOpen $hkcuRoot
 if ($hRoot -ne [IntPtr]::Zero) {
-    # Query name – must contain the actual SID, NOT VirtStore prefix
+    # Query name - must contain the actual SID, NOT VirtStore prefix
     $buf = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(1024)
     $resLen = 0
     $st = [NtReg]::NtQueryKey($hRoot, [int][KEY_INFORMATION_CLASS]::KeyNameInformation,
@@ -679,7 +715,7 @@ if ($hW -ne [IntPtr]::Zero) {
     Skip "NB-02" "Skipped (NB-01 failed)"
 }
 
-# NB-03: Write to a real key (CoW) – virtual value overrides real
+# NB-03: Write to a real key (CoW) - virtual value overrides real
 $hCoW = (NtCreate $realSeedPath)[0]
 if ($hCoW -ne [IntPtr]::Zero) {
     $st = SetValueSZ $hCoW "NtCoWVal" "NtCoW_Override"
@@ -729,7 +765,7 @@ if ($hCoW -ne [IntPtr]::Zero) {
 }
 
 # NB-06: NtQueryValueKey on a key opened READ-ONLY works for real values
-$hRO = NtOpen $realSeedPath [NtReg]::KeyRead
+$hRO = NtOpen $realSeedPath ([NtReg]::KeyRead)
 if ($hRO -ne [IntPtr]::Zero) {
     $roVal = ReadSZ $hRO "RealStrVal"
     if ($roVal -eq "REAL_STRING_ORIGINAL") {
@@ -742,8 +778,8 @@ if ($hRO -ne [IntPtr]::Zero) {
     Fail "NB-06" "NtOpenKey read-only on real key FAILED"
 }
 
-# ─── SECTION NC: NtEnumerateKey – Merge correctness ──────────────────────────
-Section "NC" "NtEnumerateKey – Merge Correctness"
+# ─── SECTION NC: NtEnumerateKey - Merge correctness ──────────────────────────
+Section "NC" "NtEnumerateKey - Merge Correctness"
 
 # Setup: ensure MergeParent has RealSubA, RealSubB in real; create VirtSubD, VirtSubE in virt
 $mpPath = "$NtBase\MergeParent"
@@ -791,7 +827,7 @@ if ($hMP -ne [IntPtr]::Zero) {
         Fail "NC-04" "NtEnumerateKey: total count $($names.Count) < 4 (merge incomplete)"
     }
 
-    # NC-05: Index continuity – no index should return NOT_FOUND before all names are exhausted
+    # NC-05: Index continuity - no index should return NOT_FOUND before all names are exhausted
     $hMP2 = NtOpen $mpPath
     if ($hMP2 -ne [IntPtr]::Zero) {
         $gapFound = $false
@@ -820,12 +856,12 @@ if ($hMP -ne [IntPtr]::Zero) {
         Skip "NC-05" "NtOpenKey for continuity check failed"
     }
 } else {
-    Fail "NC-01" "NtCreateKey MergeParent FAILED – cannot run NC-0x tests"
+    Fail "NC-01" "NtCreateKey MergeParent FAILED - cannot run NC-0x tests"
     "NC-02","NC-03","NC-04","NC-05" | ForEach-Object { Skip $_ "Skipped (NC-01 failed)" }
 }
 
-# ─── SECTION ND: NtEnumerateValueKey – Merge correctness ─────────────────────
-Section "ND" "NtEnumerateValueKey – Merge Correctness"
+# ─── SECTION ND: NtEnumerateValueKey - Merge correctness ─────────────────────
+Section "ND" "NtEnumerateValueKey - Merge Correctness"
 
 # ShadowKey has: ShadowedVal (real+virt), RealOnlyVal (real), AnotherReal (real), VirtOnlyInShadow (virt)
 $skPath = "$NtBase\ShadowKey"
@@ -861,7 +897,7 @@ if ($hSK2 -ne [IntPtr]::Zero) {
     else         { Fail "ND-04" "NtEnumerateValueKey: VirtOnlyInShadow MISSING" }
 
     # ND-05: ShadowedVal must appear ONCE (no duplicate for virtual+real)
-    $svCount = ($vnames | Where-Object { $_ -ieq "ShadowedVal" }).Count
+    $svCount = @($vnames | Where-Object { $_ -ieq "ShadowedVal" }).Count
     if ($svCount -le 1) {
         Pass "ND-05" "NtEnumerateValueKey: ShadowedVal appears $svCount time (no duplicate)"
     } else {
@@ -876,19 +912,19 @@ if ($hSK2 -ne [IntPtr]::Zero) {
     }
 } else {
     "ND-01","ND-02","ND-03","ND-04","ND-05","ND-06" | ForEach-Object {
-        Fail $_ "NtOpenKey ShadowKey FAILED – cannot test"
+        Fail $_ "NtOpenKey ShadowKey FAILED - cannot test"
     }
 }
 
-# ─── SECTION NE: NtQueryKey – Count Accuracy ─────────────────────────────────
-Section "NE" "NtQueryKey – SubKeys/Values Count Accuracy (known issue)"
+# ─── SECTION NE: NtQueryKey - Count Accuracy ─────────────────────────────────
+Section "NE" "NtQueryKey - SubKeys/Values Count Accuracy (known issue)"
 Log "  NOTE: NtQueryKey KeyFullInformation reports counts from the"
 Log "  virtual handle ONLY. It does not add real-key counts. This means"
 Log "  RegQueryInfoKey / RegistryKey.SubKeyCount are always wrong when"
 Log "  real and virtual entries coexist. Tests here document the delta."
 Log ""
 
-# NE-01: ShadowKey – virtual handle has 2 values, merged has 4
+# NE-01: ShadowKey - virtual handle has 2 values, merged has 4
 $hNE1 = NtOpen $skPath
 if ($hNE1 -ne [IntPtr]::Zero) {
     $fi = QueryKeyFull $hNE1
@@ -908,7 +944,7 @@ if ($hNE1 -ne [IntPtr]::Zero) {
     }
 }
 
-# NE-02: MergeParent – virtual handle has 2 subkeys (VirtSubD_NT, VirtSubE_NT), merged has 4+
+# NE-02: MergeParent - virtual handle has 2 subkeys (VirtSubD_NT, VirtSubE_NT), merged has 4+
 $hNE2 = NtOpen $mpPath
 if ($hNE2 -ne [IntPtr]::Zero) {
     $fi2 = QueryKeyFull $hNE2
@@ -947,7 +983,7 @@ if ($hNE3 -ne [IntPtr]::Zero) {
         if ($isVirtPath) {
             Pass "NE-03" "NtQueryKey KeyNameInformation returns virtual store path (expected for virtual handle)"
         } elseif ($isLogicPath) {
-            Pass "NE-03" "NtQueryKey KeyNameInformation returns logical path – hook translates name back"
+            Pass "NE-03" "NtQueryKey KeyNameInformation returns logical path - hook translates name back"
         } else {
             Fail "NE-03" "NtQueryKey KeyNameInformation: unexpected path '$keyName'"
         }
@@ -1053,7 +1089,7 @@ if ($hCoWDel -ne [IntPtr]::Zero) {
     Skip "NF-03b" "Skipped"
 }
 
-# NF-04: [KNOWN BUG] Delete a real-only KEY – key re-appears on re-open
+# NF-04: [KNOWN BUG] Delete a real-only KEY - key re-appears on re-open
 $realOnlyKeyPath = "$NtBase\DeleteTarget"
 $hDelRK = NtOpen $realOnlyKeyPath
 if ($hDelRK -ne [IntPtr]::Zero) {
@@ -1076,7 +1112,7 @@ if ($hDelRK -ne [IntPtr]::Zero) {
 }
 
 # ─── SECTION NG: NtQueryMultipleValueKey ─────────────────────────────────────
-Section "NG" "NtQueryMultipleValueKey – All-or-Nothing Fallback"
+Section "NG" "NtQueryMultipleValueKey - All-or-Nothing Fallback"
 Log "  NOTE: NtQueryMultipleValueKey is all-or-nothing."
 Log "  If ANY requested value is missing from the virtual handle, the hook"
 Log "  falls back to the real handle for ALL values, losing virtual overrides."
@@ -1138,7 +1174,7 @@ if ($hMQ -ne [IntPtr]::Zero) {
             if ($str1 -eq "VIRT_SHADOW_OVERRIDE") {
                 Pass "NG-01" "NtQueryMultipleValueKey: ShadowedVal returned virtual override value"
             } else {
-                Fail "NG-01" "[KNOWN BUG] NtQueryMultipleValueKey: ShadowedVal='$str1' (got real, not virtual – all-or-nothing fallback kicked in)"
+                Fail "NG-01" "[KNOWN BUG] NtQueryMultipleValueKey: ShadowedVal='$str1' (got real, not virtual - all-or-nothing fallback kicked in)"
             }
 
             if ($str2 -eq "REAL_ONLY_VALUE") {
@@ -1203,7 +1239,7 @@ $hBuf2 = NtOpen $skPath
 if ($hBuf2 -ne [IntPtr]::Zero) {
     $usPtrs = MakeUS "ShadowedVal"
     try {
-        $us = [System.Runtime.InteropServices.Marshal]::PtrToStructure($usPtrs[0], [UNICODE_STRING])
+        $us = [System.Runtime.InteropServices.Marshal]::PtrToStructure($usPtrs[0], [type][UNICODE_STRING])
         $tiny = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(1)
         $resLen = 0
         $stT = [NtReg]::NtQueryValueKey($hBuf2, [ref]$us,
@@ -1252,9 +1288,8 @@ $hParent = NtOpen $mpPath
 if ($hParent -ne [IntPtr]::Zero) {
     # Open "RealSubA" relative to MergeParent handle
     $usPtrs = MakeUS "RealSubA"
-    $us = [System.Runtime.InteropServices.Marshal]::PtrToStructure($usPtrs[0], [UNICODE_STRING])
     $oa = [OBJECT_ATTRIBUTES]::new()
-    $oa.Length                   = [System.Runtime.InteropServices.Marshal]::SizeOf([OBJECT_ATTRIBUTES])
+    $oa.Length                   = [System.Runtime.InteropServices.Marshal]::SizeOf($oa)
     $oa.RootDirectory            = $hParent      # relative to parent
     $oa.ObjectName               = $usPtrs[0]
     $oa.Attributes               = [OBJECT_ATTRIBUTES]::OBJ_CASE_INSENSITIVE
@@ -1263,9 +1298,10 @@ if ($hParent -ne [IntPtr]::Zero) {
     $oaPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($oa.Length)
     [System.Runtime.InteropServices.Marshal]::StructureToPtr($oa, $oaPtr, $false)
 
-    $hChild = [IntPtr]::Zero
-    $stRel  = [NtReg]::NtOpenKey([ref]$hChild, [NtReg]::KeyRead,
-                [ref][System.Runtime.InteropServices.Marshal]::PtrToStructure($oaPtr, [OBJECT_ATTRIBUTES]))
+    $hChild  = [IntPtr]::Zero
+    # Force the Type overload and extract to a variable (PS5.1 binder fix)
+    $oa_ni01 = [System.Runtime.InteropServices.Marshal]::PtrToStructure($oaPtr, [type][OBJECT_ATTRIBUTES])
+    $stRel   = [NtReg]::NtOpenKey([ref]$hChild, [NtReg]::KeyRead, [ref]$oa_ni01)
     [System.Runtime.InteropServices.Marshal]::FreeHGlobal($oaPtr)
     FreeAll $usPtrs
 
@@ -1279,7 +1315,7 @@ if ($hParent -ne [IntPtr]::Zero) {
     # NI-02: Open a virtual-only subkey via relative open
     $usPtrs2 = MakeUS "VirtSubD_NT"
     $oa2 = [OBJECT_ATTRIBUTES]::new()
-    $oa2.Length                   = [System.Runtime.InteropServices.Marshal]::SizeOf([OBJECT_ATTRIBUTES])
+    $oa2.Length                   = [System.Runtime.InteropServices.Marshal]::SizeOf($oa2)
     $oa2.RootDirectory            = $hParent
     $oa2.ObjectName               = $usPtrs2[0]
     $oa2.Attributes               = [OBJECT_ATTRIBUTES]::OBJ_CASE_INSENSITIVE
@@ -1288,9 +1324,10 @@ if ($hParent -ne [IntPtr]::Zero) {
     $oa2Ptr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($oa2.Length)
     [System.Runtime.InteropServices.Marshal]::StructureToPtr($oa2, $oa2Ptr, $false)
 
-    $hVirtChild = [IntPtr]::Zero
-    [NtReg]::NtOpenKey([ref]$hVirtChild, [NtReg]::KeyRead,
-        [ref][System.Runtime.InteropServices.Marshal]::PtrToStructure($oa2Ptr, [OBJECT_ATTRIBUTES])) | Out-Null
+    $hVirtChild  = [IntPtr]::Zero
+    # Force the Type overload and extract to a variable (PS5.1 binder fix)
+    $oa2_ni02 = [System.Runtime.InteropServices.Marshal]::PtrToStructure($oa2Ptr, [type][OBJECT_ATTRIBUTES])
+    [NtReg]::NtOpenKey([ref]$hVirtChild, [NtReg]::KeyRead, [ref]$oa2_ni02) | Out-Null
     [System.Runtime.InteropServices.Marshal]::FreeHGlobal($oa2Ptr)
     FreeAll $usPtrs2
 
@@ -1303,7 +1340,7 @@ if ($hParent -ne [IntPtr]::Zero) {
 
     NtSafeClose $hParent
 } else {
-    Fail "NI-01" "NtOpenKey MergeParent FAILED – cannot test relative opens"
+    Fail "NI-01" "NtOpenKey MergeParent FAILED - cannot test relative opens"
     Skip "NI-02" "Skipped"
 }
 
@@ -1365,7 +1402,7 @@ if ($hVC -ne [IntPtr]::Zero) {
     $virtCUPath = "$VirtNtBase\HKEY_CURRENT_USER\VirtRegTest_Classes_2026"
     $hVCU = NtOpen $virtCUPath
     if ($hVCU -ne [IntPtr]::Zero) {
-        Fail "NK-02" "_Classes routed to HKEY_CURRENT_USER (wrong!) – should be HKEY_USERS"
+        Fail "NK-02" "_Classes routed to HKEY_CURRENT_USER (wrong!) - should be HKEY_USERS"
         NtSafeClose $hVCU
     } else {
         Skip "NK-02" "Cannot verify _Classes routing (NK-01 may have skipped or failed)"

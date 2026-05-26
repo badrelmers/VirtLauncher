@@ -5,7 +5,7 @@
     > VirtLauncher64.exe -r -e reg query "HKEY_LOCAL_MACHINE\SOFTWARE\Classes" 2>nul | findstr "EnumA"
     The current time is: 23:03:09.48
 
-
+☐ in sandboxie i cannot rename a reg name, it says regedit.exe: SBIE2205 Service not implemented:  NtRenameKey . why he did not implemented it? does it improve speed? investigate it
 
 ☐ do like sandboxie it writes directly to HKEY_USERS\Sandbox_badr_paltalk not HKCU
 
@@ -81,7 +81,6 @@ ________________________________________________
 
 ☐ registry virtualisation of hklm is broken; writes go directly to the real reg
 
-☐ Delete logic: NtDeleteKey/NtDeleteValueKey only deletes from virtual store - this is a known bug area: if a real-only key is "deleted", it reappears after re-open because there's no tombstone mechanism for registry keys (unlike files).
 ☐ NtQueryKey: Returns virtual key metadata (subkey count, value count from virtual only, not merged count - possible bug).
 ☐ NtQueryMultipleValueKey: Tries virtual entirely, falls back to real if fails - but doesn't do per-value fallback (possible bug).
 

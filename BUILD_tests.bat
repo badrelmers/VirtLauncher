@@ -9,7 +9,8 @@ REM fltmc >nul 2>&1 || ( color 4F & echo. & echo RUNME AS ADMIN & echo. & pause 
 @echo off
 CD /D "%~dp0"
 
-del /Q tests\*.exe 2>nul
+del /Q tests\_bin\test_bug1.exe 2>nul
+del /Q tests\_bin\test_bug2.exe 2>nul
 
 set "SRCDIR=%~dp0"
 
@@ -69,8 +70,8 @@ del /Q *.obj 2>nul
 
 echo ============================================================
 
-move /y test_bug1.exe tests || goto :err
-move /y test_bug2.exe tests || goto :err
+move /y test_bug1.exe tests\_bin || goto :err
+move /y test_bug2.exe tests\_bin || goto :err
 
 echo.
 echo  Build complete!  Files in: %SRCDIR%

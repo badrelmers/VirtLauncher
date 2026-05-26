@@ -302,7 +302,7 @@ if %ERRORLEVEL% EQU 0 (
 
 
 
-@rem call :CLEANUP
+call :CLEANUP
 echo.
 exit /b
 

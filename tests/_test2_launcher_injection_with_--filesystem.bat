@@ -15,7 +15,7 @@ REM set VLAUNCHER_DEBUG=true
 :: --- Configuration ---
 set "TEST32_PATH=F:\_bin\_code\_kickstart\____shortcuts\_appz\_explorer\TablacusExplorer\_last\TE32.exe"
 set "TEST64_PATH=F:\_bin\_code\_kickstart\____shortcuts\_appz\_explorer\TablacusExplorer\_last\TE64.exe"
-set "LISTDLLS_EXE=%~dp0ListDlls\listdlls64.exe"
+set "LISTDLLS_EXE=%~dp0_bin\ListDlls\listdlls64.exe"
 set "BUILD_DIR=..\build"
 
 @rem ___________________________________________________________

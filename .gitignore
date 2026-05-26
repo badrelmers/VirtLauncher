@@ -1,3 +1,3 @@
 build/
-tests/test_bug1.exe
-tests/test_bug2.exe
+tests/_bin/test_bug1.exe
+tests/_bin/test_bug2.exe

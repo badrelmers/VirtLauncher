@@ -35,7 +35,7 @@ echo.
 @rem echo.
 
 echo ______Bug2: stale read-only dir handle misses virtual file
-VirtLauncher64.exe -f -e "%~dp0test_bug2.exe" "%BUG2_REALDIR%" >nul
+VirtLauncher64.exe -f -e "%~dp0_bin\test_bug2.exe" "%BUG2_REALDIR%" >nul
 if %ERRORLEVEL% EQU 0 (
     echo good
 ) else (

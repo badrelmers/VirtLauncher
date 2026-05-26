@@ -48,7 +48,7 @@ echo ______Bug1: COW read via NT-relative open through virtual dir handle
 @rem echo   [then NtOpenFile with RootDirectory=virtual_handle, ObjectName=cow_file.txt]
 @rem echo   [file is real-only, COW should serve it; Bug1 causes STATUS_OBJECT_NAME_NOT_FOUND]
 
-VirtLauncher64.exe -f -e "%~dp0test_bug1.exe" %BUG1_REALDIR% cow_file.txt >nul
+VirtLauncher64.exe -f -e "%~dp0_bin\test_bug1.exe" %BUG1_REALDIR% cow_file.txt >nul
 if %ERRORLEVEL% EQU 0 (
     @rem [Bug1 is FIXED: COW fallback via NT-relative open works]
     echo good
@@ -61,7 +61,7 @@ if %ERRORLEVEL% EQU 0 (
 echo ______Bug1 variant: same dir, different file to rule out caching
 echo good_variant > "%BUG1_REALDIR%\cow_file2.txt"
 
-VirtLauncher64.exe -f -e "%~dp0test_bug1.exe" %BUG1_REALDIR% cow_file2.txt >nul
+VirtLauncher64.exe -f -e "%~dp0_bin\test_bug1.exe" %BUG1_REALDIR% cow_file2.txt >nul
 if %ERRORLEVEL% EQU 0 (
     echo good
 ) else (
