@@ -2932,8 +2932,14 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
                         }
                         Real_NtClose(hVirtCheck);
 
-                        if (tombCount > 0) {
-                            // There are tombstones: compute the merged count properly.
+                        if (!virtValsQ.empty() || tombCount > 0) {
+                            // Virtual key has live values and/or tombstones: always
+                            // compute the correct merged count.
+                            // Previously guarded by tombCount > 0, which left the raw
+                            // real-key count unchanged when only live virtual values
+                            // existed.  That made NtQueryKey under-report the count,
+                            // causing reg.exe to stop enumerating before reaching
+                            // real-only values like RealEnum.
                             // Count real values that are not shadowed by any virtual
                             // entry (live or tombstone).
                             ULONG realUnshadowed = 0;
@@ -3739,31 +3745,82 @@ static NTSTATUS NTAPI Hook_NtEnumerateValueKey(
                 VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
                 VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus, OBJ_CASE_INSENSITIVE);
                 if (NT_SUCCESS(Real_NtOpenKey(&hVirtCheck, KEY_QUERY_VALUE, &voa))) {
-                    // Collect tombstoned value names from the virtual key.
-                    std::vector<std::wstring> deletedVals;
-                    std::vector<BYTE> scanBuf(512, 0);
-                    for (ULONG vi = 0; ; ++vi) {
-                        ULONG vLen = 0;
-                        NTSTATUS vs = Real_NtEnumerateValueKey(hVirtCheck, vi,
-                                          VlKeyValueBasicInformation,
-                                          &scanBuf[0], (ULONG)scanBuf.size(), &vLen);
-                        if (vs == VL_STATUS_BUFFER_TOO_SMALL || vs == VL_STATUS_BUFFER_OVERFLOW) {
-                            scanBuf.assign(vLen + 4, 0);
-                            vs = Real_NtEnumerateValueKey(hVirtCheck, vi,
-                                     VlKeyValueBasicInformation,
-                                     &scanBuf[0], (ULONG)scanBuf.size(), &vLen);
+                    // BUG 2 FIX: The old code only collected tombstones and then
+                    // enumerated the real key skipping them.  That completely missed
+                    // live virtual values (e.g. EnumA written via the launcher).
+                    // We now collect BOTH live virtual values and tombstoned names,
+                    // then perform the same full merge that the tracked path does:
+                    //   indices  0 .. virtLive-1          → live virtual values
+                    //   indices  virtLive .. merged-1     → real values not shadowed
+                    //                                       by a live virtual or tombstoned
+                    std::vector<std::wstring> virtValsU;   // live (non-tombstone) virtual values
+                    std::vector<std::wstring> deletedVals; // tombstoned value names
+                    {
+                        std::vector<BYTE> scanBuf(512, 0);
+                        for (ULONG vi = 0; ; ++vi) {
+                            ULONG vLen = 0;
+                            NTSTATUS vs = Real_NtEnumerateValueKey(hVirtCheck, vi,
+                                              VlKeyValueBasicInformation,
+                                              &scanBuf[0], (ULONG)scanBuf.size(), &vLen);
+                            if (vs == VL_STATUS_BUFFER_TOO_SMALL || vs == VL_STATUS_BUFFER_OVERFLOW) {
+                                scanBuf.assign(vLen + 4, 0);
+                                vs = Real_NtEnumerateValueKey(hVirtCheck, vi,
+                                         VlKeyValueBasicInformation,
+                                         &scanBuf[0], (ULONG)scanBuf.size(), &vLen);
+                            }
+                            if (!NT_SUCCESS(vs)) break;
+                            VL_KEY_VALUE_BASIC_INFORMATION* kvbi =
+                                reinterpret_cast<VL_KEY_VALUE_BASIC_INFORMATION*>(&scanBuf[0]);
+                            std::wstring nm(kvbi->Name, kvbi->NameLength / sizeof(WCHAR));
+                            if (kvbi->Type == VL_VALUE_DELETED_TYPE)
+                                deletedVals.push_back(nm);
+                            else
+                                virtValsU.push_back(nm);
                         }
-                        if (!NT_SUCCESS(vs)) break;
-                        VL_KEY_VALUE_BASIC_INFORMATION* kvbi =
-                            reinterpret_cast<VL_KEY_VALUE_BASIC_INFORMATION*>(&scanBuf[0]);
-                        if (kvbi->Type == VL_VALUE_DELETED_TYPE)
-                            deletedVals.push_back(std::wstring(kvbi->Name, kvbi->NameLength / sizeof(WCHAR)));
                     }
-                    Real_NtClose(hVirtCheck);
 
-                    if (!deletedVals.empty()) {
-                        // Enumerate real key, skipping tombstoned values.
-                        ULONG liveIdx = 0;
+                    if (!virtValsU.empty() || !deletedVals.empty()) {
+                        ULONG virtCount = (ULONG)virtValsU.size();
+                        if (Index < virtCount) {
+                            // Serve the Index-th live virtual value from hVirtCheck,
+                            // skipping tombstone entries to get a contiguous live index.
+                            ULONG liveIdx = 0;
+                            std::vector<BYTE> vBuf(1024, 0);
+                            for (ULONG vi = 0; ; ++vi) {
+                                ULONG vLen = 0;
+                                NTSTATUS vs = Real_NtEnumerateValueKey(hVirtCheck, vi,
+                                                  VlKeyValueBasicInformation,
+                                                  &vBuf[0], (ULONG)vBuf.size(), &vLen);
+                                if (vs == VL_STATUS_BUFFER_TOO_SMALL || vs == VL_STATUS_BUFFER_OVERFLOW) {
+                                    vBuf.assign(vLen + 4, 0);
+                                    vs = Real_NtEnumerateValueKey(hVirtCheck, vi,
+                                             VlKeyValueBasicInformation,
+                                             &vBuf[0], (ULONG)vBuf.size(), &vLen);
+                                }
+                                if (!NT_SUCCESS(vs)) break;
+                                VL_KEY_VALUE_BASIC_INFORMATION* kvbi =
+                                    reinterpret_cast<VL_KEY_VALUE_BASIC_INFORMATION*>(&vBuf[0]);
+                                if (kvbi->Type == VL_VALUE_DELETED_TYPE) continue;
+                                if (liveIdx == Index) {
+                                    NTSTATUS rs = Real_NtEnumerateValueKey(hVirtCheck, vi,
+                                                      KeyValueInformationClass, KeyValueInformation,
+                                                      Length, ResultLength);
+                                    Real_NtClose(hVirtCheck);
+                                    VL_DBG(L"Hook_NtEnumerateValueKey: untracked serving virtual live index=%u vi=%u",
+                                           Index, vi);
+                                    return rs;
+                                }
+                                ++liveIdx;
+                            }
+                            Real_NtClose(hVirtCheck);
+                            return VL_STATUS_NO_MORE_ENTRIES;
+                        }
+                        Real_NtClose(hVirtCheck);
+
+                        // Index is in the real-unshadowed range.
+                        // want = which unshadowed-real slot we need.
+                        ULONG want = Index - virtCount;
+                        ULONG skipped = 0;
                         std::vector<BYTE> eBuf(1024, 0);
                         for (ULONG ri = 0; ; ++ri) {
                             ULONG rLen = 0;
@@ -3780,13 +3837,19 @@ static NTSTATUS NTAPI Hook_NtEnumerateValueKey(
                             VL_KEY_VALUE_BASIC_INFORMATION* kvbi =
                                 reinterpret_cast<VL_KEY_VALUE_BASIC_INFORMATION*>(&eBuf[0]);
                             std::wstring vname(kvbi->Name, kvbi->NameLength / sizeof(WCHAR));
-                            if (NameInList(vname, deletedVals)) continue; // skip tombstone
-                            if (liveIdx == Index)
+                            // Skip real values shadowed by a live virtual value, or tombstoned.
+                            if (NameInList(vname, virtValsU) || NameInList(vname, deletedVals)) continue;
+                            if (skipped == want) {
+                                VL_DBG(L"Hook_NtEnumerateValueKey: untracked serving real unshadowed index=%u ri=%u name=%s",
+                                       Index, ri, vname.c_str());
                                 return Real_NtEnumerateValueKey(KeyHandle, ri,
                                            KeyValueInformationClass, KeyValueInformation,
                                            Length, ResultLength);
-                            ++liveIdx;
+                            }
+                            ++skipped;
                         }
+                    } else {
+                        Real_NtClose(hVirtCheck);
                     }
                 }
             }
