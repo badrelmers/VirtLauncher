@@ -2888,12 +2888,24 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
                 }
 
                 if (inScope && !virtPath.empty()) {
-                    // Count tombstoned values in the virtual key.
+                    // Compute the correct merged value count:
+                    //   merged = |virtual live values| + |real values not shadowed|
+                    //
+                    // The old approach subtracted tombCount from the real key's
+                    // Values field.  That is wrong when any tombstoned value was
+                    // virtual-only (never existed in the real key), because then
+                    // tombCount > 0 but the real Values count is not reduced -- the
+                    // subtraction under-counts and reg.exe / .NET loops fewer times
+                    // than needed, causing real-only values like RealEnum to be
+                    // silently skipped.
                     ULONG tombCount = 0;
                     HANDLE hVirtCheck = NULL;
                     VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
                     VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus, OBJ_CASE_INSENSITIVE);
                     if (NT_SUCCESS(Real_NtOpenKey(&hVirtCheck, KEY_QUERY_VALUE, &voa))) {
+                        // Collect live virtual values and tombstoned names.
+                        std::vector<std::wstring> virtValsQ;
+                        std::vector<std::wstring> deletedValsQ;
                         std::vector<BYTE> scanBuf(512, 0);
                         for (ULONG vi = 0; ; ++vi) {
                             ULONG vLen = 0;
@@ -2910,34 +2922,64 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
                             if (!NT_SUCCESS(vs)) break;
                             VL_KEY_VALUE_BASIC_INFORMATION* kvbi =
                                 reinterpret_cast<VL_KEY_VALUE_BASIC_INFORMATION*>(&scanBuf[0]);
-                            if (kvbi->Type == VL_VALUE_DELETED_TYPE)
+                            std::wstring nm(kvbi->Name, kvbi->NameLength / sizeof(WCHAR));
+                            if (kvbi->Type == VL_VALUE_DELETED_TYPE) {
+                                deletedValsQ.push_back(nm);
                                 ++tombCount;
+                            } else {
+                                virtValsQ.push_back(nm);
+                            }
                         }
                         Real_NtClose(hVirtCheck);
-                    }
 
-                    if (tombCount > 0) {
-                        VL_DBG(L"Hook_NtQueryKey: untracked in-scope virtPath=%s tombCount=%u",
-                               virtPath.c_str(), tombCount);
-                        if (KeyInformationClass == VlKeyFullInformation) {
-                            const ULONG kMinFull =
-                                sizeof(LARGE_INTEGER) + sizeof(ULONG) * 9;
-                            if (Length >= kMinFull) {
-                                VL_KEY_FULL_INFORMATION* fi =
-                                    reinterpret_cast<VL_KEY_FULL_INFORMATION*>(KeyInformation);
-                                if (fi->Values >= tombCount)
-                                    fi->Values -= tombCount;
-                                else
-                                    fi->Values = 0;
+                        if (tombCount > 0) {
+                            // There are tombstones: compute the merged count properly.
+                            // Count real values that are not shadowed by any virtual
+                            // entry (live or tombstone).
+                            ULONG realUnshadowed = 0;
+                            std::vector<BYTE> rBuf(512, 0);
+                            for (ULONG ri = 0; ; ++ri) {
+                                ULONG rLen = 0;
+                                NTSTATUS rs = Real_NtEnumerateValueKey(KeyHandle, ri,
+                                                  VlKeyValueBasicInformation,
+                                                  &rBuf[0], (ULONG)rBuf.size(), &rLen);
+                                if (rs == VL_STATUS_BUFFER_TOO_SMALL ||
+                                    rs == VL_STATUS_BUFFER_OVERFLOW) {
+                                    rBuf.assign(rLen + 4, 0);
+                                    rs = Real_NtEnumerateValueKey(KeyHandle, ri,
+                                             VlKeyValueBasicInformation,
+                                             &rBuf[0], (ULONG)rBuf.size(), &rLen);
+                                }
+                                if (!NT_SUCCESS(rs)) break;
+                                VL_KEY_VALUE_BASIC_INFORMATION* rkvbi =
+                                    reinterpret_cast<VL_KEY_VALUE_BASIC_INFORMATION*>(&rBuf[0]);
+                                std::wstring rname(rkvbi->Name,
+                                                   rkvbi->NameLength / sizeof(WCHAR));
+                                if (!NameInList(rname, virtValsQ) &&
+                                    !NameInList(rname, deletedValsQ))
+                                    ++realUnshadowed;
                             }
-                        } else { // VlKeyCachedInformation
-                            if (Length >= sizeof(VL_KEY_CACHED_INFORMATION)) {
-                                VL_KEY_CACHED_INFORMATION* ci =
-                                    reinterpret_cast<VL_KEY_CACHED_INFORMATION*>(KeyInformation);
-                                if (ci->Values >= tombCount)
-                                    ci->Values -= tombCount;
-                                else
-                                    ci->Values = 0;
+
+                            ULONG merged = (ULONG)virtValsQ.size() + realUnshadowed;
+                            VL_DBG(L"Hook_NtQueryKey: untracked in-scope virtPath=%s tombCount=%u"
+                                   L" virtLive=%u realUnshadowed=%u merged=%u",
+                                   virtPath.c_str(), tombCount,
+                                   (ULONG)virtValsQ.size(), realUnshadowed, merged);
+
+                            if (KeyInformationClass == VlKeyFullInformation) {
+                                const ULONG kMinFull =
+                                    sizeof(LARGE_INTEGER) + sizeof(ULONG) * 9;
+                                if (Length >= kMinFull) {
+                                    VL_KEY_FULL_INFORMATION* fi =
+                                        reinterpret_cast<VL_KEY_FULL_INFORMATION*>(KeyInformation);
+                                    fi->Values = merged;
+                                }
+                            } else { // VlKeyCachedInformation
+                                if (Length >= sizeof(VL_KEY_CACHED_INFORMATION)) {
+                                    VL_KEY_CACHED_INFORMATION* ci =
+                                        reinterpret_cast<VL_KEY_CACHED_INFORMATION*>(KeyInformation);
+                                    ci->Values = merged;
+                                }
                             }
                         }
                     }
