@@ -656,6 +656,14 @@ struct MergedSubkeyEntry {
 };
 struct MergedSubkeyCache {
     std::vector<MergedSubkeyEntry> entries;
+    // LastWriteTime of hR and hV captured BEFORE the build begins.
+    // If either key is modified externally (by another process not going
+    // through our hooks), the kernel updates LastWriteTime atomically.
+    // The next NtEnumerateKey call detects the mismatch and rebuilds.
+    // Timestamps are captured PRE-build (not post-build) so that any
+    // change that occurs DURING enumeration also triggers a rebuild.
+    LARGE_INTEGER realLastWrite;
+    LARGE_INTEGER virtLastWrite;
 };
 // Guarded by g_KeyMapLock (same lock as g_KeyMap).
 static std::map<HANDLE, MergedSubkeyCache> g_SubkeyEnumCache;
@@ -790,6 +798,29 @@ static void InvalidateAllSubkeyCaches() {
     EnterCriticalSection(&g_KeyMapLock);
     g_SubkeyEnumCache.clear();
     LeaveCriticalSection(&g_KeyMapLock);
+}
+
+// Returns the LastWriteTime of a registry key handle.
+// Used for cache staleness detection: the kernel updates this timestamp
+// atomically whenever a subkey is added, deleted, or renamed, so any
+// structural change to the key — whether by our own hooks or an external
+// process — is immediately reflected here.
+//
+// Buffer note: we only need the fixed header (LastWriteTime at offset 0).
+// 64 bytes is more than sufficient; KeyBasicInformation has no variable
+// data we need to read for the staleness check.
+//
+// Caller must set SetReentrant(true) before calling if currently inside
+// a hook dispatch path to prevent recursive hook invocation.
+static LARGE_INTEGER GetKeyLastWriteTime(HANDLE h) {
+    LARGE_INTEGER zero = {};
+    if (!h || h == INVALID_HANDLE_VALUE || !Real_NtQueryKey) return zero;
+    BYTE buf[64] = {};
+    ULONG resLen = 0;
+    NTSTATUS st = Real_NtQueryKey(h, VlKeyBasicInformation,
+                                   buf, sizeof(buf), &resLen);
+    if (!NT_SUCCESS(st)) return zero;
+    return reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(buf)->LastWriteTime;
 }
 
 static bool GetEntry(HANDLE h, VirtKeyEntry& out) {
@@ -3347,9 +3378,54 @@ static NTSTATUS NTAPI Hook_NtEnumerateKey(
     std::map<HANDLE, MergedSubkeyCache>::iterator cit =
         g_SubkeyEnumCache.find(KeyHandle);
 
+    // ── Staleness check ──────────────────────────────────────────────────
+    // If the cache exists, verify that neither the real nor the virtual key
+    // has been modified since the cache was built.  The kernel updates
+    // LastWriteTime atomically on any subkey add/delete/rename, so this
+    // detects external changes (by other processes) as well as any change
+    // that slipped past InvalidateAllSubkeyCaches().
+    //
+    // We use SetReentrant(true) to suppress hook re-entry during the
+    // NtQueryKey calls.  The lock is already held, and Real_NtQueryKey
+    // is not one of the functions we hook, so this is safe.
+    if (cit != g_SubkeyEnumCache.end()) {
+        SetReentrant(true);
+        LARGE_INTEGER curReal = GetKeyLastWriteTime(hR);
+        LARGE_INTEGER curVirt = GetKeyLastWriteTime(hV);
+        SetReentrant(false);
+        bool stale =
+            (curReal.QuadPart != cit->second.realLastWrite.QuadPart) ||
+            (curVirt.QuadPart != cit->second.virtLastWrite.QuadPart);
+        if (stale) {
+            VL_DBG(L"Hook_NtEnumerateKey: cache stale for handle=%p, rebuilding"
+                   L" (real %lld->%lld virt %lld->%lld)",
+                   KeyHandle,
+                   cit->second.realLastWrite.QuadPart, curReal.QuadPart,
+                   cit->second.virtLastWrite.QuadPart, curVirt.QuadPart);
+            g_SubkeyEnumCache.erase(cit);
+            cit = g_SubkeyEnumCache.end();
+        }
+    }
+
     if (cit == g_SubkeyEnumCache.end()) {
         // Cache miss: build the full merged list now.
         MergedSubkeyCache newCache;
+
+        // ── Capture timestamps BEFORE enumeration begins ─────────────────
+        // IMPORTANT: timestamps must be snapshotted here, not after the build.
+        //
+        // Rationale: if another process modifies the key DURING our build
+        // (e.g., an installer writes a subkey between our Pass 1 and Pass 2),
+        // the kernel's LastWriteTime will be newer than what we stored here.
+        // The next call to Hook_NtEnumerateKey will detect the mismatch and
+        // trigger a rebuild, preventing stale data from being served.
+        //
+        // If we stored timestamps POST-build instead (as might seem intuitive),
+        // the stored timestamp would already reflect the modification, so the
+        // next call would see curReal == stored and incorrectly serve the
+        // possibly incomplete or inconsistent cached list.
+        newCache.realLastWrite = GetKeyLastWriteTime(hR);
+        newCache.virtLastWrite = GetKeyLastWriteTime(hV);
 
         // Use case-insensitive sets for O(log V) shadow/tombstone lookups
         // when processing the (potentially large) real-side entry list.
