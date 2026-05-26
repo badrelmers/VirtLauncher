@@ -2967,10 +2967,95 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
                             }
 
                             ULONG merged = (ULONG)virtValsQ.size() + realUnshadowed;
-                            VL_DBG(L"Hook_NtQueryKey: untracked in-scope virtPath=%s tombCount=%u"
-                                   L" virtLive=%u realUnshadowed=%u merged=%u",
+
+                            // -------------------------------------------------------
+                            // FIX: also patch Max* hints and SubKeys for the untracked
+                            // path.  The real key may report MaxValueNameLen=0 and
+                            // MaxValueDataLen=0 when it carries no values itself (e.g.
+                            // the HKCU root).  reg.exe / .NET use these fields to
+                            // pre-size their NtEnumerateValueKey buffers; leaving them
+                            // at 0 while Values>0 causes STATUS_BUFFER_OVERFLOW on the
+                            // very first enumerated virtual value, which reg.exe
+                            // surfaces as "ERROR: More data is available."
+                            //
+                            // SubKeys and MaxNameLen have the same problem when
+                            // virtual-only subkeys exist under an untracked root.
+                            //
+                            // Fix: re-open the virtual key with KEY_READ, query its
+                            // own NtQueryKey stats, and take the max of each hint field
+                            // (mirrors the tracked path at lines ~3194-3222).
+                            // -------------------------------------------------------
+                            ULONG virtMaxValueNameLen   = 0;
+                            ULONG virtMaxValueDataLen   = 0;
+                            ULONG virtMaxNameLen        = 0;
+                            ULONG virtSubKeys           = 0;
+                            ULONG realSubKeysUnshadowed = 0;
+                            {
+                                HANDLE hVirtStats = NULL;
+                                if (NT_SUCCESS(Real_NtOpenKey(&hVirtStats, KEY_READ, &voa))) {
+                                    // Query the virtual key's cached stats.
+                                    {
+                                        std::vector<BYTE> stBuf(
+                                            sizeof(VL_KEY_CACHED_INFORMATION) + 16, 0);
+                                        ULONG stLen = 0;
+                                        NTSTATUS stq = Real_NtQueryKey(
+                                            hVirtStats, VlKeyCachedInformation,
+                                            &stBuf[0], (ULONG)stBuf.size(), &stLen);
+                                        if ((NT_SUCCESS(stq) ||
+                                             stq == VL_STATUS_BUFFER_OVERFLOW) &&
+                                            stLen >= sizeof(VL_KEY_CACHED_INFORMATION))
+                                        {
+                                            VL_KEY_CACHED_INFORMATION* vci =
+                                                reinterpret_cast<VL_KEY_CACHED_INFORMATION*>(
+                                                    &stBuf[0]);
+                                            virtMaxValueNameLen = vci->MaxValueNameLen;
+                                            virtMaxValueDataLen = vci->MaxValueDataLen;
+                                            virtMaxNameLen      = vci->MaxNameLen;
+                                            virtSubKeys         = vci->SubKeys;
+                                        }
+                                    }
+                                    // Count real subkeys not shadowed by a virtual
+                                    // subkey and not tombstoned (same logic as the
+                                    // tracked path at line ~3128).
+                                    {
+                                        std::vector<std::wstring> deletedSubKeysQ;
+                                        std::vector<std::wstring> virtSubkeyNamesQ =
+                                            CollectSubkeyNames(hVirtStats, &deletedSubKeysQ);
+                                        std::vector<BYTE> tmpBuf(1024, 0);
+                                        for (ULONG ri = 0; ; ++ri) {
+                                            ULONG resLen = 0;
+                                            NTSTATUS rs = Real_NtEnumerateKey(
+                                                KeyHandle, ri, VlKeyBasicInformation,
+                                                &tmpBuf[0], (ULONG)tmpBuf.size(), &resLen);
+                                            if (rs == VL_STATUS_BUFFER_TOO_SMALL ||
+                                                rs == VL_STATUS_BUFFER_OVERFLOW) {
+                                                tmpBuf.assign(resLen + 4, 0);
+                                                rs = Real_NtEnumerateKey(
+                                                    KeyHandle, ri, VlKeyBasicInformation,
+                                                    &tmpBuf[0], (ULONG)tmpBuf.size(), &resLen);
+                                            }
+                                            if (!NT_SUCCESS(rs)) break;
+                                            VL_KEY_BASIC_INFORMATION* kbi =
+                                                reinterpret_cast<VL_KEY_BASIC_INFORMATION*>(
+                                                    &tmpBuf[0]);
+                                            std::wstring sname(kbi->Name,
+                                                kbi->NameLength / sizeof(WCHAR));
+                                            if (!NameInList(sname, virtSubkeyNamesQ) &&
+                                                !NameInList(sname, deletedSubKeysQ))
+                                                ++realSubKeysUnshadowed;
+                                        }
+                                    }
+                                    Real_NtClose(hVirtStats);
+                                }
+                            }
+                            ULONG mergedSubKeys = virtSubKeys + realSubKeysUnshadowed;
+
+                            VL_DBG(L"Hook_NtQueryKey: untracked in-scope virtPath=%s"
+                                   L" tombCount=%u virtLive=%u realUnshadowed=%u merged=%u"
+                                   L" mergedSubKeys=%u virtMaxValName=%u virtMaxValData=%u",
                                    virtPath.c_str(), tombCount,
-                                   (ULONG)virtValsQ.size(), realUnshadowed, merged);
+                                   (ULONG)virtValsQ.size(), realUnshadowed, merged,
+                                   mergedSubKeys, virtMaxValueNameLen, virtMaxValueDataLen);
 
                             if (KeyInformationClass == VlKeyFullInformation) {
                                 const ULONG kMinFull =
@@ -2978,13 +3063,27 @@ static NTSTATUS NTAPI Hook_NtQueryKey(
                                 if (Length >= kMinFull) {
                                     VL_KEY_FULL_INFORMATION* fi =
                                         reinterpret_cast<VL_KEY_FULL_INFORMATION*>(KeyInformation);
-                                    fi->Values = merged;
+                                    fi->Values  = merged;
+                                    fi->SubKeys = mergedSubKeys;
+                                    if (virtMaxNameLen      > fi->MaxNameLen)
+                                        fi->MaxNameLen      = virtMaxNameLen;
+                                    if (virtMaxValueNameLen > fi->MaxValueNameLen)
+                                        fi->MaxValueNameLen = virtMaxValueNameLen;
+                                    if (virtMaxValueDataLen > fi->MaxValueDataLen)
+                                        fi->MaxValueDataLen = virtMaxValueDataLen;
                                 }
                             } else { // VlKeyCachedInformation
                                 if (Length >= sizeof(VL_KEY_CACHED_INFORMATION)) {
                                     VL_KEY_CACHED_INFORMATION* ci =
                                         reinterpret_cast<VL_KEY_CACHED_INFORMATION*>(KeyInformation);
-                                    ci->Values = merged;
+                                    ci->Values  = merged;
+                                    ci->SubKeys = mergedSubKeys;
+                                    if (virtMaxNameLen      > ci->MaxNameLen)
+                                        ci->MaxNameLen      = virtMaxNameLen;
+                                    if (virtMaxValueNameLen > ci->MaxValueNameLen)
+                                        ci->MaxValueNameLen = virtMaxValueNameLen;
+                                    if (virtMaxValueDataLen > ci->MaxValueDataLen)
+                                        ci->MaxValueDataLen = virtMaxValueDataLen;
                                 }
                             }
                         }
