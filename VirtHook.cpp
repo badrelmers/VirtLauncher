@@ -668,6 +668,34 @@ struct MergedSubkeyCache {
 // Guarded by g_KeyMapLock (same lock as g_KeyMap).
 static std::map<HANDLE, MergedSubkeyCache> g_SubkeyEnumCache;
 
+// ============================================================
+// Untracked-handle path cache   (PERF FIX)
+//
+// GetHandleLogicalPath calls NtQueryObject/NtQueryKey (kernel
+// round-trips) every time it is called for an untracked handle.
+// During shell enumeration Tablacus opens dozens of subkeys that
+// are never tracked by our hook; each key is then queried for
+// 50-100 values, so NtQueryObject fires O(handles * values) times
+// per operation.  Cache the resolved path the first time we see a
+// handle; invalidate the entry in Hook_NtClose.
+//
+// Stores HANDLE -> resolved logical path + derived virtual path.
+// Empty resolvedPath means the handle could not be resolved.
+// inScope==false means the handle is outside virtualisation scope.
+//
+// The HKCU-root and _Classes-root special-case mappings (which
+// LogicalToVirtual intentionally skips to avoid re-entrancy) are
+// folded into GetUntrackedHandleScope so both callers benefit from
+// the cache rather than repeating the checks on every call.
+// ============================================================
+struct HandlePathEntry {
+    std::wstring resolvedPath; // result of GetHandleLogicalPath
+    std::wstring virtPath;     // result of scope resolution (empty if out of scope)
+    bool         inScope;      // true if virtPath is valid
+};
+static std::map<HANDLE, HandlePathEntry> g_HandlePathCache;
+static CRITICAL_SECTION                  g_HandlePathCacheLock;
+
 // Case-insensitive comparator for filename sets (NTFS is case-insensitive)
 struct CiLess {
     bool operator()(const std::wstring& a, const std::wstring& b) const {
@@ -996,6 +1024,117 @@ static std::wstring GetHandleLogicalPath(HANDLE h) {
     }
     VL_DBG(L"GetHandleLogicalPath: FAILED for handle %p", h);
     return L"";
+}
+
+// Forward declaration — defined after GetFullNtPath (below).
+static bool LogicalToVirtual(const std::wstring& logical, std::wstring& virt);
+
+// ============================================================
+// Cached untracked-handle scope resolver   (PERF FIX)
+//
+// Replaces the per-call pattern:
+//   SetReentrant(true);
+//   resolvedPath = GetHandleLogicalPath(h);  // NtQueryObject round-trip
+//   inScope = LogicalToVirtual(...) || special-case ...
+//   SetReentrant(false);
+//
+// with a single lookup into g_HandlePathCache.  The expensive kernel
+// call is only made on the first call per unique handle value.
+// The cache entry is invalidated in Hook_NtClose for every handle
+// close (tracked and untracked alike) to guard against handle reuse.
+//
+// HKCU-root and _Classes-root special cases are folded in here so
+// every caller benefits uniformly without duplicating the logic.
+//
+// Returns true if the handle is in virtualisation scope; fills
+// resolvedPath and virtPath.  Returns false if out of scope (but
+// resolvedPath may still be non-empty for diagnostic purposes).
+//
+// Thread-safe.  Must NOT be called while holding any of our locks
+// (g_KeyMapLock, g_FileMapLock) since GetHandleLogicalPath may
+// acquire them internally.
+// ============================================================
+static bool GetUntrackedHandleScope(HANDLE h,
+                                     std::wstring& resolvedPath,
+                                     std::wstring& virtPath)
+{
+    // ── Cache read ────────────────────────────────────────────
+    {
+        EnterCriticalSection(&g_HandlePathCacheLock);
+        std::map<HANDLE, HandlePathEntry>::iterator it = g_HandlePathCache.find(h);
+        if (it != g_HandlePathCache.end()) {
+            resolvedPath = it->second.resolvedPath;
+            virtPath     = it->second.virtPath;
+            bool inScope = it->second.inScope;
+            LeaveCriticalSection(&g_HandlePathCacheLock);
+            return inScope;
+        }
+        LeaveCriticalSection(&g_HandlePathCacheLock);
+    }
+
+    // ── Cache miss: resolve (expensive, done only once per handle) ─
+    SetReentrant(true);
+    resolvedPath = GetHandleLogicalPath(h);
+    virtPath.clear();
+    bool inScope = false;
+
+    if (!resolvedPath.empty()) {
+        if (StartsWithI(resolvedPath, g_VirtNtBase)) {
+            // Case B: handle already points into the virtual store.
+            virtPath = resolvedPath;
+            inScope  = true;
+        } else {
+            // Case A: try normal logical -> virtual mapping.
+            inScope = LogicalToVirtual(resolvedPath, virtPath);
+
+            if (!inScope) {
+                // Special case A: LogicalToVirtual intentionally skips the
+                // HKCU hive root (\REGISTRY\USER\<SID>) to avoid re-entrancy.
+                // Map the exact root -> VirtNtBase\HKEY_CURRENT_USER.
+                if (_wcsnicmp(resolvedPath.c_str(),
+                               g_RealNtBase.c_str(),
+                               g_RealNtBase.size()) == 0 &&
+                    resolvedPath.size() == g_RealNtBase.size())
+                {
+                    virtPath = g_VirtNtBase + L"\\HKEY_CURRENT_USER";
+                    inScope  = true;
+                }
+            }
+
+            if (!inScope) {
+                // Special case B: LogicalToVirtual skips the _Classes hive
+                // root (\REGISTRY\USER\<SID>_Classes).
+                // Map exact root -> VirtNtBase\HKEY_USERS\<SID>_Classes.
+                std::wstring classesRoot = g_RealNtBase + L"_Classes";
+                if (_wcsnicmp(resolvedPath.c_str(),
+                               classesRoot.c_str(),
+                               classesRoot.size()) == 0 &&
+                    resolvedPath.size() == classesRoot.size())
+                {
+                    std::wstring::size_type p = g_RealNtBase.rfind(L'\\');
+                    if (p != std::wstring::npos) {
+                        std::wstring sidClasses = g_RealNtBase.substr(p + 1) + L"_Classes";
+                        virtPath = g_VirtNtBase + L"\\HKEY_USERS\\" + sidClasses;
+                        inScope  = true;
+                    }
+                }
+            }
+        }
+    }
+    SetReentrant(false);
+
+    // ── Cache write ───────────────────────────────────────────
+    {
+        HandlePathEntry entry;
+        entry.resolvedPath = resolvedPath;
+        entry.virtPath     = virtPath;
+        entry.inScope      = inScope;
+        EnterCriticalSection(&g_HandlePathCacheLock);
+        g_HandlePathCache[h] = entry;
+        LeaveCriticalSection(&g_HandlePathCacheLock);
+    }
+
+    return inScope;
 }
 
 // Build the full NT path from an OBJECT_ATTRIBUTES.
@@ -3543,50 +3682,15 @@ static NTSTATUS NTAPI Hook_NtEnumerateValueKey(
 {
     VirtKeyEntry e;
     if (!g_RegEnabled || !GetEntry(KeyHandle, e)) {
-        // Untracked handle: resolve via NtQueryObject.  If the handle points to
-        // (or can be mapped to) a virtual store key, open the virtual key and
-        // perform a tombstone-aware enumeration so deleted values are hidden.
+        // Untracked handle: resolve via cached NtQueryObject.  If the handle
+        // points to (or can be mapped to) a virtual store key, open the virtual
+        // key and perform a tombstone-aware enumeration so deleted values are
+        // hidden.  GetUntrackedHandleScope calls NtQueryObject only once per
+        // unique handle and caches the result; subsequent calls are O(1).
         if (g_RegEnabled) {
-            SetReentrant(true);
-            std::wstring resolvedPath = GetHandleLogicalPath(KeyHandle);
-            std::wstring virtPath;
-            bool inScope = false;
-            if (!resolvedPath.empty()) {
-                if (StartsWithI(resolvedPath, g_VirtNtBase)) {
-                    virtPath = resolvedPath; inScope = true;  // Case B
-                } else {
-                    inScope = LogicalToVirtual(resolvedPath, virtPath); // Case A
-                    if (!inScope) {
-                        // HKCU root special case
-                        if (_wcsnicmp(resolvedPath.c_str(), g_RealNtBase.c_str(),
-                                      g_RealNtBase.size()) == 0 &&
-                            resolvedPath.size() == g_RealNtBase.size())
-                        {
-                            virtPath = g_VirtNtBase + L"\\HKEY_CURRENT_USER";
-                            inScope  = true;
-                        }
-                    }
-                    if (!inScope) {
-                        // _Classes root special case — check HKU\SID_Classes virtual path
-                        std::wstring classesRoot = g_RealNtBase + L"_Classes";
-                        if (_wcsnicmp(resolvedPath.c_str(), classesRoot.c_str(),
-                                      classesRoot.size()) == 0 &&
-                            resolvedPath.size() == classesRoot.size())
-                        {
-                            std::wstring::size_type p = g_RealNtBase.rfind(L'\\');
-                            std::wstring sidClasses = (p != std::wstring::npos)
-                                ? g_RealNtBase.substr(p + 1) + L"_Classes" : L"";
-                            if (!sidClasses.empty()) {
-                                virtPath = g_VirtNtBase + L"\\HKEY_USERS\\" + sidClasses;
-                                inScope  = true;
-                            }
-                        }
-                    }
-                }
-            }
-            SetReentrant(false);
-
-            if (inScope && !virtPath.empty()) {
+            std::wstring resolvedPath, virtPath;
+            if (GetUntrackedHandleScope(KeyHandle, resolvedPath, virtPath)) {
+                // inScope == true
                 VL_DBG(L"Hook_NtEnumerateValueKey: untracked in-scope virtPath=%s index=%u",
                        virtPath.c_str(), Index);
                 HANDLE hVirtCheck = NULL;
@@ -3792,60 +3896,11 @@ static NTSTATUS NTAPI Hook_NtQueryValueKey(
         // If the handle resolves to (or can be mapped to) a virtual store key,
         // we must check for a value tombstone before falling through, otherwise
         // a tombstoned value would be visible to the caller via the real API.
+        // GetUntrackedHandleScope calls NtQueryObject only once per unique
+        // handle; all subsequent calls for the same handle are O(1) cache hits.
         if (g_RegEnabled && ValueName) {
-            SetReentrant(true);
-            std::wstring resolvedPath = GetHandleLogicalPath(KeyHandle);
-            std::wstring virtPath;
-            bool inScope = false;
-
-            if (!resolvedPath.empty()) {
-                if (StartsWithI(resolvedPath, g_VirtNtBase)) {
-                    virtPath = resolvedPath; inScope = true;  // Case B
-                } else {
-                    inScope = LogicalToVirtual(resolvedPath, virtPath); // Case A
-                    if (!inScope) {
-                        // Special case A: HKCU hive root is SKIPped by
-                        // LogicalToVirtual to avoid re-entrancy, but reads from
-                        // it (reg query HKEY_USERS\SID /v ...) must still be
-                        // served from the virtual store.
-                        // Map exact HKCU root → VirtNtBase\HKEY_CURRENT_USER.
-                        if (_wcsnicmp(resolvedPath.c_str(),
-                                      g_RealNtBase.c_str(),
-                                      g_RealNtBase.size()) == 0 &&
-                            resolvedPath.size() == g_RealNtBase.size())
-                        {
-                            virtPath = g_VirtNtBase + L"\\HKEY_CURRENT_USER";
-                            inScope  = true;
-                            VL_DBG(L"Hook_NtQueryValueKey: untracked HKCU-root -> HKEY_CURRENT_USER virtPath=%s name=%s",
-                                   virtPath.c_str(), FromUStr(ValueName).c_str());
-                        }
-                    }
-                    if (!inScope) {
-                        // Special case B: _Classes root is SKIPped by LogicalToVirtual
-                        // but we must still serve virtualised values from it.
-                        // Map exact _Classes root -> HKEY_USERS\SID_CLASSES virtual
-                        // path (where Hook_NtSetValueKey writes root-level values).
-                        std::wstring classesRoot = g_RealNtBase + L"_Classes";
-                        if (_wcsnicmp(resolvedPath.c_str(),
-                                      classesRoot.c_str(),
-                                      classesRoot.size()) == 0 &&
-                            resolvedPath.size() == classesRoot.size())
-                        {
-                            std::wstring sidClasses;
-                            std::wstring::size_type p = g_RealNtBase.rfind(L'\\');
-                            if (p != std::wstring::npos)
-                                sidClasses = g_RealNtBase.substr(p + 1) + L"_Classes";
-                            virtPath = g_VirtNtBase + L"\\HKEY_USERS\\" + sidClasses;
-                            inScope  = true;
-                            VL_DBG(L"Hook_NtQueryValueKey: untracked _Classes-root -> HKU virtPath=%s name=%s",
-                                   virtPath.c_str(), FromUStr(ValueName).c_str());
-                        }
-                    }
-                }
-            }
-            SetReentrant(false);
-
-            if (inScope && !virtPath.empty()) {
+            std::wstring resolvedPath, virtPath;
+            if (GetUntrackedHandleScope(KeyHandle, resolvedPath, virtPath)) {
                 VL_DBG(L"Hook_NtQueryValueKey: untracked in-scope virtPath=%s name=%s",
                        virtPath.c_str(), FromUStr(ValueName).c_str());
                 // Open the virtual key and handle both live values and tombstones.
@@ -3936,42 +3991,11 @@ static NTSTATUS NTAPI Hook_NtQueryMultipleValueKey(
         // Untracked handle: resolve and check for tombstoned values before
         // falling through.  NtQueryMultipleValueKey queries several values at
         // once; we must block any that are tombstoned in the virtual store.
+        // GetUntrackedHandleScope calls NtQueryObject only once per unique
+        // handle; all subsequent calls for the same handle are O(1) cache hits.
         if (g_RegEnabled && ValueEntries && EntryCount > 0) {
-            SetReentrant(true);
-            std::wstring resolvedPath = GetHandleLogicalPath(KeyHandle);
-            std::wstring virtPath;
-            bool inScope = false;
-            if (!resolvedPath.empty()) {
-                if (StartsWithI(resolvedPath, g_VirtNtBase)) {
-                    virtPath = resolvedPath; inScope = true;
-                } else {
-                    inScope = LogicalToVirtual(resolvedPath, virtPath);
-                    if (!inScope) {
-                        if (_wcsnicmp(resolvedPath.c_str(), g_RealNtBase.c_str(),
-                                      g_RealNtBase.size()) == 0 &&
-                            resolvedPath.size() == g_RealNtBase.size())
-                        { virtPath = g_VirtNtBase + L"\\HKEY_CURRENT_USER"; inScope = true; }
-                    }
-                    if (!inScope) {
-                        std::wstring classesRoot = g_RealNtBase + L"_Classes";
-                        if (_wcsnicmp(resolvedPath.c_str(), classesRoot.c_str(),
-                                      classesRoot.size()) == 0 &&
-                            resolvedPath.size() == classesRoot.size())
-                        {
-                            std::wstring::size_type p = g_RealNtBase.rfind(L'\\');
-                            std::wstring sc = (p != std::wstring::npos)
-                                ? g_RealNtBase.substr(p + 1) + L"_Classes" : L"";
-                            if (!sc.empty()) {
-                                virtPath = g_VirtNtBase + L"\\HKEY_USERS\\" + sc;
-                                inScope  = true;
-                            }
-                        }
-                    }
-                }
-            }
-            SetReentrant(false);
-
-            if (inScope && !virtPath.empty()) {
+            std::wstring resolvedPath, virtPath;
+            if (GetUntrackedHandleScope(KeyHandle, resolvedPath, virtPath)) {
                 HANDLE hVirtCheck = NULL;
                 VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
                 VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus, OBJ_CASE_INSENSITIVE);
@@ -4931,6 +4955,16 @@ static NTSTATUS NTAPI Hook_NtLoadKey3(
 
 // ---- NtClose -- CRITICAL: only special-case tracked handles ----
 static NTSTATUS NTAPI Hook_NtClose(HANDLE Handle) {
+    // Invalidate the untracked-handle path cache for this handle.
+    // Must be done for ALL closes (not just tracked ones) because Windows
+    // reuses handle values after close: if we kept a stale entry the next
+    // open that reuses the same HANDLE value would get wrong path data.
+    {
+        EnterCriticalSection(&g_HandlePathCacheLock);
+        g_HandlePathCache.erase(Handle);
+        LeaveCriticalSection(&g_HandlePathCacheLock);
+    }
+
     // Try registry first
     VirtKeyEntry ke;
     if (PopKeyEntry(Handle, ke)) {
@@ -8069,6 +8103,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
         g_TlsIdx = TlsAlloc();
         InitializeCriticalSectionAndSpinCount(&g_KeyMapLock, 4000);
         InitializeCriticalSectionAndSpinCount(&g_FileMapLock, 4000);
+        InitializeCriticalSectionAndSpinCount(&g_HandlePathCacheLock, 4000);
 
         VL_DBG(L"DllMain: DLL_PROCESS_ATTACH -- VirtHook loading (v12 console title fix)");
 
@@ -8133,6 +8168,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
         g_FileMap.clear();
         LeaveCriticalSection(&g_FileMapLock);
         DeleteCriticalSection(&g_FileMapLock);
+
+        // Teardown untracked-handle path cache.
+        EnterCriticalSection(&g_HandlePathCacheLock);
+        g_HandlePathCache.clear();
+        LeaveCriticalSection(&g_HandlePathCacheLock);
+        DeleteCriticalSection(&g_HandlePathCacheLock);
 
         if (g_TlsIdx != TLS_OUT_OF_INDEXES) {
             TlsFree(g_TlsIdx);
