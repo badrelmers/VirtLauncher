@@ -1,4 +1,5 @@
 
+☐ injected childs should print verbose output like the main injection when using VLAUNCHER_VERBOSE
 
 ☐ reg query is slow with the big hives
     The current time is: 23:02:50.77

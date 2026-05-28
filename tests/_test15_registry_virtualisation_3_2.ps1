@@ -38,12 +38,21 @@
     Path to write test result log. Default: %TEMP%\VirtRegTest_NtLevel.log
 
 .NOTES
-    Known bug areas specifically probed:
-      - NtQueryKey: SubKeys/Values counts (virtual-only vs merged)
-      - NtQueryMultipleValueKey: all-or-nothing fallback (no per-value merge)
-      - NtDeleteKey/NtDeleteValueKey: no tombstone → real key re-appears on re-open
-      - NtEnumerateKey index gaps when virtual list is shorter than merged list
-      - Buffer-too-small handling in merge path
+    Areas probed (all fixed unless noted):
+      - NtCreateKey disposition: EnsureVirtualPath no longer pre-creates the leaf
+        key, so REG_CREATED_NEW_KEY (1) is returned correctly for new virtual keys.
+      - NtQueryKey SubKeys/Values: Hook_NtQueryKey merges counts from both the
+        virtual and real handles via set-union deduplication.
+      - NtQueryMultipleValueKey: per-value fallback merge implemented. Each value
+        is tried on the virtual handle first; if NOT_FOUND and not tombstoned, the
+        real handle is consulted. Virtual overrides are preserved for overridden
+        values while real-only values are served from the real handle.
+      - NtDeleteKey/NtDeleteValueKey: tombstone markers prevent real values/keys
+        from re-appearing after a virtual delete.
+      - NtEnumerateKey/NtEnumerateValueKey: index-continuity and merge correctness.
+      - Buffer-too-small handling in merge path.
+      - Relative-path opens via OBJECT_ATTRIBUTES.RootDirectory.
+      - HKCU\..._Classes hive routing to HKEY_USERS virtual store.
 #>
 
 param(
@@ -917,14 +926,15 @@ if ($hSK2 -ne [IntPtr]::Zero) {
 }
 
 # ─── SECTION NE: NtQueryKey - Count Accuracy ─────────────────────────────────
-Section "NE" "NtQueryKey - SubKeys/Values Count Accuracy (known issue)"
-Log "  NOTE: NtQueryKey KeyFullInformation reports counts from the"
-Log "  virtual handle ONLY. It does not add real-key counts. This means"
-Log "  RegQueryInfoKey / RegistryKey.SubKeyCount are always wrong when"
-Log "  real and virtual entries coexist. Tests here document the delta."
-Log ""
+Section "NE" "NtQueryKey - SubKeys/Values Count Accuracy"
+# Log "  NOTE: NtQueryKey KeyFullInformation count merge is implemented."
+# Log "  Hook_NtQueryKey deduplicates subkey and value names across both"
+# Log "  the virtual and real handles and reports the merged count."
+# Log "  RegQueryInfoKey / RegistryKey.SubKeyCount now return correct merged"
+# Log "  counts when real and virtual entries coexist."
+# Log ""
 
-# NE-01: ShadowKey - virtual handle has 2 values, merged has 4
+# NE-01: ShadowKey - merged handle should report all values (virt+real dedup)
 $hNE1 = NtOpen $skPath
 if ($hNE1 -ne [IntPtr]::Zero) {
     $fi = QueryKeyFull $hNE1
@@ -933,9 +943,9 @@ if ($hNE1 -ne [IntPtr]::Zero) {
         $reportedVals = $fi.Values
         Log "  [NE-01] NtQueryKey(ShadowKey).Values = $reportedVals  (merged should be >=4)"
         if ($reportedVals -ge 4) {
-            Pass "NE-01" "NtQueryKey: ShadowKey value count=$reportedVals >= 4 (correct merged count)"
+            Pass "NE-01" "NtQueryKey: ShadowKey value count=$reportedVals >= 4 (merged count correct)"
         } elseif ($reportedVals -eq 2) {
-            Fail "NE-01" "[KNOWN BUG] NtQueryKey: ShadowKey.Values=$reportedVals (only virtual count, not merged 4)"
+            Fail "NE-01" "NtQueryKey: ShadowKey.Values=$reportedVals < 4 (merged count wrong)"
         } else {
             Fail "NE-01" "NtQueryKey: ShadowKey.Values=$reportedVals (unexpected, expected 2 or 4)"
         }
@@ -944,7 +954,7 @@ if ($hNE1 -ne [IntPtr]::Zero) {
     }
 }
 
-# NE-02: MergeParent - virtual handle has 2 subkeys (VirtSubD_NT, VirtSubE_NT), merged has 4+
+# NE-02: MergeParent - merged handle should report all subkeys (VirtSubD_NT, VirtSubE_NT + real)
 $hNE2 = NtOpen $mpPath
 if ($hNE2 -ne [IntPtr]::Zero) {
     $fi2 = QueryKeyFull $hNE2
@@ -953,9 +963,9 @@ if ($hNE2 -ne [IntPtr]::Zero) {
         $reportedSubs = $fi2.SubKeys
         Log "  [NE-02] NtQueryKey(MergeParent).SubKeys = $reportedSubs  (merged should be >=4)"
         if ($reportedSubs -ge 4) {
-            Pass "NE-02" "NtQueryKey: MergeParent SubKeys=$reportedSubs >= 4 (correct merged count)"
+            Pass "NE-02" "NtQueryKey: MergeParent SubKeys=$reportedSubs >= 4 (merged count correct)"
         } elseif ($reportedSubs -le 2) {
-            Fail "NE-02" "[KNOWN BUG] NtQueryKey: MergeParent.SubKeys=$reportedSubs (virtual-only, not merged >=4)"
+            Fail "NE-02" "NtQueryKey: MergeParent.SubKeys=$reportedSubs < 4 (merged count wrong)"
         } else {
             Fail "NE-02" "NtQueryKey: MergeParent.SubKeys=$reportedSubs (partial, expected >=4)"
         }
@@ -1054,7 +1064,7 @@ if ($hDVV -ne [IntPtr]::Zero) {
     Skip "NF-02b" "Skipped"
 }
 
-# NF-03: [KNOWN BUG] Delete a value that exists only in real (via CoW handle)
+# NF-03: NtDeleteValueKey on a value that exists only in real (via CoW handle)
 $hCoWDel = (NtCreate $realSeedPath)[0]
 if ($hCoWDel -ne [IntPtr]::Zero) {
     $stDelReal = DeleteValue $hCoWDel "RealDwordVal"
@@ -1071,14 +1081,14 @@ if ($hCoWDel -ne [IntPtr]::Zero) {
     }
     NtSafeClose $hCoWDel
 
-    # NF-03b: [KNOWN BUG] After close+reopen, RealDwordVal reappears from real
+    # NF-03b: After close+reopen, tombstone ensures RealDwordVal stays deleted
     $hReopenDel = NtOpen $realSeedPath
     if ($hReopenDel -ne [IntPtr]::Zero) {
         $reapp = QueryValue $hReopenDel "RealDwordVal"
         if ($null -eq $reapp) {
             Pass "NF-03b" "NtDeleteValueKey real-only: stays deleted on re-open (tombstone works)"
         } else {
-            Fail "NF-03b" "[KNOWN BUG] NtDeleteValueKey real-only: value REAPPEARS on re-open (no registry tombstone)"
+            Fail "NF-03b" "NtDeleteValueKey real-only: value reappears on re-open (tombstone broken)"
         }
         NtSafeClose $hReopenDel
     } else {
@@ -1089,7 +1099,7 @@ if ($hCoWDel -ne [IntPtr]::Zero) {
     Skip "NF-03b" "Skipped"
 }
 
-# NF-04: [KNOWN BUG] Delete a real-only KEY - key re-appears on re-open
+# NF-04: NtDeleteKey on a real-only key - tombstone prevents re-appearance on re-open
 $realOnlyKeyPath = "$NtBase\DeleteTarget"
 $hDelRK = NtOpen $realOnlyKeyPath
 if ($hDelRK -ne [IntPtr]::Zero) {
@@ -1101,7 +1111,7 @@ if ($hDelRK -ne [IntPtr]::Zero) {
         if ($hCheckRK -eq [IntPtr]::Zero) {
             Pass "NF-04" "NtDeleteKey real-only key: gone on immediate re-open"
         } else {
-            Fail "NF-04" "[KNOWN BUG] NtDeleteKey real-only key: REAPPEARS immediately (no tombstone)"
+            Fail "NF-04" "NtDeleteKey real-only key: still visible after delete (tombstone broken)"
             NtSafeClose $hCheckRK
         }
     } else {
@@ -1112,22 +1122,23 @@ if ($hDelRK -ne [IntPtr]::Zero) {
 }
 
 # ─── SECTION NG: NtQueryMultipleValueKey ─────────────────────────────────────
-Section "NG" "NtQueryMultipleValueKey - All-or-Nothing Fallback"
-Log "  NOTE: NtQueryMultipleValueKey is all-or-nothing."
-Log "  If ANY requested value is missing from the virtual handle, the hook"
-Log "  falls back to the real handle for ALL values, losing virtual overrides."
-Log "  A mixed query (some virt-overridden + some real-only) cannot be"
-Log "  satisfied correctly with the current all-or-nothing implementation."
-Log ""
+Section "NG" "NtQueryMultipleValueKey - Per-Value Merge"
+# Log "  NtQueryMultipleValueKey uses per-value fallback merge (fixed)."
+# Log "  For each requested value: virtual handle is tried first; if NOT_FOUND"
+# Log "  on virtual and value is not tombstoned, the real handle is consulted."
+# Log "  A mixed query (some virt-overridden + some real-only) is now handled"
+# Log "  correctly: virtual overrides are preserved for overridden values while"
+# Log "  real-only values are served from the real handle."
+# Log ""
 
 # Create a fresh test key with known virtual values, then query via NtQueryMultipleValueKey
 $mqPath = "$NtBase\ShadowKey"
 $hMQ = NtOpen $mqPath
 if ($hMQ -ne [IntPtr]::Zero) {
-    # We want to query: ShadowedVal (virt override) and RealOnlyVal (real only)
-    # With correct per-value merge: ShadowedVal = VIRT_SHADOW_OVERRIDE, RealOnlyVal = REAL_ONLY_VALUE
-    # With all-or-nothing fallback: if virt handle missing RealOnlyVal, entire query falls to real
-    #   → ShadowedVal = REAL_SHADOW_ORIGINAL (wrong!), RealOnlyVal = REAL_ONLY_VALUE
+    # Query: ShadowedVal (virt override) and RealOnlyVal (real only)
+    # Expected with per-value merge (fixed):
+    #   ShadowedVal = VIRT_SHADOW_OVERRIDE  (served from virtual handle)
+    #   RealOnlyVal = REAL_ONLY_VALUE        (served from real handle)
 
     # Build UNICODE_STRING structs for the two value names
     $name1 = "ShadowedVal"
@@ -1138,14 +1149,22 @@ if ($hMQ -ne [IntPtr]::Zero) {
 
     try {
         $entries = [KEY_VALUE_ENTRY[]]::new(2)
-        $entries[0].ValueName  = $usPtr1
-        $entries[0].DataLength = 0
-        $entries[0].DataOffset = 0
-        $entries[0].Type       = 0
-        $entries[1].ValueName  = $usPtr2
-        $entries[1].DataLength = 0
-        $entries[1].DataOffset = 0
-        $entries[1].Type       = 0
+        
+        # FIX: Create local struct instances, populate them, THEN assign to the array
+        # This bypasses the PowerShell struct-in-array mutation bug.
+        $entry0 = [KEY_VALUE_ENTRY]::new()
+        $entry0.ValueName  = $usPtr1
+        $entry0.DataLength = 0
+        $entry0.DataOffset = 0
+        $entry0.Type       = 0
+        $entries[0] = $entry0
+
+        $entry1 = [KEY_VALUE_ENTRY]::new()
+        $entry1.ValueName  = $usPtr2
+        $entry1.DataLength = 0
+        $entry1.DataOffset = 0
+        $entry1.Type       = 0
+        $entries[1] = $entry1
 
         $bufLen = [uint32]512
         $valBuf = [System.Runtime.InteropServices.Marshal]::AllocHGlobal([int]$bufLen)
@@ -1172,9 +1191,9 @@ if ($hMQ -ne [IntPtr]::Zero) {
             Log "          RealOnlyVal = '$str2' (should be 'REAL_ONLY_VALUE')"
 
             if ($str1 -eq "VIRT_SHADOW_OVERRIDE") {
-                Pass "NG-01" "NtQueryMultipleValueKey: ShadowedVal returned virtual override value"
+                Pass "NG-01" "NtQueryMultipleValueKey: ShadowedVal returned virtual override value (per-value merge correct)"
             } else {
-                Fail "NG-01" "[KNOWN BUG] NtQueryMultipleValueKey: ShadowedVal='$str1' (got real, not virtual - all-or-nothing fallback kicked in)"
+                Fail "NG-01" "NtQueryMultipleValueKey: ShadowedVal='$str1' (expected VIRT_SHADOW_OVERRIDE - per-value merge failed)"
             }
 
             if ($str2 -eq "REAL_ONLY_VALUE") {
@@ -1363,10 +1382,10 @@ if ($hFlush -ne [IntPtr]::Zero) {
 
 # ─── SECTION NK: HKCU _Classes (per-user HKCR backing hive) ─────────────────
 Section "NK" "HKCU\\..._Classes Hive (per-user HKCR backing)"
-Log "  NOTE: HKCR writes go to \Registry\User\<SID>_Classes at NT level."
-Log "  LogicalToVirtual must route <SID>_Classes to HKEY_USERS (catch-all),"
-Log "  NOT to HKEY_CURRENT_USER (SID match with component-boundary check)."
-Log ""
+# Log "  NOTE: HKCR writes go to \Registry\User\<SID>_Classes at NT level."
+# Log "  LogicalToVirtual must route <SID>_Classes to HKEY_USERS (catch-all),"
+# Log "  NOT to HKEY_CURRENT_USER (SID match with component-boundary check)."
+# Log ""
 
 $classPath = "\Registry\User\$sid`_Classes\VirtRegTest_Classes_2026"
 $hClass = (NtCreate $classPath)[0]
