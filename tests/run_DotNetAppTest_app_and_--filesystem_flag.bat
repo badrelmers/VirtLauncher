@@ -15,9 +15,7 @@ if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
 rmdir /Q /S c:\virtl 2>nul
 
 echo virtual store: C:\virtl
-VirtLauncher64.exe -r -f C:\virtl -e %~dp0DotNetAppTest
-@rem VirtLauncher64.exe -r -f C:\virtl -e powershell
-@rem VirtLauncher64.exe  -f C:\virtl -e powershell
+VirtLauncher64.exe -r -f C:\virtl -e %~dp0\_bin\DotNetAppTest
 
 @rem this will not run
 if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
