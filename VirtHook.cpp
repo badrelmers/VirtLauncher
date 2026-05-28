@@ -2582,7 +2582,29 @@ static NTSTATUS DoVirtOpen(
             // A new subkey was created: invalidate all parent-handle enum caches
             // so the next NtEnumerateKey on any parent sees this new entry.
             InvalidateAllSubkeyCaches();
-            VL_DBG(L"DoVirtOpen: CREATE OK hVirt=%p hReal=%p", hVirt, hReal);
+
+            // FIX NA-04: CoW disposition fixup.
+            //
+            // Real_NtCreateKey above always operates on the *virtual* store path,
+            // so it always sets *Disposition = REG_CREATED_NEW_KEY (1) -- the
+            // virtual placeholder is indeed brand-new.  But from the sandboxed
+            // application's perspective the key already existed in the real
+            // registry; leaking REG_CREATED_NEW_KEY would cause apps that branch
+            // on disposition (first-run init, value seeding, installers, etc.) to
+            // behave incorrectly inside the sandbox.
+            //
+            // Rule: if hReal was opened successfully (real key pre-existed), the
+            // caller must see REG_OPENED_EXISTING_KEY (2), matching what a normal
+            // non-virtualised NtCreateKey call would have returned.
+            //
+            // Pure-virtual keys (hReal == NULL, no real counterpart) keep the
+            // disposition that Real_NtCreateKey set -- 1 for new, 2 for a second
+            // NtCreateKey call on the same virtual-only key.
+            if (Disposition && hReal != NULL)
+                *Disposition = 2UL; // REG_OPENED_EXISTING_KEY
+
+            VL_DBG(L"DoVirtOpen: CREATE OK hVirt=%p hReal=%p disp=%u",
+                   hVirt, hReal, Disposition ? *Disposition : 0u);
             return VL_STATUS_SUCCESS;
         }
         VL_DBG(L"DoVirtOpen: CREATE FAILED st=0x%08X", (ULONG)st);
