@@ -2512,7 +2512,19 @@ static NTSTATUS DoVirtOpen(
         OrigOA->Attributes | OBJ_CASE_INSENSITIVE);
 
     if (isCreate) {
-        EnsureVirtualPath(virtPath);
+        // FIX NA-01: Ensure only the PARENT ancestors exist in the virtual
+        // store, not the leaf key itself.  EnsureVirtualPath walks every
+        // segment of the path including the final one; calling it on the
+        // full virtPath creates the leaf before Real_NtCreateKey runs,
+        // causing Real_NtCreateKey to report Disposition=REG_OPENED_EXISTING
+        // (2) instead of REG_CREATED_NEW_KEY (1) for a brand-new key.
+        // By passing only the parent path, Real_NtCreateKey creates the leaf
+        // fresh and sets Disposition correctly.
+        {
+            size_t lastSlash = virtPath.rfind(L'\\');
+            if (lastSlash != std::wstring::npos)
+                EnsureVirtualPath(virtPath.substr(0, lastSlash));
+        }
         VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
         VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus,
             OrigOA->Attributes | OBJ_CASE_INSENSITIVE);
@@ -4185,6 +4197,112 @@ static NTSTATUS NTAPI Hook_NtQueryValueKey(
                 Length, ResultLength);
 }
 
+// ---- Per-value result record for PerValueMergeQuery --------------------
+// Defined at file scope: MSVC 2010 (C++03) does not allow local types to be
+// used as std::vector<> template arguments.
+struct VL_PerValueResult {
+    ULONG type;
+    ULONG dataLen;
+    ULONG offsetInPacked;
+};
+
+// ---- Per-value merge helper for NtQueryMultipleValueKey ----------------
+//
+// NtQueryMultipleValueKey is all-or-nothing: if any requested value is
+// absent from the target key the entire call fails with STATUS_OBJECT_NAME_
+// NOT_FOUND.  When we have both a virtual and a real handle, some values
+// may live only in the virtual store (overrides / CoW'd) while others exist
+// only in the real key.  We must merge per-value:
+//
+//   For each entry: try virtual first, fall back to real if not found.
+//
+// We query each value individually with NtQueryValueKey (KeyValuePartial
+// Information), then pack all raw data bytes into ValueBuffer and update
+// DataOffset / DataLength / Type in each KEY_VALUE_ENTRY.
+//
+// FIX NG-01: replaces the previous "try virtual whole, fallback real whole"
+// logic that returned un-overridden real data whenever the virtual key was
+// missing even one of the requested values.
+static NTSTATUS PerValueMergeQuery(
+    HANDLE hVirt, HANDLE hReal,
+    PVL_KEY_VALUE_ENTRY ValueEntries, ULONG EntryCount,
+    PVOID ValueBuffer, PULONG BufferLength, PULONG RequiredBufferLength)
+{
+    if (!EntryCount || !ValueEntries || !BufferLength)
+        return VL_STATUS_INFO_LENGTH_MISMATCH; // defensive; callers always pass valid args
+
+    // Scratch buffer for per-value KeyValuePartialInformation query.
+    // The partial-info header is 12 bytes; 64 KB covers almost all values.
+    const ULONG kScratchMax = 65536u;
+    std::vector<BYTE> scratch(kScratchMax);
+
+    // Accumulate per-value raw data in a temporary heap buffer first so we
+    // can compute the required size before touching the caller's ValueBuffer.
+    std::vector<BYTE> packed;
+    packed.reserve(*BufferLength > 0 ? *BufferLength : 256u);
+
+    // C++03: VL_PerValueResult is declared at file scope above.
+    std::vector<VL_PerValueResult> results(EntryCount);
+
+    for (ULONG i = 0; i < EntryCount; i++) {
+        // C++03: no brace-initializer; zero the struct explicitly.
+        VL_PerValueResult zero; zero.type = 0; zero.dataLen = 0; zero.offsetInPacked = 0;
+        results[i] = zero;
+
+        PVL_KEY_VALUE_ENTRY ve = &ValueEntries[i];
+        if (!ve->ValueName) continue; // leave zeroed result; DataLength=0 is valid
+
+        PVL_UNICODE_STRING vn = reinterpret_cast<PVL_UNICODE_STRING>(ve->ValueName);
+        ULONG resLen = 0;
+
+        // Try virtual first (covers CoW'd / overridden values).
+        NTSTATUS st = VL_STATUS_OBJECT_NAME_NOT_FOUND;
+        if (hVirt)
+            st = Real_NtQueryValueKey(hVirt, vn,
+                     VlKeyValuePartialInformation, &scratch[0], kScratchMax, &resLen);
+
+        // Fall back to real if not found in virtual.
+        if (!NT_SUCCESS(st) && hReal) {
+            resLen = 0;
+            st = Real_NtQueryValueKey(hReal, vn,
+                     VlKeyValuePartialInformation, &scratch[0], kScratchMax, &resLen);
+        }
+        if (!NT_SUCCESS(st)) return VL_STATUS_OBJECT_NAME_NOT_FOUND;
+
+        VL_KEY_VALUE_PARTIAL_INFORMATION* kvi =
+            reinterpret_cast<VL_KEY_VALUE_PARTIAL_INFORMATION*>(&scratch[0]);
+
+        ULONG offsetInPacked = static_cast<ULONG>(packed.size());
+        packed.resize(offsetInPacked + kvi->DataLength);
+        if (kvi->DataLength > 0)
+            memcpy(&packed[offsetInPacked], kvi->Data, kvi->DataLength);
+
+        // C++03: assign members individually, no brace-initializer.
+        results[i].type          = kvi->Type;
+        results[i].dataLen       = kvi->DataLength;
+        results[i].offsetInPacked = offsetInPacked;
+    }
+
+    ULONG required = static_cast<ULONG>(packed.size());
+    if (RequiredBufferLength) *RequiredBufferLength = required;
+
+    if (required > *BufferLength) {
+        *BufferLength = required;
+        return VL_STATUS_BUFFER_OVERFLOW;
+    }
+
+    // Copy packed data into the caller's buffer and patch each entry.
+    if (required > 0)
+        memcpy(ValueBuffer, &packed[0], required);
+    for (ULONG i = 0; i < EntryCount; i++) {
+        ValueEntries[i].Type       = results[i].type;
+        ValueEntries[i].DataLength = results[i].dataLen;
+        ValueEntries[i].DataOffset = results[i].offsetInPacked;
+    }
+    *BufferLength = required;
+    return VL_STATUS_SUCCESS;
+}
+
 // ---- NtQueryMultipleValueKey -- route to virtual handle ----
 static NTSTATUS NTAPI Hook_NtQueryMultipleValueKey(
     HANDLE KeyHandle, PVL_KEY_VALUE_ENTRY ValueEntries,
@@ -4204,31 +4322,25 @@ static NTSTATUS NTAPI Hook_NtQueryMultipleValueKey(
                 VL_UNICODE_STRING vus; MakeUStr(&vus, virtPath);
                 VL_OBJECT_ATTRIBUTES voa; MakeOA(&voa, &vus, OBJ_CASE_INSENSITIVE);
                 if (NT_SUCCESS(Real_NtOpenKey(&hVirtCheck, KEY_QUERY_VALUE, &voa))) {
-                    // For each requested value: if a live virtual value exists
-                    // return it; if tombstoned return NOT_FOUND for that entry.
-                    // If not in virtual at all, fall through to real below.
-                    NTSTATUS stAll = VL_STATUS_SUCCESS;
+                    // For each requested value: if tombstoned in virtual,
+                    // block the whole call.  Otherwise use per-value merge.
                     for (ULONG i = 0; i < EntryCount; ++i) {
                         PVL_KEY_VALUE_ENTRY ve = &ValueEntries[i];
                         if (!ve->ValueName) continue;
                         if (RegValueIsDeleted(hVirtCheck, ve->ValueName)) {
-                            stAll = VL_STATUS_OBJECT_NAME_NOT_FOUND;
+                            Real_NtClose(hVirtCheck);
+                            return VL_STATUS_OBJECT_NAME_NOT_FOUND;
                         }
-                        // Live virtual values are served by the Real call below
-                        // on the virtual handle, so we don't need to do anything
-                        // extra here.
                     }
-                    if (stAll == VL_STATUS_OBJECT_NAME_NOT_FOUND) {
-                        Real_NtClose(hVirtCheck);
-                        return VL_STATUS_OBJECT_NAME_NOT_FOUND;
-                    }
-                    // Try virtual store first, fall back to real if needed.
-                    NTSTATUS st = Real_NtQueryMultipleValueKey(hVirtCheck, ValueEntries,
-                                      EntryCount, ValueBuffer, BufferLength,
-                                      RequiredBufferLength);
+                    // FIX NG-01 (untracked path): use per-value merge so that
+                    // virtual overrides are returned even when the virtual key
+                    // does not contain ALL requested values.
+                    NTSTATUS st = PerValueMergeQuery(hVirtCheck, KeyHandle,
+                                      ValueEntries, EntryCount,
+                                      ValueBuffer, BufferLength, RequiredBufferLength);
                     Real_NtClose(hVirtCheck);
                     if (NT_SUCCESS(st)) return st;
-                    // Fall through to real API.
+                    // Fall through to real API on unexpected failure.
                 }
             }
         }
@@ -4240,17 +4352,23 @@ static NTSTATUS NTAPI Hook_NtQueryMultipleValueKey(
     VL_DBG(L"Hook_NtQueryMultipleValueKey: entryCount=%u handle=%p virt=%p real=%p",
            EntryCount, KeyHandle, e.hVirt, e.hReal);
 
-    // Try virtual first; fall back to real for entries not found
+    // FIX NG-01 (tracked handle): use per-value merge instead of trying the
+    // virtual key in bulk and falling back to real in bulk.  The old approach
+    // returned un-overridden real data whenever any one value was absent from
+    // the virtual key (NtQueryMultipleValueKey is all-or-nothing per call).
+    if (e.hVirt && e.hReal) {
+        VL_DBG(L"Hook_NtQueryMultipleValueKey: per-value merge virt=%p real=%p",
+               e.hVirt, e.hReal);
+        return PerValueMergeQuery(e.hVirt, e.hReal,
+                                  ValueEntries, EntryCount,
+                                  ValueBuffer, BufferLength, RequiredBufferLength);
+    }
+
+    // Simple path: only one of hVirt/hReal is available.
     HANDLE useH = e.hVirt ? e.hVirt : (e.hReal ? e.hReal : KeyHandle);
     NTSTATUS st = Real_NtQueryMultipleValueKey(useH, ValueEntries, EntryCount,
                                                 ValueBuffer, BufferLength,
                                                 RequiredBufferLength);
-    if (!NT_SUCCESS(st) && e.hReal && e.hReal != useH) {
-        VL_DBG(L"Hook_NtQueryMultipleValueKey: virtual failed, trying real");
-        st = Real_NtQueryMultipleValueKey(e.hReal, ValueEntries, EntryCount,
-                                           ValueBuffer, BufferLength,
-                                           RequiredBufferLength);
-    }
     return st;
 }
 
