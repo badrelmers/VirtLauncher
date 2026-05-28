@@ -39,8 +39,14 @@
 
 .NOTES
     Areas probed (all fixed unless noted):
-      - NtCreateKey disposition: EnsureVirtualPath no longer pre-creates the leaf
-        key, so REG_CREATED_NEW_KEY (1) is returned correctly for new virtual keys.
+      - NtCreateKey disposition (two cases, both fixed):
+        * Pure-virtual new key (no real counterpart): EnsureVirtualPath is called
+          on the parent path only so the leaf does not exist when Real_NtCreateKey
+          runs → REG_CREATED_NEW_KEY (1) returned correctly (NA-01).
+        * CoW over a pre-existing real key: disposition is overridden to
+          REG_OPENED_EXISTING_KEY (2) after the real handle is confirmed open,
+          so the app sees the key as already existing rather than newly created
+          (NA-04).
       - NtQueryKey SubKeys/Values: Hook_NtQueryKey merges counts from both the
         virtual and real handles via set-union deduplication.
       - NtQueryMultipleValueKey: per-value fallback merge implemented. Each value
@@ -947,7 +953,7 @@ if ($hNE1 -ne [IntPtr]::Zero) {
         } elseif ($reportedVals -eq 2) {
             Fail "NE-01" "NtQueryKey: ShadowKey.Values=$reportedVals < 4 (merged count wrong)"
         } else {
-            Fail "NE-01" "NtQueryKey: ShadowKey.Values=$reportedVals (unexpected, expected 2 or 4)"
+            Fail "NE-01" "NtQueryKey: ShadowKey.Values=$reportedVals (unexpected partial count; expected >=4)"
         }
     } else {
         Fail "NE-01" "QueryKeyFull on ShadowKey FAILED"
@@ -986,8 +992,9 @@ if ($hNE3 -ne [IntPtr]::Zero) {
         $namePtr = [IntPtr]($buf.ToInt64() + 4)
         $keyName = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($namePtr, $nameLen / 2)
         Log "  [NE-03] NtQueryKey(SeedKey, KeyNameInformation) = '$keyName'"
-        # The name returned should be the VIRTUAL path (since we opened the virtual handle)
-        # A correct hook returns the virtual store path from the virtual handle's own QueryKey
+        # The hook passes NtQueryKey through to the virtual handle, so the name
+        # is the virtual store path. The test also accepts the logical path in case
+        # a future implementation translates it back; either correctly identifies the key.
         $isVirtPath   = $keyName -imatch [System.Text.RegularExpressions.Regex]::Escape("VirtRegTest_Store_2026")
         $isLogicPath  = $keyName -imatch [System.Text.RegularExpressions.Regex]::Escape("VirtRegTestReal_2026")
         if ($isVirtPath) {
@@ -1131,7 +1138,8 @@ Section "NG" "NtQueryMultipleValueKey - Per-Value Merge"
 # Log "  real-only values are served from the real handle."
 # Log ""
 
-# Create a fresh test key with known virtual values, then query via NtQueryMultipleValueKey
+# ShadowKey was populated in Section ND; open it and query two of its values
+# via NtQueryMultipleValueKey to verify the per-value merge path.
 $mqPath = "$NtBase\ShadowKey"
 $hMQ = NtOpen $mqPath
 if ($hMQ -ne [IntPtr]::Zero) {

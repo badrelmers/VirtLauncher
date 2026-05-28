@@ -8,7 +8,7 @@ REM fltmc >nul 2>&1 || ( color 4F & echo. & echo RUNME AS ADMIN & echo. & pause 
 mode con | findstr "32766" >nul|| mode con lines=32766 COLS=120 &REM prevent "mode con" from clearing the console
 
 ::_______________________________________________
-set VLAUNCHER_VERBOSE=true
+rem set VLAUNCHER_VERBOSE=true
 set VLAUNCHER_DEBUG=true
 
 
@@ -48,9 +48,17 @@ reg add "%rbase%\DeleteTarget" /f >nul
 
 VirtLauncher64.exe -r "%virt_store%" --exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0_test15_registry_virtualisation_3_2.ps1"
 
-rem VirtLauncher64.exe -r "%virt_store%" --exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0_test15_registry_virtualisation_3_2_org.ps1"
-
-
+echo.
+echo.
+if %errorlevel% EQU 0 (
+    echo  [OK] ALL TESTS PASSED SUCCESSFULLY
+    color 2F
+) else (
+    echo  [X] SOME TESTS FAILED
+    color 4F
+)
+echo.
+echo.
 
 reg delete "%virt_store%" /f >nul 2>nul
 reg delete "%rbase%" /f >nul 2>nul
