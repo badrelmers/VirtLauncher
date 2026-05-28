@@ -353,15 +353,31 @@ typedef struct _VL_KEY_VALUE_PARTIAL_INFORMATION {
     ULONG DataLength;
     UCHAR Data[1];
 } VL_KEY_VALUE_PARTIAL_INFORMATION;
+#pragma pack(pop)
 
 // KEY_VALUE_ENTRY for NtQueryMultipleValueKey
+//
+// MUST be declared at natural alignment -- NOT inside #pragma pack(4).
+//
+// On x64 the layout is:
+//   offset  0 : ValueName  (pointer, 8 bytes, align 8)
+//   offset  8 : DataLength (ULONG,   4 bytes)
+//   offset 12 : DataOffset (ULONG,   4 bytes)
+//   offset 16 : Type       (ULONG,   4 bytes)
+//   offset 20 : [4 bytes tail padding to keep align-8 for arrays]
+//   sizeof  = 24 bytes per element
+//
+// Under pack(4) the tail padding is suppressed → sizeof = 20.
+// The kernel and every caller (.NET Marshal, etc.) use the 24-byte stride,
+// so PerValueMergeQuery and Hook_NtQueryMultipleValueKey would read
+// ValueEntries[1].ValueName 4 bytes early, landing on garbage, and
+// Real_NtQueryValueKey would fault → STATUS_OBJECT_NAME_NOT_FOUND (NG-01).
 typedef struct _VL_KEY_VALUE_ENTRY {
     PVL_UNICODE_STRING ValueName;
     ULONG              DataLength;
     ULONG              DataOffset;
     ULONG              Type;
 } VL_KEY_VALUE_ENTRY, *PVL_KEY_VALUE_ENTRY;
-#pragma pack(pop)
 
 // Directory enumeration structures (natural alignment, canonical field names)
 struct VL_FILE_DIRECTORY_INFORMATION {
