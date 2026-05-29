@@ -920,4 +920,5 @@ if !FAIL! EQU 0 (
 echo.
 if exist "%VIRTL_BASE%" rmdir /Q /S "%VIRTL_BASE%"
 if exist "%testdir%" rmdir /Q /S "%testdir%"
-pause
+if not "%DoNotPause%"=="yes" pause
+exit /b !FAIL!

@@ -47,10 +47,10 @@ REM --- Section NF-04: Key Deletion/Tombstone Target ---
 reg add "%rbase%\DeleteTarget" /f >nul
 
 VirtLauncher64.exe -r "%virt_store%" --exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0_test15_registry_virtualisation_3_NT_level_2.ps1"
-
+set lastexcode=%errorlevel%
 echo.
 echo.
-if %errorlevel% EQU 0 (
+if %lastexcode% EQU 0 (
     echo  [OK] ALL TESTS PASSED SUCCESSFULLY
     color 2F
 ) else (
@@ -62,4 +62,5 @@ echo.
 
 reg delete "%virt_store%" /f >nul 2>nul
 reg delete "%rbase%" /f >nul 2>nul
-pause
+if not "%DoNotPause%"=="yes" pause
+exit /b %lastexcode%

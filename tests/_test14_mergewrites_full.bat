@@ -1363,10 +1363,11 @@ if %FAIL% EQU 0 (
     echo  *** ALL TESTS PASSED ***
 ) else (
     color 4F
-    echo  *** %FAIL% TEST^(S^) FAILED ***
+    echo  *** %FAIL% TESTS FAILED ***
 )
 
 echo.
 if exist "%VL%" rmdir /Q /S "%VL%"
 if exist "%T%" rmdir /Q /S "%T%"
-pause
+if not "%DoNotPause%"=="yes" pause
+exit /b !FAIL!

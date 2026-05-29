@@ -1,15 +1,20 @@
 
+- Urgent tasks:                                                       
+
 ☐ bug: Hook_NtQueryInformationFile — class 21 (FileAllInformation) is not handled. It embeds a FILE_NAME_INFORMATION at a fixed offset of 96 bytes that would return a virtual-store volume-relative path. The existing class 9 code already applies ReverseApplyFsRedirect using the same pattern, so class 21 needs the exact same treatment. Class 48 (FileNormalizedNameInformation) has a different format (device path, not volume-relative) so ReverseApplyFsRedirect can't handle it without deeper changes — I'll note it but leave it alone. https://claude.ai/chat/4a7f5ba9-bcdd-4314-a8e7-55395551d219   badr2351
 
 ☐ in the config ini file change "ini =" because folder may contain = so use | or =|    see: size_t eq = line.find(L'=');
 
 ☐ max path 255
-  ☐ allow write to paths longuer than 255
-  ☐ or add to the doc and help a reminder to users saying: to keep the virtual store short to prevent 255 charachter limit in old os where 32k is not supported so echo and cmd do not have problems inside the virtual world, for example  _test9_exclude_and_filesystem_suite.bat gave multiple errors when virtual folder is inside this long path "F:\_bin\_src\_launcher_virtualization\__VirtLauncher\_testsss\files\final2_fix_rename - Copy - Copyffffffffffffffffffffffffffffffffffffffffffffff\build"
+    ☐ allow write to paths longuer than 255
+    ☐ or add to the doc and help a reminder to users saying: to keep the virtual store short to prevent 255 charachter limit in old os where 32k is not supported so echo and cmd do not have problems inside the virtual world, for example  _test9_exclude_and_filesystem_suite.bat gave multiple errors when virtual folder is inside this long path "F:\_bin\_src\_launcher_virtualization\__VirtLauncher\_testsss\files\final2_fix_rename - Copy - Copyffffffffffffffffffffffffffffffffffffffffffffff\build"
+   
+☐ firefox is not sandboxed , should i disable firefox sandbox for my sandbox to work? or is there a better solution to force it run inside my sandbox without disabling firefox sandbox?
+
 
 ☐ should i use the more low level function than CreateProcessW? i mean should i inject the ntdll equivalent of CreateProcessW or my current method is sufficient? what if an app use ntdll function to start a child the child will not be injected in that case
 
-________________________________________________
+- Low priority tasks:                                                 
 
 ☐ @low add mingw compile https://github.com/microsoft/Detours/blob/f4c0fc91b8a93fc09ccbbd6e4277efe6872784fe/src/detours.h#L53
 
@@ -19,11 +24,7 @@ ________________________________________________
 
 ☐ @low in sandboxie i cannot rename a reg name, it says regedit.exe: SBIE2205 Service not implemented:  NtRenameKey . why he did not implemented it? does it improve speed? investigate it
 
-________________________________________________
-
-
-
-
+- Notes:                                                              
 
 Limitations and Potential Gaps:
   ☐ While this works for most cases, it's not exhaustive: Some apps might use undocumented or alternative NT APIs (e.g., via Zw* variants or direct kernel calls), but these are uncommon in user-mode apps. should i hook zw functions too or nt is sufficient? this tool hook both https://github.com/SegaraRai/PathRedirector/blob/8b22c42e8ec424d61ef7121019ebae348e4d9633/Hook.cpp#L24
@@ -35,16 +36,13 @@ bugs i will not solve:
     the test for this bug is in _test13_mergewrites_full.bat section 11.4 and _test12_merged_writes.bat section 3.2
     ☐ TODO: fix it, make it an optional option using a flag
 
-  _____________________
-
   ✘ when i check read only on a folder and i open the same folder inside my virtlauncher using tablacus i do not see the read only, this happen in sandboxie too and i will not fix it @cancelled(26-05-18 19:53)
-  ______________________
 
   ✔ strange bug: open tablacus virtualised go to c: create a folder from the virtualised tablacus it will be named New folder  do not change this name, go to the real c:\ create a folder it will be named automcatically too to New folder ,now change its name,  you will see that tablaus folder changed automatically to the one we created in the real c: !!!!!!!!!!!!!!! . update: this is not a bug , it s just a visual glitch in tablacus, if you refresh the virtual folder you will see that the New folder still exist @done(26-05-18 19:52)
 
 
-
-＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿
+- Done:                                                               
+＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿
 Archive:
   ✔ powershell crash @done(26-05-29 01:42) 
   ✔ NtQueryKey: Returns virtual key metadata (subkey count, value count from virtual only, not merged count - possible bug). NtQueryKey reports virtual-only subkey/value counts, not merged. @done(26-05-29 01:42) 
@@ -62,3 +60,7 @@ Archive:
   ✔ when i run 32 from 64 it fails silently it must tell me about failuers @done(26-05-18 19:58) 
   ✔ add the 32 from 64 code of detours wiki https://github.com/microsoft/detours/wiki/OverviewHelpers @done(26-05-18 19:58) 
   ✔ duplicate a file in tabalusux with -r -f do not appear in tablacus but it exist in the virt store @done(26-05-18 19:44) 
+  
+  
+  ___________________________
+  this todo is best viewed with cudatext and its todo lexer + Plain_tasks plugin

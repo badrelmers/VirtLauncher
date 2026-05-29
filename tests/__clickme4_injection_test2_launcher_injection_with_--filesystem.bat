@@ -90,8 +90,8 @@ if %FAIL_COUNT% equ 0 (
 )
 
 echo.
-pause
-exit /b
+if not "%DoNotPause%"=="yes" pause
+exit /b %FAIL_COUNT%
 
 :: -------------------------------------------------------------------------
 :: Helper function: :RunTest "Description" "Command" "ExpectedDLL" "ProcessName"

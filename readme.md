@@ -1,7 +1,7 @@
-# VirtLauncher - Application Virtualization Launcher
+# VirtLauncher - Virtualization Launcher
 Launches an application with a virtual file system and virtual registry by injecting VirtHook[32|64].dll.
 
-# Security
+# Security:
 is this a sandboxie alternative?
 NO! sandboxie have better security sandboxing, i never had in mind security when i made this tool, in fact even sandboxie cannot be used safely to run unsecure code, so this tool should not be used for secure sandboxing, this is just a babysitter not a criminal prison
 

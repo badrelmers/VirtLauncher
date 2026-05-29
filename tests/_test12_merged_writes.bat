@@ -2,16 +2,25 @@
 setlocal EnableDelayedExpansion
 CD /D "%~dp0"
 
+::_______________________________________________
+ @rem set VLAUNCHER_VERBOSE=true
+ set VLAUNCHER_DEBUG=true
+
+
+::_______________________________________________
 CD /D "..\build"
+color 2F
+
+:: Counters
+set /a PASS_COUNT=0
+set /a FAIL_COUNT=0
+
 :: --- Configuration ---
-set "VLAUNCHER_VERBOSE=0"
-set "VLAUNCHER_DEBUG=0"
 set "testdir=c:\test12_merged_writes"
 set "virthome=%CD%\VIRTL"
 set "virt_testdir=%virthome%\C\test12_merged_writes"
 set "OUT_LOG=%CD%\test_output.log"
 
-color 2F
 echo ========================================================
 echo VIRTLAUNCHER EXHAUSTIVE MERGED WRITES TEST SUITE
 echo ========================================================
@@ -30,20 +39,29 @@ goto :eof
 :Fail
     color 4F
     echo [FAIL] %~1
+    set /a FAIL_COUNT+=1
     echo.
 goto :eof
 
 :Pass
     @rem echo [PASS] %~1
     echo good
+    set /a PASS_COUNT+=1
 goto :eof
+
+
+
+
 
 :CheckOutputCount
     :: %1 = Expected Count, %2 = Search String
     for /f %%C in ('find /C /I "%~2" ^< "%OUT_LOG%" 2^>nul') do set "count=%%C"
     if "!count!" EQU "%~1" (
+        set /a PASS_COUNT+=1
+        echo good
         exit /b 0
     ) else (
+        set /a FAIL_COUNT+=1
         echo [FAIL] Expected "%~2" to appear %~1 times, but found !count! times.
         type "%OUT_LOG%"
         exit /b 1
@@ -55,6 +73,8 @@ goto :eof
         call :Fail "Missing expected file: %~1"
         exit /b 1
     )
+    echo good
+    set /a PASS_COUNT+=1
     exit /b 0
 goto :eof
 
@@ -63,6 +83,8 @@ goto :eof
         call :Fail "File should not exist but does: %~1"
         exit /b 1
     )
+    echo good
+    set /a PASS_COUNT+=1
     exit /b 0
 goto :eof
 
@@ -249,4 +271,28 @@ echo ========================================================
 if exist "%OUT_LOG%" del /F /Q "%OUT_LOG%"
 rmdir /Q /S "%virthome%"
 rmdir /Q /S "%testdir%"
-pause
+
+
+
+echo.
+echo ============================================================
+echo  TEST SUMMARY
+echo ============================================================
+echo  Passed : %PASS_COUNT%
+echo  Failed : %FAIL_COUNT%
+echo ============================================================
+
+if %FAIL_COUNT% equ 0 (
+    echo  [OK] ALL TESTS PASSED SUCCESSFULLY!
+    color 2F
+) else (
+    echo  [X] SOME TESTS FAILED!
+    color 4F
+)
+
+echo.
+if not "%DoNotPause%"=="yes" pause
+exit /b %FAIL_COUNT%
+
+
+

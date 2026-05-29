@@ -12,6 +12,11 @@ REM set VLAUNCHER_DEBUG=true
 
 ::_______________________________________________
 color 2F
+
+:: Counters
+set /a SUCCESS_COUNT=0
+set /a FAIL_COUNT=0
+
 cd ..\build
 echo C:\ccc=c:\vvv> redirectstest.ini
 if exist c:\vvv rmdir /Q /S c:\vvv
@@ -35,19 +40,16 @@ echo ______test hard link
 call :prepare
 VirtLauncher64.exe -c redirectstest.ini cmd /c "mklink /H c:\ccc\zzzV2 c:\ccc\zzzV" >nul
 call :check
-@rem pause
 
 echo ______test symlink
 call :prepare
 VirtLauncher64.exe -c redirectstest.ini cmd /c "mklink c:\ccc\zzzV2 c:\ccc\zzzV" >nul
 call :check
-@rem pause
 
 echo ______test symlink dir
 call :preparedir
 VirtLauncher64.exe -c redirectstest.ini cmd /c "mklink /D c:\ccc\dirV2 c:\ccc\dirV" >nul
 call :checkdir
-@rem pause
 
 echo ______test Junction
 call :preparedir
@@ -60,8 +62,17 @@ call :checkdir
 
 if exist c:\vvv rmdir /Q /S c:\vvv
 del redirectstest.ini
-pause
-exit /b
+
+if %FAIL_COUNT% equ 0 (
+    echo  ALL TESTS PASSED
+    color 2F
+) else (
+    echo  SOME TESTS FAILED
+    color 4F
+)
+
+if not "%DoNotPause%"=="yes" pause
+exit /b %FAIL_COUNT%
 
 :prepare
     if exist c:\vvv rmdir /Q /S c:\vvv
@@ -77,9 +88,11 @@ exit /b
 :check
     if exist c:\vvv\zzzV2 (
         echo GOOD 
+        set /a SUCCESS_COUNT+=1
     ) else (
         color 4F
         echo BAD!!!!!!!!!!
+        set /a FAIL_COUNT+=1
     )
 exit /b
 

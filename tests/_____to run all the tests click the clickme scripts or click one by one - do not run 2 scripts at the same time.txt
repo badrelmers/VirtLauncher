@@ -1,0 +1,1 @@
+_____to run all the tests click the clickme scripts or click one by one - do not run 2 scripts at the same time

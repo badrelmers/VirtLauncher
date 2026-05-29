@@ -112,13 +112,10 @@ echo  Failed : %FAIL_COUNT%
 echo ============================================================
 
 if %FAIL_COUNT% equ 0 (
-    echo  [OK] ALL TESTS PASSED SUCCESSFULLY, this cannot happen
+    echo  [OK] ALL TESTS PASSED SUCCESSFULLY
     color 2F
-) else if %FAIL_COUNT% equ 9 (
-    echo  [OK] 9 TESTS FAILED: this is expected
-    color 5F
 ) else (
-    echo  [X] this should not happen
+    echo  [X] SOME TESTS FAILED!
     color 4F
 )
 
@@ -126,8 +123,8 @@ if %FAIL_COUNT% equ 0 (
 echo.
 
 call :CLEANUP
-pause
-exit /b
+if not "%DoNotPause%"=="yes" pause
+exit /b %FAIL_COUNT%
 
 
 

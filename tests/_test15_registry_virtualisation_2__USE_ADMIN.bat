@@ -198,7 +198,7 @@ reg delete "%VIRT_ROOT%" /f >nul 2>&1
 reg delete "%REAL_HKCU%" /f >nul 2>&1
 reg delete "%REAL_HKLM%" /f >nul 2>&1
 
-pause
+if not "%DoNotPause%"=="yes" pause
 exit /b %FAIL_COUNT%
 
 

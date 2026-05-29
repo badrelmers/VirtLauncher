@@ -60,12 +60,15 @@ echo.
 echo.
 :: Threshold Check (2 seconds = 200 centiseconds)
 if %elapsed% lss 200 (
+    set extcode=0
     color 2F
     echo good: time spent is less than 2s
 ) else (
+    set extcode=1
     color 4F
     echo bad: time spent is greater than 2s
 )
 echo.
 echo.
-pause
+if not "%DoNotPause%"=="yes" pause
+exit /b %extcode%

@@ -119,8 +119,8 @@ if %FAIL_COUNT% equ 0 (
 )
 
 call :CLEANUP
-pause
-exit /b
+if not "%DoNotPause%"=="yes" pause
+exit /b %FAIL_COUNT%
 
 
 

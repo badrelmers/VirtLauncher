@@ -481,7 +481,8 @@ if !ERRORLEVEL! EQU 0 (
 echo ___________________
 set RPARSE_TMP=%TEMP%\vl_rparse_%RANDOM%.txt
 echo @echo off>"%TEST_DIR%\pl_s5_sympath.bat"
-echo dir /AL "%SRC_DIR%" 2^>nul ^| more ^>"%RPARSE_TMP%">>"%TEST_DIR%\pl_s5_sympath.bat"
+rem echo dir /AL "%SRC_DIR%" 2^>nul ^| more ^>"%RPARSE_TMP%">>"%TEST_DIR%\pl_s5_sympath.bat"
+echo dir /AL "%SRC_DIR%" 2^>nul ^>"%RPARSE_TMP%">>"%TEST_DIR%\pl_s5_sympath.bat"
 
 %LAUNCHER% -r "%VIRT_STORE%" -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s5_sympath.bat"
 if exist "%RPARSE_TMP%" (
@@ -624,7 +625,8 @@ if !ERRORLEVEL! EQU 0 (
 echo ___________________
 set JRPARSE_TMP=%TEMP%\vl_jrparse_%RANDOM%.txt
 echo @echo off>"%TEST_DIR%\pl_s6_juncpath.bat"
-echo dir /AL "%SRC_DIR%" 2^>nul ^| more ^>"%JRPARSE_TMP%">>"%TEST_DIR%\pl_s6_juncpath.bat"
+rem echo dir /AL "%SRC_DIR%" 2^>nul ^| more ^>"%JRPARSE_TMP%">>"%TEST_DIR%\pl_s6_juncpath.bat"
+echo dir /AL "%SRC_DIR%" 2^>nul ^>"%JRPARSE_TMP%">>"%TEST_DIR%\pl_s6_juncpath.bat"
 
 %LAUNCHER% -r "%VIRT_STORE%" -c "%INI_FILE%" cmd /c "%TEST_DIR%\pl_s6_juncpath.bat"
 if exist "%JRPARSE_TMP%" (
@@ -967,7 +969,7 @@ if %FAIL_COUNT% equ 0 (
 )
 
 echo.
-pause
+if not "%DoNotPause%"=="yes" pause
 exit /b %FAIL_COUNT%
 
 

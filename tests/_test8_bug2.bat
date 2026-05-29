@@ -36,7 +36,9 @@ echo.
 
 echo ______Bug2: stale read-only dir handle misses virtual file
 VirtLauncher64.exe -f -e "%~dp0_bin\test_bug2.exe" "%BUG2_REALDIR%" >nul
-if %ERRORLEVEL% EQU 0 (
+
+set lastexcode=%ERRORLEVEL%
+if %lastexcode% EQU 0 (
     echo good
 ) else (
     color 4F & echo bad
@@ -47,5 +49,5 @@ rmdir /S /Q "%BUG2_REALDIR%"
 rmdir /S /Q "%BUG2_VIRTDIR%" 
 if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
 
-pause
-exit /b
+if not "%DoNotPause%"=="yes" pause
+exit /b %lastexcode%

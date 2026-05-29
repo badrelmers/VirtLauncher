@@ -90,8 +90,8 @@ echo ============================================================
 if %FAIL_COUNT% EQU 0 ( color 2F & echo  [OK] ALL TESTS PASSED ) else ( color 4F & echo  [X] %FAIL_COUNT% FAILURES )
 echo.
 call :GLOBAL_CLEANUP
-pause
-exit /b 0
+if not "%DoNotPause%"=="yes" pause
+exit /b %FAIL_COUNT%
 
 
 REM ════════════════════════════════════════════════════════════
@@ -744,7 +744,6 @@ goto :eof
 :Fail
 echo         BAD  -- %~1
 set /a FAIL_COUNT+=1
-pause
 goto :eof
 
 :Skip

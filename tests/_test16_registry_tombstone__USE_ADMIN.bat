@@ -18,6 +18,10 @@ color 2F
 set "BUILD_DIR=..\build"
 cd "%BUILD_DIR%"
 
+:: Counters
+set /a PASS_COUNT=0
+set /a FAIL_COUNT=0
+
 :: Root test key created OUTSIDE the sandbox (real registry).
 :: All tests operate under this key.
 set "TROOT=HKCU\Software\_VLTest_Tombstone"
@@ -54,25 +58,25 @@ rmdir /Q /S "%CD%\VIRTL" 2>nul
 reg add "%TROOT%\delme" /f >nul
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\delme" /f >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - delete succeeded
+    call :Pass " - delete succeeded"
 ) else (
-    color 4F & echo bad - delete failed with errorlevel %ERRORLEVEL%
+    call :Fail " - delete failed with errorlevel %ERRORLEVEL%"
 )
 
 @rem Real key must still exist outside the sandbox
 reg query "%TROOT%\delme" >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - real key still exists outside sandbox
+    call :Pass " - real key still exists outside sandbox"
 ) else (
-    color 4F & echo bad - real key was deleted outside the sandbox
+    call :Fail " - real key was deleted outside the sandbox"
 )
 
 @rem Inside sandbox the key must NOT be visible
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\delme" >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - key correctly invisible inside sandbox after delete
+    call :Pass " - key correctly invisible inside sandbox after delete"
 ) else (
-    color 4F & echo bad - deleted key still visible inside sandbox
+    call :Fail " - deleted key still visible inside sandbox"
 )
 
 
@@ -82,9 +86,9 @@ echo __________________1 2 deleted key must not reappear in a new sandbox sessio
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\delme" >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - tombstone persisted across sessions
+    call :Pass " - tombstone persisted across sessions"
 ) else (
-    color 4F & echo bad - tombstone lost, key resurrected in new session
+    call :Fail " - tombstone lost, key resurrected in new session"
 )
 
 
@@ -98,9 +102,9 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\keyval" /f >nul 2>n
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\keyval" /v myval >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - key with value invisible after delete
+    call :Pass " - key with value invisible after delete"
 ) else (
-    color 4F & echo bad - key with value still visible
+    call :Fail " - key with value still visible"
 )
 
 
@@ -117,16 +121,16 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\parent" /f >nul 2>n
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\parent" >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - parent key invisible
+    call :Pass " - parent key invisible"
 ) else (
-    color 4F & echo bad - parent key still visible
+    call :Fail " - parent key still visible"
 )
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\parent\child1" >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - child1 invisible after parent delete
+    call :Pass " - child1 invisible after parent delete"
 ) else (
-    color 4F & echo bad - child1 still visible
+    call :Fail " - child1 still visible"
 )
 
 
@@ -144,17 +148,17 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg add "%TROOT%\recreate" /v "newval" 
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\recreate" /v newval >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - recreated key visible with new value
+    call :Pass " - recreated key visible with new value"
 ) else (
-    color 4F & echo bad - recreated key not visible
+    call :Fail " - recreated key not visible"
 )
 
 @rem The new value must only exist inside the sandbox, not in the real registry
 reg query "%TROOT%\recreate" /v newval >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - new value correctly sandboxed
+    call :Pass " - new value correctly sandboxed"
 ) else (
-    color 4F & echo bad - new value leaked to real registry
+    call :Fail " - new value leaked to real registry"
 )
 
 
@@ -169,16 +173,16 @@ rmdir /Q /S "%CD%\VIRTL" 2>nul
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg add "%TROOT%\virtonly" /v "x" /t REG_SZ /d "y" /f >nul 2>nul
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\virtonly" /f >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - delete of virtual-only key succeeded
+    call :Pass " - delete of virtual-only key succeeded"
 ) else (
-    color 4F & echo bad - delete of virtual-only key failed
+    call :Fail " - delete of virtual-only key failed"
 )
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\virtonly" >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - virtual-only key invisible after delete
+    call :Pass " - virtual-only key invisible after delete"
 ) else (
-    color 4F & echo bad - virtual-only key still visible after delete
+    call :Fail " - virtual-only key still visible after delete"
 )
 
 
@@ -200,25 +204,25 @@ rmdir /Q /S "%CD%\VIRTL" 2>nul
 reg add "%TROOT%\valtest" /v "realval" /t REG_SZ /d "real_data" /f >nul
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\valtest" /v realval /f >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - value delete succeeded
+    call :Pass " - value delete succeeded"
 ) else (
-    color 4F & echo bad - value delete failed
+    call :Fail " - value delete failed"
 )
 
 @rem Real value must still be there outside sandbox
 reg query "%TROOT%\valtest" /v realval >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - real value preserved outside sandbox
+    call :Pass " - real value preserved outside sandbox"
 ) else (
-    color 4F & echo bad - real value was deleted outside sandbox
+    call :Fail " - real value was deleted outside sandbox"
 )
 
 @rem Inside sandbox value must be gone
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\valtest" /v realval >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - value correctly invisible inside sandbox
+    call :Pass " - value correctly invisible inside sandbox"
 ) else (
-    color 4F & echo bad - deleted value still visible inside sandbox
+    call :Fail " - deleted value still visible inside sandbox"
 )
 
 
@@ -227,9 +231,9 @@ echo __________________2 2 value tombstone persists across sandbox sessions
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\valtest" /v realval >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - value tombstone survived new session
+    call :Pass " - value tombstone survived new session"
 ) else (
-    color 4F & echo bad - tombstone lost, value resurrected
+    call :Fail " - tombstone lost, value resurrected"
 )
 
 
@@ -248,23 +252,23 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\siblings" /v kill /
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\siblings" /v kill >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - deleted value invisible
+    call :Pass " - deleted value invisible"
 ) else (
-    color 4F & echo bad - deleted value still visible
+    call :Fail " - deleted value still visible"
 )
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\siblings" /v keep1 >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - sibling keep1 still readable
+    call :Pass " - sibling keep1 still readable"
 ) else (
-    color 4F & echo bad - sibling keep1 disappeared
+    call :Fail " - sibling keep1 disappeared"
 )
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\siblings" /v keep2 >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - sibling keep2 still readable
+    call :Pass " - sibling keep2 still readable"
 ) else (
-    color 4F & echo bad - sibling keep2 disappeared
+    call :Fail " - sibling keep2 disappeared"
 )
 
 
@@ -282,17 +286,17 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg add    "%TROOT%\rewrite" /v val /t 
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\rewrite" /v val | findstr "new" >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - re-written value reads new data
+    call :Pass " - re-written value reads new data"
 ) else (
-    color 4F & echo bad - re-written value does not show new data
+    call :Fail " - re-written value does not show new data"
 )
 
 @rem Confirm real registry still has the old value
 reg query "%TROOT%\rewrite" /v val | findstr "old" >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - real registry still has old value
+    call :Pass " - real registry still has old value"
 ) else (
-    color 4F & echo bad - real registry value was modified
+    call :Fail " - real registry value was modified"
 )
 
 
@@ -312,24 +316,24 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\allvals" /v b /f >n
 @rem Key itself must still be queryable
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\allvals" >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - empty key still visible after all values deleted
+    call :Pass " - empty key still visible after all values deleted"
 ) else (
-    color 4F & echo bad - key disappeared after deleting all values
+    call :Fail " - key disappeared after deleting all values"
 )
 
 @rem Both values must be gone
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\allvals" /v a >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - value a invisible
+    call :Pass " - value a invisible"
 ) else (
-    color 4F & echo bad - value a still visible
+    call :Fail " - value a still visible"
 )
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\allvals" /v b >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - value b invisible
+    call :Pass " - value b invisible"
 ) else (
-    color 4F & echo bad - value b still visible
+    call :Fail " - value b still visible"
 )
 
 
@@ -344,16 +348,16 @@ reg add "%TROOT%\virtval" /f >nul
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg add    "%TROOT%\virtval" /v "vv" /t REG_SZ /d "sandbox" /f >nul 2>nul
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\virtval" /v vv /f >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - virtual-only value deleted successfully
+    call :Pass " - virtual-only value deleted successfully"
 ) else (
-    color 4F & echo bad - virtual-only value delete failed
+    call :Fail " - virtual-only value delete failed"
 )
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\virtval" /v vv >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - virtual-only value invisible after delete
+    call :Pass " - virtual-only value invisible after delete"
 ) else (
-    color 4F & echo bad - virtual-only value still visible
+    call :Fail " - virtual-only value still visible"
 )
 
 
@@ -379,16 +383,16 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\enum_parent\dead" /
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\enum_parent" | findstr /I "dead" >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - dead subkey absent from enumeration
+    call :Pass " - dead subkey absent from enumeration"
 ) else (
-    color 4F & echo bad - dead subkey still appears in enumeration
+    call :Fail " - dead subkey still appears in enumeration"
 )
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\enum_parent" | findstr /I "alive" >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - alive subkey present in enumeration
+    call :Pass " - alive subkey present in enumeration"
 ) else (
-    color 4F & echo bad - alive subkey missing from enumeration
+    call :Fail " - alive subkey missing from enumeration"
 )
 
 
@@ -406,16 +410,16 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\enum_vals" /v dead_
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\enum_vals" | findstr /I "dead_val" >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - dead_val absent from value enumeration
+    call :Pass " - dead_val absent from value enumeration"
 ) else (
-    color 4F & echo bad - dead_val still in value enumeration
+    call :Fail " - dead_val still in value enumeration"
 )
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\enum_vals" | findstr /I "alive_val" >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - alive_val present in value enumeration
+    call :Pass " - alive_val present in value enumeration"
 ) else (
-    color 4F & echo bad - alive_val missing from value enumeration
+    call :Fail " - alive_val missing from value enumeration"
 )
 
 
@@ -436,9 +440,9 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\count_test\sk_dead"
 @rem Count the subkey lines: must be exactly 1 (sk_alive)
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\count_test" | findstr /I "sk_alive" | "%~dp0_bin\wc.exe" -l | findstr /C:"      1" >nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - only 1 subkey visible after delete
+    call :Pass " - only 1 subkey visible after delete"
 ) else (
-    color 4F & echo bad - wrong subkey count after delete
+    call :Fail " - wrong subkey count after delete"
 )
 
 
@@ -456,16 +460,16 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\tree\branch_dead" /
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\tree" /s | findstr /I "branch_dead" >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - branch_dead absent from recursive enumeration
+    call :Pass " - branch_dead absent from recursive enumeration"
 ) else (
-    color 4F & echo bad - branch_dead still in recursive enumeration
+    call :Fail " - branch_dead still in recursive enumeration"
 )
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\tree" /s | findstr /I "branch_live" >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - branch_live present in recursive enumeration
+    call :Pass " - branch_live present in recursive enumeration"
 ) else (
-    color 4F & echo bad - branch_live missing from recursive enumeration
+    call :Fail " - branch_live missing from recursive enumeration"
 )
 
 
@@ -489,9 +493,9 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\isolation_key" /f >
 @rem Real registry must still have the key and value
 reg query "%TROOT%\isolation_key" /v val >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - real key unaffected by sandbox delete
+    call :Pass " - real key unaffected by sandbox delete"
 ) else (
-    color 4F & echo bad - sandbox delete leaked to real registry
+    call :Fail " - sandbox delete leaked to real registry"
 )
 
 
@@ -506,9 +510,9 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\isolation_val" /v r
 
 reg query "%TROOT%\isolation_val" /v realv >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - real value unaffected by sandbox delete
+    call :Pass " - real value unaffected by sandbox delete"
 ) else (
-    color 4F & echo bad - sandbox value delete leaked to real registry
+    call :Fail " - sandbox value delete leaked to real registry"
 )
 
 
@@ -528,17 +532,17 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg add    "%TROOT%\leak_test" /v "v" /
 @rem Sandbox sees new value
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\leak_test" /v v | findstr "modified" >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - sandbox sees modified value
+    call :Pass " - sandbox sees modified value"
 ) else (
-    color 4F & echo bad - sandbox does not see modified value
+    call :Fail " - sandbox does not see modified value"
 )
 
 @rem Real registry must still have original
 reg query "%TROOT%\leak_test" /v v | findstr "original" >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - real registry untouched
+    call :Pass " - real registry untouched"
 ) else (
-    color 4F & echo bad - real registry was modified
+    call :Fail " - real registry was modified"
 )
 
 
@@ -560,9 +564,9 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\types" /v dword_val
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\types" /v dword_val >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - REG_DWORD tombstoned correctly
+    call :Pass " - REG_DWORD tombstoned correctly"
 ) else (
-    color 4F & echo bad - REG_DWORD still visible
+    call :Fail " - REG_DWORD still visible"
 )
 
 
@@ -576,9 +580,9 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\types" /v bin_val /
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\types" /v bin_val >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - REG_BINARY tombstoned correctly
+    call :Pass " - REG_BINARY tombstoned correctly"
 ) else (
-    color 4F & echo bad - REG_BINARY still visible
+    call :Fail " - REG_BINARY still visible"
 )
 
 
@@ -592,9 +596,9 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\types" /v esz_val /
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\types" /v esz_val >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - REG_EXPAND_SZ tombstoned correctly
+    call :Pass " - REG_EXPAND_SZ tombstoned correctly"
 ) else (
-    color 4F & echo bad - REG_EXPAND_SZ still visible
+    call :Fail " - REG_EXPAND_SZ still visible"
 )
 
 
@@ -608,9 +612,9 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\types" /v msz_val /
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\types" /v msz_val >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - REG_MULTI_SZ tombstoned correctly
+    call :Pass " - REG_MULTI_SZ tombstoned correctly"
 ) else (
-    color 4F & echo bad - REG_MULTI_SZ still visible
+    call :Fail " - REG_MULTI_SZ still visible"
 )
 
 
@@ -624,9 +628,9 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\defval" /ve /f >nul
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\defval" /ve | findstr "default_data" >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - default value tombstoned correctly
+    call :Pass " - default value tombstoned correctly"
 ) else (
-    color 4F & echo bad - default value still visible
+    call :Fail " - default value still visible"
 )
 
 
@@ -652,17 +656,17 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\write_del" /v temp 
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\write_del" /v temp >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - written-then-deleted value invisible
+    call :Pass " - written-then-deleted value invisible"
 ) else (
-    color 4F & echo bad - written-then-deleted value still visible
+    call :Fail " - written-then-deleted value still visible"
 )
 
 @rem The other value must still be readable
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\write_del" /v keep >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - sibling value unaffected
+    call :Pass " - sibling value unaffected"
 ) else (
-    color 4F & echo bad - sibling value disappeared
+    call :Fail " - sibling value disappeared"
 )
 
 
@@ -678,9 +682,9 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\parent_live\new_chi
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\parent_live\new_child" >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - created-then-deleted subkey invisible
+    call :Pass " - created-then-deleted subkey invisible"
 ) else (
-    color 4F & echo bad - created-then-deleted subkey still visible
+    call :Fail " - created-then-deleted subkey still visible"
 )
 
 
@@ -700,9 +704,9 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\cow_del" /v v /f >n
 @rem Value must be gone -- tombstone blocks real value resurrection
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\cow_del" /v v >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - real value blocked by tombstone after CoW delete
+    call :Pass " - real value blocked by tombstone after CoW delete"
 ) else (
-    color 4F & echo bad - real value resurrected after CoW delete
+    call :Fail " - real value resurrected after CoW delete"
 )
 
 
@@ -736,17 +740,17 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%HKLM_TEST%\delme" /f >nul 
 @rem Must be gone inside sandbox
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%HKLM_TEST%\delme" >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - HKLM key invisible inside sandbox after delete
+    call :Pass " - HKLM key invisible inside sandbox after delete"
 ) else (
-    color 4F & echo bad - HKLM key still visible inside sandbox
+    call :Fail " - HKLM key still visible inside sandbox"
 )
 
 @rem Must survive outside
 reg query "%HKLM_TEST%\delme" >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - HKLM key untouched in real registry
+    call :Pass " - HKLM key untouched in real registry"
 ) else (
-    color 4F & echo bad - HKLM key was deleted in real registry
+    call :Fail " - HKLM key was deleted in real registry"
 )
 
 
@@ -758,16 +762,16 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%HKLM_TEST%\delme" /v val /
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%HKLM_TEST%\delme" /v val >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - HKLM value invisible inside sandbox after delete
+    call :Pass " - HKLM value invisible inside sandbox after delete"
 ) else (
-    color 4F & echo bad - HKLM value still visible inside sandbox
+    call :Fail " - HKLM value still visible inside sandbox"
 )
 
 reg query "%HKLM_TEST%\delme" /v val >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - HKLM value untouched in real registry
+    call :Pass " - HKLM value untouched in real registry"
 ) else (
-    color 4F & echo bad - HKLM value was deleted in real registry
+    call :Fail " - HKLM value was deleted in real registry"
 )
 
 :skip_hklm
@@ -792,17 +796,17 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\a\b\c\d\e" /f >nul 
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\a\b\c\d\e" >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - deep key invisible after delete
+    call :Pass " - deep key invisible after delete"
 ) else (
-    color 4F & echo bad - deep key still visible
+    call :Fail " - deep key still visible"
 )
 
 @rem Ancestor one level up must still be visible
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\a\b\c\d" >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - parent d still visible
+    call :Pass " - parent d still visible"
 ) else (
-    color 4F & echo bad - parent d disappeared after child delete
+    call :Fail " - parent d disappeared after child delete"
 )
 
 
@@ -816,17 +820,17 @@ VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\a\b\c\d\e" /v deep_
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\a\b\c\d\e" /v deep_v >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
-    echo good - deep value invisible after delete
+    call :Pass " - deep value invisible after delete"
 ) else (
-    color 4F & echo bad - deep value still visible
+    call :Fail " - deep value still visible"
 )
 
 @rem Key itself must still be queryable
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\a\b\c\d\e" >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good - key still visible after deep value delete
+    call :Pass " - key still visible after deep value delete"
 ) else (
-    color 4F & echo bad - key disappeared after value delete
+    call :Fail " - key disappeared after value delete"
 )
 
 
@@ -848,22 +852,38 @@ reg add "%TROOT%\cycle" /v "v" /t REG_SZ /d "original" /f >nul
 @rem Round 1: delete
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\cycle" /f >nul 2>nul
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\cycle" >nul 2>nul
-if %ERRORLEVEL% NEQ 0 (echo good - cycle r1 delete ok) else (color 4F & echo bad - cycle r1 key visible)
+if %ERRORLEVEL% NEQ 0 (
+    call :Pass " - cycle r1 delete ok"
+) else (
+    call :Fail " - cycle r1 key visible"
+)
 
 @rem Round 2: recreate with new value
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg add "%TROOT%\cycle" /v "v" /t REG_SZ /d "round2" /f >nul 2>nul
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\cycle" /v v | findstr "round2" >nul 2>nul
-if %ERRORLEVEL% EQU 0 (echo good - cycle r2 recreate ok) else (color 4F & echo bad - cycle r2 value wrong)
+if %ERRORLEVEL% EQU 0 (
+    call :Pass " - cycle r2 recreate ok"
+) else (
+    call :Fail " - cycle r2 value wrong"
+)
 
 @rem Round 3: delete again
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\cycle" /f >nul 2>nul
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\cycle" >nul 2>nul
-if %ERRORLEVEL% NEQ 0 (echo good - cycle r3 delete ok) else (color 4F & echo bad - cycle r3 key visible)
+if %ERRORLEVEL% NEQ 0 (
+    call :Pass " - cycle r3 delete ok"
+) else (
+    call :Fail " - cycle r3 key visible"
+)
 
 @rem Round 4: recreate again
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg add "%TROOT%\cycle" /v "v" /t REG_SZ /d "round4" /f >nul 2>nul
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\cycle" /v v | findstr "round4" >nul 2>nul
-if %ERRORLEVEL% EQU 0 (echo good - cycle r4 recreate ok) else (color 4F & echo bad - cycle r4 value wrong)
+if %ERRORLEVEL% EQU 0 (
+    call :Pass " - cycle r4 recreate ok"
+) else (
+    call :Fail " - cycle r4 value wrong"
+)
 
 
 echo __________________9 2 delete / recreate / delete cycle on a value
@@ -875,15 +895,27 @@ reg add "%TROOT%\vcycle" /v "vv" /t REG_SZ /d "original" /f >nul
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\vcycle" /v vv /f >nul 2>nul
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\vcycle" /v vv >nul 2>nul
-if %ERRORLEVEL% NEQ 0 (echo good - vcycle r1 delete ok) else (color 4F & echo bad - vcycle r1 still visible)
+if %ERRORLEVEL% NEQ 0 (
+    call :Pass " - vcycle r1 delete ok"
+) else (
+    call :Fail " - vcycle r1 still visible"
+)
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg add "%TROOT%\vcycle" /v "vv" /t REG_SZ /d "r2" /f >nul 2>nul
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\vcycle" /v vv | findstr "r2" >nul 2>nul
-if %ERRORLEVEL% EQU 0 (echo good - vcycle r2 recreate ok) else (color 4F & echo bad - vcycle r2 value wrong)
+if %ERRORLEVEL% EQU 0 (
+    call :Pass " - vcycle r2 recreate ok"
+) else (
+    call :Fail " - vcycle r2 value wrong"
+)
 
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg delete "%TROOT%\vcycle" /v vv /f >nul 2>nul
 VirtLauncher64.exe -r "%VREG%" -e cmd /c reg query "%TROOT%\vcycle" /v vv >nul 2>nul
-if %ERRORLEVEL% NEQ 0 (echo good - vcycle r3 delete ok) else (color 4F & echo bad - vcycle r3 still visible)
+if %ERRORLEVEL% NEQ 0 (
+    call :Pass " - vcycle r3 delete ok"
+) else (
+    call :Fail " - vcycle r3 still visible"
+)
 
 
 ::================================================================================
@@ -894,4 +926,40 @@ echo.
 reg delete "%TROOT%" /f >nul 2>nul
 reg delete "%VREG%" /f >nul 2>nul
 rmdir /Q /S "%CD%\VIRTL" 2>nul
-pause
+
+
+
+
+echo.
+echo ============================================================
+echo  TEST SUMMARY
+echo ============================================================
+echo  Passed : %PASS_COUNT%
+echo  Failed : %FAIL_COUNT%
+echo ============================================================
+
+if %FAIL_COUNT% equ 0 (
+    echo  [OK] ALL TESTS PASSED SUCCESSFULLY!
+    color 2F
+) else (
+    echo  [X] SOME TESTS FAILED!
+    color 4F
+)
+
+echo.
+if not "%DoNotPause%"=="yes" pause
+exit /b %FAIL_COUNT%
+
+
+
+
+:Pass
+rem echo   [+] PASS: %~1
+echo good
+set /a PASS_COUNT+=1
+goto :eof
+
+:Fail
+echo FAIL: %~1
+set /a FAIL_COUNT+=1
+goto :eof

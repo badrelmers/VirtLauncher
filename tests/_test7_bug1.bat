@@ -9,6 +9,11 @@ CD /D "%~dp0"
 
 ::_______________________________________________
 color 2F
+
+:: Counters
+set /a PASS_COUNT=0
+set /a FAIL_COUNT=0
+
 set "BUILD_DIR=..\build"
 cd "%BUILD_DIR%"
 if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
@@ -51,10 +56,10 @@ echo ______Bug1: COW read via NT-relative open through virtual dir handle
 VirtLauncher64.exe -f -e "%~dp0_bin\test_bug1.exe" %BUG1_REALDIR% cow_file.txt >nul
 if %ERRORLEVEL% EQU 0 (
     @rem [Bug1 is FIXED: COW fallback via NT-relative open works]
-    echo good
+    call :Pass
 ) else (
     @rem [Bug1 is PRESENT: COW fallback broken for NT-relative opens]
-    color 4F & echo bad
+    call :Fail
 )
 
 
@@ -63,9 +68,9 @@ echo good_variant > "%BUG1_REALDIR%\cow_file2.txt"
 
 VirtLauncher64.exe -f -e "%~dp0_bin\test_bug1.exe" %BUG1_REALDIR% cow_file2.txt >nul
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
@@ -76,10 +81,10 @@ echo real_content > "%BUG1_REALDIR%\cow_file3.txt"
 VirtLauncher64.exe -f -e cmd /c "type %BUG1_REALDIR%\cow_file3.txt" | findstr real_content >nul
 if %ERRORLEVEL% EQU 0 (
     @rem [expected: Win32 always resolves to absolute, COW works]
-    echo good
+    call :Pass
 ) else (
     @rem [unexpected: basic COW is broken]
-    color 4F & echo bad
+    call :Fail
 )
 
 
@@ -89,8 +94,38 @@ rmdir /S /Q "%BUG1_REALDIR%"
 if exist "%BUG1_VIRTDIR%" rmdir /S /Q "%BUG1_VIRTDIR%" 
 if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
 
-pause
-exit /b
+
+
+echo.
+echo ============================================================
+echo  TEST SUMMARY
+echo ============================================================
+echo  Passed : %PASS_COUNT%
+echo  Failed : %FAIL_COUNT%
+echo ============================================================
+
+if %FAIL_COUNT% equ 0 (
+    echo  [OK] ALL TESTS PASSED SUCCESSFULLY!
+    color 2F
+) else (
+    echo  [X] SOME TESTS FAILED!
+    color 4F
+)
+
+echo.
+if not "%DoNotPause%"=="yes" pause
+exit /b %FAIL_COUNT%
+
+:Pass
+echo good
+set /a PASS_COUNT+=1
+goto :eof
+
+:Fail
+color 4F
+echo bad
+set /a FAIL_COUNT+=1
+goto :eof
 
 
  

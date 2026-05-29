@@ -9,6 +9,11 @@ REM set VLAUNCHER_VERBOSE=true
 
 ::_______________________________________________
 color 2F
+
+:: Counters
+set /a PASS_COUNT=0
+set /a FAIL_COUNT=0
+
 :: --- Configuration ---
 set "BUILD_DIR=..\build"
 cd "%BUILD_DIR%"
@@ -39,22 +44,22 @@ echo vvv>"%testdir%\v"
 
 VirtLauncher64.exe -r -f -e cmd /S /C "echo y|move /-Y "%testdir%\c" "%testdir%\v" " | findstr Overwrite >nul
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
 if exist "%CD%\VIRTL\%testdir::=%\c" (
-    color 4F & echo bad
+    call :Fail
 ) else (
-    echo good
+    call :Pass
 )
 
 if exist "%CD%\VIRTL\%testdir::=%\v" (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
@@ -72,9 +77,9 @@ echo vvv>"%testdir%\v"
 mkdir "%CD%\VIRTL\%testdir::=%"
 VirtLauncher64.exe -r -f -e cmd /c move "%testdir%\c" "%testdir%\v" >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
@@ -90,9 +95,9 @@ echo vvv>"%testdir%\v"
 rmdir "%CD%\VIRTL\%testdir::=%" 2>nul
 VirtLauncher64.exe -r -f -e cmd /c move "%testdir%\c" "%testdir%\v" >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
@@ -105,22 +110,22 @@ mkdir "%testdir%\cc"
 mkdir "%testdir%\vv\cc"
 VirtLauncher64.exe -r -f -e cmd /S /C "echo y|move /-Y "%testdir%\cc" "%testdir%\vv" " | findstr Overwrite >nul
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 @rem cc folder should not exist now thanks to the tombstone
 if exist "%CD%\VIRTL\%testdir::=%\cc" (
-    color 4F & echo bad
+    call :Fail
 ) else (
-    echo good
+    call :Pass
 )
 
 if exist "%CD%\VIRTL\%testdir::=%\vv\cc" (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
@@ -139,22 +144,22 @@ rmdir /Q /S "%testdir%" 2>nul
 mkdir "%testdir%\cc"
 VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\cc" vvc
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
 if exist "%CD%\VIRTL\%testdir::=%\cc" (
-    color 4F & echo bad
+    call :Fail
 ) else (
-    echo good
+    call :Pass
 )
 
 if exist "%CD%\VIRTL\%testdir::=%\vvc" (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
@@ -167,9 +172,9 @@ mkdir "%testdir%\vvc"
 VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\cc" vvc 2>&1 | findstr /C:"A duplicate file name exists" | "%~dp0_bin\wc.exe" -l | findstr /C:"      1" >nul
 @rem VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\cc" vvc 2>&1 | findstr /C:"A duplicate file name exists"
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
@@ -183,22 +188,22 @@ mkdir "%testdir%"
 echo sdfsdf>"%testdir%\fileee"
 VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\fileee" fileeerenamed
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
 if exist "%CD%\VIRTL\%testdir::=%\fileee" (
-    color 4F & echo bad
+    call :Fail
 ) else (
-    echo good
+    call :Pass
 )
 
 if exist "%CD%\VIRTL\%testdir::=%\fileeerenamed" (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
@@ -213,9 +218,9 @@ echo sdfsdf>"%testdir%\fileee2"
 VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\fileee" fileee2 2>&1 | findstr /C:"A duplicate file name exists" | "%~dp0_bin\wc.exe" -l | findstr /C:"      1" >nul
 @rem VirtLauncher64.exe -r -f -e cmd /c rename "%testdir%\fileee" fileee2 2>&1 | findstr /C:"A duplicate file name exists"
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
@@ -238,16 +243,16 @@ echo dsfsd>"%testdir%\cc\ggg"
 @rem it gave error: Invalid path
 VirtLauncher64.exe -r -f -e cmd /c xcopy "%testdir%\cc" "%testdir%\vvc" /I /E /Q /H /R | findstr /C:"1 File(s) copied" | "%~dp0_bin\wc.exe" -l | findstr /C:"      1" >nul
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
 if exist "%CD%\VIRTL\%testdir::=%\vvc\ggg" (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
@@ -262,16 +267,16 @@ echo dsfsd>"%testdir%\vvc\ggg"
 
 VirtLauncher64.exe -r -f -e cmd /S /c "echo y|xcopy "%testdir%\cc" "%testdir%\vvc" /I /E /Q /H /R" | findstr /C:"1 File(s) copied" | "%~dp0_bin\wc.exe" -l | findstr /C:"      1" >nul
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
 if exist "%CD%\VIRTL\%testdir::=%\vvc\ggg" (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 echo __________________3 3 copy a real file to an non existent file
@@ -287,16 +292,16 @@ echo sdfsdf>"%testdir%\fileee"
 @rem the file is copied but it print this error: The file cannot be copied onto itself.
 VirtLauncher64.exe -r -f -e cmd /c copy "%testdir%\fileee" "%testdir%\fileeecopy" | findstr /C:"        1 file(s) copied." | "%~dp0_bin\wc.exe" -l | findstr /C:"      1" >nul
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
 if exist "%CD%\VIRTL\%testdir::=%\fileeecopy" (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
@@ -311,16 +316,16 @@ echo sdfsdf>"%testdir%\fileee2"
 @rem the file is copied but it print this error: The file cannot be copied onto itself.
 VirtLauncher64.exe -r -f -e cmd /c copy "%testdir%\fileee" "%testdir%\fileee2"  | findstr /C:"        1 file(s) copied." | "%~dp0_bin\wc.exe" -l | findstr /C:"      1" >nul
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
 if exist "%CD%\VIRTL\%testdir::=%\fileee2" (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
@@ -344,16 +349,16 @@ echo sdfsdf>"%testdir%\fileee"
 @rem it gave this: The directory is not empty.  it should not because the same command without virtuaisation does not do like that!
 VirtLauncher64.exe -r -f -e cmd /S /c "echo y|rmdir /S "%testdir%" " >nul
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
 if exist "%CD%\VIRTL\%testdir::=%\fileee" (
-    color 4F & echo bad
+    call :Fail
 ) else (
-    echo good
+    call :Pass
 )
 
 
@@ -371,16 +376,16 @@ echo sdfsdf>"%testdir%\fileee"
 @rem this gave error: Incorrect function.
 VirtLauncher64.exe -r -f -e cmd /c del "%testdir%\fileee"
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
 if exist "%CD%\VIRTL\%testdir::=%\fileee" (
-    color 4F & echo bad
+    call :Fail
 ) else (
-    echo good
+    call :Pass
 )
 
 
@@ -400,9 +405,9 @@ echo outside>"%testdir%\fileee"
 
 VirtLauncher64.exe -r -f -e cmd /c type "%testdir%\fileee" | findstr outside >nul
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
@@ -417,9 +422,9 @@ echo outside>"%testdir%\fileee"
 VirtLauncher64.exe -r -f -e cmd /S /c "echo inside>"%testdir%\fileee" "
 VirtLauncher64.exe -r -f -e cmd /c type "%testdir%\fileee" | findstr inside >nul
 if %ERRORLEVEL% EQU 0 (
-    echo good
+    call :Pass
 ) else (
-    color 4F & echo bad
+    call :Fail
 )
 
 
@@ -430,6 +435,41 @@ echo.
 echo.
 rmdir /Q /S "%CD%\VIRTL" 2>nul
 rmdir /Q /S "%testdir%"
-pause
+
+
+
+echo.
+echo ============================================================
+echo  TEST SUMMARY
+echo ============================================================
+echo  Passed : %PASS_COUNT%
+echo  Failed : %FAIL_COUNT%
+echo ============================================================
+
+if %FAIL_COUNT% equ 0 (
+    echo  [OK] ALL TESTS PASSED SUCCESSFULLY!
+    color 2F
+) else (
+    echo  [X] SOME TESTS FAILED!
+    color 4F
+)
+
+echo.
+if not "%DoNotPause%"=="yes" pause
+exit /b %FAIL_COUNT%
+
+
+:Pass
+echo good
+set /a PASS_COUNT+=1
+goto :eof
+
+:Fail
+color 4F
+echo bad
+set /a FAIL_COUNT+=1
+goto :eof
+
+
 
 
