@@ -7290,24 +7290,31 @@ static NTSTATUS NTAPI Hook_NtQueryInformationFile(
         std::wstring fullLog = ReverseApplyFsRedirect(fullPhys);
         if (fullLog == fullPhys) return;   // no redirect matched, nothing to do
 
-        // Strip the '\??\X:' prefix back to get the volume-relative logical path.
-        // The logical drive letter may differ from the physical one (config rules
-        // can map across drives), so strip whatever 6-char '\??\Y:' prefix the
-        // returned path starts with.
+        // Strip the '\??\X:' prefix (exactly 6 chars: \??\Y:) back to get the
+        // volume-relative logical path.  The logical drive letter may differ from
+        // the physical one when config rules map across drives.
+        //
+        // Edge case: ReverseApplyFsRedirect may return exactly '\??\Y:' (6 chars,
+        // no further path component) when the physical path was the virtual store's
+        // drive-root folder itself  e.g. sandbox\F\ -> \??\F:  .
+        // The volume-relative form of a bare drive root is '\' (one backslash),
+        // NOT an empty string.  Writing back empty crashes callers (cmd.exe CWD).
         std::wstring volRelLog;
         if (fullLog.size() >= 6 &&
             fullLog[0] == L'\\' && fullLog[1] == L'?' &&
             fullLog[2] == L'?' && fullLog[3] == L'\\' &&
             iswalpha(fullLog[4]) && fullLog[5] == L':')
         {
-            volRelLog = fullLog.substr(6);   // e.g. '\foo\bar.txt'
+            volRelLog = fullLog.substr(6);          // e.g. '\foo\bar.txt'
+            if (volRelLog.empty()) volRelLog = L"\\"; // bare drive root -> '\'
         } else {
             volRelLog = fullLog;   // unexpected format; use as-is
         }
 
-        // Only write back if the result fits (it must, since the logical path is
-        // shorter than or equal to the physical one after redirect reversal).
-        if (volRelLog.size() <= volRel.size()) {
+        // Only write back if the result is non-empty and fits in the buffer.
+        // (The logical path must always be <= the physical length after reversal,
+        // but guard explicitly so a logic error never overflows the buffer.)
+        if (!volRelLog.empty() && volRelLog.size() <= volRel.size()) {
             ULONG newLen = (ULONG)(volRelLog.size() * sizeof(WCHAR));
             memcpy(pFni->FileName, volRelLog.c_str(), newLen);
             pFni->FileNameLength = newLen;

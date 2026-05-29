@@ -182,7 +182,7 @@ if %FAIL_COUNT% equ 0 (
 )
 
 echo.
-if not "%DoNotPause%"=="yes" pause
+pause
 exit /b %FAIL_COUNT%
 
 
