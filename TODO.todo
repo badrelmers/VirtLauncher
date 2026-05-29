@@ -1,111 +1,28 @@
 
-☐ injected childs should print verbose output like the main injection when using VLAUNCHER_VERBOSE
+☐ bug: Hook_NtQueryInformationFile — class 21 (FileAllInformation) is not handled. It embeds a FILE_NAME_INFORMATION at a fixed offset of 96 bytes that would return a virtual-store volume-relative path. The existing class 9 code already applies ReverseApplyFsRedirect using the same pattern, so class 21 needs the exact same treatment. Class 48 (FileNormalizedNameInformation) has a different format (device path, not volume-relative) so ReverseApplyFsRedirect can't handle it without deeper changes — I'll note it but leave it alone. https://claude.ai/chat/4a7f5ba9-bcdd-4314-a8e7-55395551d219   badr2351
 
-☐ reg query is slow with the big hives
-    The current time is: 23:02:50.77
-    > VirtLauncher64.exe -r -e reg query "HKEY_LOCAL_MACHINE\SOFTWARE\Classes" 2>nul | findstr "EnumA"
-    The current time is: 23:03:09.48
+☐ in the config ini file change "ini =" because folder may contain = so use | or =|    see: size_t eq = line.find(L'=');
 
-☐ in sandboxie i cannot rename a reg name, it says regedit.exe: SBIE2205 Service not implemented:  NtRenameKey . why he did not implemented it? does it improve speed? investigate it
+☐ max path 255
+  ☐ allow write to paths longuer than 255
+  ☐ or add to the doc and help a reminder to users saying: to keep the virtual store short to prevent 255 charachter limit in old os where 32k is not supported so echo and cmd do not have problems inside the virtual world, for example  _test9_exclude_and_filesystem_suite.bat gave multiple errors when virtual folder is inside this long path "F:\_bin\_src\_launcher_virtualization\__VirtLauncher\_testsss\files\final2_fix_rename - Copy - Copyffffffffffffffffffffffffffffffffffffffffffffff\build"
 
-☐ do like sandboxie it writes directly to HKEY_USERS\Sandbox_badr_paltalk not HKCU
+☐ should i use the more low level function than CreateProcessW? i mean should i inject the ntdll equivalent of CreateProcessW or my current method is sufficient? what if an app use ntdll function to start a child the child will not be injected in that case
 
-☐ sandboxie allow to write to the virtual HKEY_LOCAL_MACHINE without admin, my tool was able to do it too but i removed it, i do not know which one is better, so maybe it s good to add a new flag that allow to write to it , or maybe just allow without flags? TODO:decide
+________________________________________________
 
-☐ Application Hives (\REGISTRY\A): Modern Windows uses this for UWP/AppX isolated hives. Your code will return false for these because they don't start with MACHINE or USER. Sandboxie handles these with some highly specific hooks, but for a standard Win32 desktop application sandbox, it is perfectly safe to let them fail to resolve or pass through, as Win32 desktop apps generally do not have the permissions or context to write to \REGISTRY\A anyway.
+☐ @low add mingw compile https://github.com/microsoft/Detours/blob/f4c0fc91b8a93fc09ccbbd6e4277efe6872784fe/src/detours.h#L53
 
-_____________________________________
-https://gemini.google.com/app/9303131e71d3eb50   alkorsan
-you said:  You bypassed this for HKCU by skipping the _Classes redirection entirely
-do you mean that my code do not virtualise and redirect  some  HKCU keys? is there other keys that my code bypass? i do not want to bypass anything , i want a full virtualisation
-Yes, your current code explicitly bypasses the _Classes hive, meaning per-user COM registrations and file associations (HKCU\Software\Classes) are currently escaping your sandbox and leaking into the real host registry.
-I completely understand wanting 100% full virtualization. You don't want anything slipping through the cracks.
-Here is exactly what is happening in your code, why it was written that way, and how we can safely close the leak now.
-1. The _Classes Leak in Your Code
-If you look at the LogicalToVirtual function in your VirtHook.cpp (around line 490), you have this exact block: -
-C++
-    if (!g_HkcuNtBase.empty() && StartsWithI(logical, g_HkcuNtBase)) {
-        size_t hLen = g_HkcuNtBase.size();
-        if (logical.size() > hLen && logical[hLen] != L'\\') {
-            // ...
-            // Do NOT redirect and do NOT fall through to the HKU arm.
-            // <SID>_Classes is an independent NT hive loaded directly under
-            // \REGISTRY\USER.  Routing it through HKEY_USERS creates a virtual
-            // path that has no real hive behind it, which breaks COM in two ways:
-            // ...
-            // Both issues cause heap/stack corruption in the caller -> BEX64 crash.
-            VL_DBG(L"LogicalToVirtual: SKIP (non-HKCU SID-suffix hive, e.g. _Classes) path=%s",
-                   logical.c_str());
-            
-            return false; // <--- THIS IS THE LEAK
-        } else {
+☐ @low Application Hives (\REGISTRY\A): Modern Windows uses this for UWP/AppX isolated hives. my code will return false for these because they don't start with MACHINE or USER. Sandboxie handles these with some highly specific hooks, but for a standard Win32 desktop application sandbox, it is perfectly safe to let them fail to resolve or pass through, as Win32 desktop apps generally do not have the permissions or context to write to \REGISTRY\A anyway.
 
-Whenever an application modifies HKCR (which merges HKLM\Software\Classes and HKCU\Software\Classes), the kernel resolves the user portion to \REGISTRY\USER\<SID>_Classes. Your code sees this, hits that return false;, and allows the app to write directly to the real host registry.
-Why was it written this way? As your comments mention, routing _Classes into the virtual store used to strip the REG_FLAG_HIVE_ROOT flag. When the COM runtime (ole32/combase) queried the key and saw that flag was missing, it panicked and caused a BEX64 stack corruption crash.
-Why we can fix it now: In the previous step, we added the interception for KeyHandleTagsInformation (Class 7) to Hook_NtQueryKey. Because we are now feeding COM the 0 it needs to stay stable, the BEX64 crash is completely neutralized. You no longer need to bypass _Classes.
-2. The Fix: Closing the Leak
-To virtualize _Classes properly, we just need to remove the return false; and let it fall through to your existing HKEY_USERS redirection block below it.
-Replace your HKCU block in LogicalToVirtual with this: -
-C++
-    // ---- 2. HKCU: \REGISTRY\USER\<CurrentSID>\... ----------------------
-    if (!g_HkcuNtBase.empty() && StartsWithI(logical, g_HkcuNtBase)) {
-        size_t hLen = g_HkcuNtBase.size();
-        if (logical.size() > hLen && logical[hLen] != L'\\') {
-            // It's <SID>_Classes (or another SID-suffix hive).
-            // DO NOT return false here. Let it fall through to the 
-            // HKEY_USERS block below so it gets fully virtualized!
-        } else {
-            std::wstring sub = logical.substr(hLen);
-            if (sub.empty()) {
-                // Path IS the HKCU root -- skip to preserve real root handles.
-                VL_DBG(L"LogicalToVirtual: SKIP (hive root HKCU itself)");
-                return false;
-            }
-            virt = g_VirtNtBase + L"\\HKEY_CURRENT_USER" + sub;
-            VL_DBG(L"LogicalToVirtual: REDIRECT %s -> %s", logical.c_str(), virt.c_str());
-            return true;
-        }
-    }
+☐ @low add --wait -w flag
 
-Now, \REGISTRY\USER\<SID>_Classes will fall down to your kUser check, match \REGISTRY\USER, and seamlessly redirect to VirtNtBase\HKEY_USERS\<SID>_Classes. Full virtualization is restored.
-3. Are Any Other Keys Bypassed?
-Looking through your LogicalToVirtual routing table, your code handles MACHINE, USER\<SID>, and USER\ perfectly. There are only two other things your code skips, and both are completely intentional: -
-	1. Hive Roots: Your code skips redirection if the path is exactly \REGISTRY\MACHINE or \REGISTRY\USER (e.g., if (sub.empty()) return false;). This is strictly required. Applications must be able to open the host's physical root keys to establish a base handle for relative path lookups. If you virtualized the roots, the OS wouldn't know how to resolve anything. This does not leak data.
-	2. Application Hives (\REGISTRY\A): Modern Windows uses this for UWP/AppX isolated hives. Your code will return false for these because they don't start with MACHINE or USER. Sandboxie handles these with some highly specific hooks, but for a standard Win32 desktop application sandbox, it is perfectly safe to let them fail to resolve or pass through, as Win32 desktop apps generally do not have the permissions or context to write to \REGISTRY\A anyway.
+☐ @low in sandboxie i cannot rename a reg name, it says regedit.exe: SBIE2205 Service not implemented:  NtRenameKey . why he did not implemented it? does it improve speed? investigate it
 
 ________________________________________________
 
 
-☐ tablacus started crashing, last working comit is "fix RegistryFinder crash" with this commit it crash: fix HKLM Registry virtualization logic bugs and architecture fixes
 
-
-
-☐ registry virtualisation of hklm is broken; writes go directly to the real reg
-
-☐ NtQueryKey: Returns virtual key metadata (subkey count, value count from virtual only, not merged count - possible bug).
-☐ NtQueryMultipleValueKey: Tries virtual entirely, falls back to real if fails - but doesn't do per-value fallback (possible bug).
-
-::    - No registry tombstone: deleting a real-only key / value inside the
-::      sandbox does NOT persist -- the real key reappears on re-open.
-::      (File virtualisation uses .vl_deleted tombstones; registry does not.)
-::    - NtQueryKey reports virtual-only subkey/value counts, not merged.
-::    - NtQueryMultipleValueKey is all-or-nothing (no per-value fallback).
-
-
-☐ powershell crash
-
-
-☐ One secondary gap found (same class of bug, FS side): Hook_NtQueryInformationFile — class 21 (FileAllInformation) is not handled. It embeds a FILE_NAME_INFORMATION at a fixed offset of 96 bytes that would return a virtual-store volume-relative path. The existing class 9 code already applies ReverseApplyFsRedirect using the same pattern, so class 21 needs the exact same treatment. Class 48 (FileNormalizedNameInformation) has a different format (device path, not volume-relative) so ReverseApplyFsRedirect can't handle it without deeper changes — I'll note it but leave it alone. https://claude.ai/chat/4a7f5ba9-bcdd-4314-a8e7-55395551d219   badr2351
-
-☐ add mingw compile https://github.com/microsoft/Detours/blob/f4c0fc91b8a93fc09ccbbd6e4277efe6872784fe/src/detours.h#L53
-
-☐ add to the doc and help a reminder to users saying: to keep the virtual store short to prevent 255 charachter limit in old os where 32k is not supported so echo and cmd do not have problems inside the virtual world, for example  _test9_exclude_and_filesystem_suite.bat gave multiple errors when virtual folder is inside this long path "F:\_bin\_src\_launcher_virtualization\__VirtLauncher\_testsss\files\final2_fix_rename - Copy - Copyffffffffffffffffffffffffffffffffffffffffffffff\build"
-
-☐ add --wait -w flag
-
-☐ in the config ini file change "ini =" because folder may contain = so use | or =|    see: size_t eq = line.find(L'=');
-
-☐ is there a more low level function than CreateProcessW? i mean should i inject the ntdll equivalent of CreateProcessW or my current method is sufficient?
 
 
 Limitations and Potential Gaps:
@@ -114,7 +31,7 @@ Limitations and Potential Gaps:
 
 bugs i will not solve:
   ☐ rename a folder is bugged
-    create a folder in the real c: and put a file inside it. open tablacus virtualized , go to c: and rename that folder, the folder will be renamed but the file will not copied. this happens in sandboxie too , so i will not fix it for now because if most of things work fine in sandboxie even with this bug,then things must work fine too with my tool too, but this merits a fix really, but it will not be a good fix because we will have to copy the real folder to the virtual store which means the usually quick rename operations will now take a lot of time (the time needed to copy the original folder) + the space ocupied by the new copied files (imagine big filder and a script rename 3 times that folder, we will end up with 3 big folders in the virtual store+the real dir), so there is no clean an beautifull solution, so if i fix it i must make it an optional fix using a flag to enable this fix when needed.
+    create a folder in the real c: and put a file called test.txt inside it. open tablacus virtualized , go to c: and rename that folder, the folder will be renamed but the file test.txt will not be copied. this happens in sandboxie too , so i will not fix it for now because if most of things work fine in sandboxie even with this bug,then things must work fine too with my tool too, but this merits a fix really, but it will not be a good fix because we will have to copy the real folder to the virtual store which means the usually quick rename operations will now take a lot of time (the time needed to copy the original folder) + the space ocupied by the new copied files (imagine big filder and a script rename 3 times that folder, we will end up with 3 big folders in the virtual store+the real dir), so there is no clean an beautifull solution, so if i fix it i must make it an optional fix using a flag to enable this fix when needed.
     the test for this bug is in _test13_mergewrites_full.bat section 11.4 and _test12_merged_writes.bat section 3.2
     ☐ TODO: fix it, make it an optional option using a flag
 
@@ -123,12 +40,24 @@ bugs i will not solve:
   ✘ when i check read only on a folder and i open the same folder inside my virtlauncher using tablacus i do not see the read only, this happen in sandboxie too and i will not fix it @cancelled(26-05-18 19:53)
   ______________________
 
-  ✔ strange bug: open tablacus virtualised go to c: create a folder from the virtualised tablacus it will be names New folder  do not change this name, go to the real c:\ create a folder it will be named automcatically too to New folder ,now change its name,  you will see that tablaus folder changed automatically to the one we created in the real c: !!!!!!!!!!!!!!! . update: this is not a bug , it s just a visual glitch in tablacus, if you refresh the virtual folder you will see that the New folder still exist @done(26-05-18 19:52)
+  ✔ strange bug: open tablacus virtualised go to c: create a folder from the virtualised tablacus it will be named New folder  do not change this name, go to the real c:\ create a folder it will be named automcatically too to New folder ,now change its name,  you will see that tablaus folder changed automatically to the one we created in the real c: !!!!!!!!!!!!!!! . update: this is not a bug , it s just a visual glitch in tablacus, if you refresh the virtual folder you will see that the New folder still exist @done(26-05-18 19:52)
 
 
 
 ＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿
 Archive:
+  ✔ powershell crash @done(26-05-29 01:42) 
+  ✔ NtQueryKey: Returns virtual key metadata (subkey count, value count from virtual only, not merged count - possible bug). NtQueryKey reports virtual-only subkey/value counts, not merged. @done(26-05-29 01:42) 
+  ✔ NtQueryMultipleValueKey: Tries virtual entirely, falls back to real if fails - but doesn't do per-value fallback (possible bug). NtQueryMultipleValueKey is all-or-nothing (no per-value fallback). @done(26-05-29 01:42) 
+  ✔ No registry tombstone: deleting a real-only key / value inside the sandbox does NOT persist -- the real key reappears on re-open. (File virtualisation uses .vl_deleted tombstones; registry does not.) @done(26-05-29 01:42) 
+  ✔ registry virtualisation of hklm is broken; writes go directly to the real reg @done(26-05-29 01:40) 
+  ✔ tablacus started crashing, last working comit is "fix RegistryFinder crash" with this commit it crash: fix HKLM Registry virtualization logic bugs and architecture fixes @done(26-05-29 01:40) 
+  ✔ injected childs should print verbose output like the main injection when using VLAUNCHER_VERBOSE @done(26-05-29 01:27) 
+  ✘ do like sandboxie it writes directly to HKEY_USERS\Sandbox_badr_paltalk not HKCU. but what if we want to redirect a reg to another reg , so it s better to keep is as is for now @cancelled(26-05-29 00:58) 
+  ✔ reg query is slow with the big hives @done(26-05-29 00:55) 
+        The current time is: 23:02:50.77 @project()
+        > VirtLauncher64.exe -r -e reg query "HKEY_LOCAL_MACHINE\SOFTWARE\Classes" 2>nul | findstr "EnumA" @project()
+        The current time is: 23:03:09.48 @project()
   ✔ when i create a file in tablacus it show @ in filename then it disssapear, also RegistryFinder the input bar show @ @done(26-05-19 19:04) 
   ✔ when i run 32 from 64 it fails silently it must tell me about failuers @done(26-05-18 19:58) 
   ✔ add the 32 from 64 code of detours wiki https://github.com/microsoft/detours/wiki/OverviewHelpers @done(26-05-18 19:58) 

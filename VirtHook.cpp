@@ -128,6 +128,52 @@ static inline void VL_DBG(const wchar_t*, ...) {}
 #endif
 
 // ============================================================
+// Verbose info logging -- stdout output matching VirtLauncher's
+// [VirtLauncher] prefix style, active when VLAUNCHER_VERBOSE=1.
+//
+// Uses WriteFile on the inherited stdout handle so output works
+// correctly from inside a DLL (avoids CRT stdio state issues).
+// Only active for child processes injected via Hook_CreateProcess*;
+// the root process is already handled by VirtLauncher.exe itself.
+// ============================================================
+
+// Initialized to false; set to true by LoadConfig() when VLAUNCHER_VERBOSE=1.
+static bool g_VerboseEnabled = false;
+
+static void VL_INFO(const wchar_t* fmt, ...) {
+    if (!g_VerboseEnabled) return;
+    wchar_t buf[2048];
+    va_list va;
+    va_start(va, fmt);
+    _vsnwprintf(buf, 2047, fmt, va);
+    va_end(va);
+    buf[2047] = L'\0';
+
+    // Append newline
+    size_t len = wcslen(buf);
+    if (len < 2047) { buf[len] = L'\n'; buf[len + 1] = L'\0'; ++len; }
+
+    // Write UTF-16 converted to the current console code page via WriteConsoleW,
+    // falling back to WriteFile with a UTF-8 conversion so output is readable
+    // whether stdout is a console or a redirected pipe/file.
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut == INVALID_HANDLE_VALUE || hOut == NULL) return;
+
+    DWORD written = 0;
+    // Try WriteConsoleW first (works when stdout is an attached console).
+    if (!WriteConsoleW(hOut, buf, (DWORD)len, &written, NULL)) {
+        // stdout is a pipe or file: convert to UTF-8 and use WriteFile.
+        char  utf8[4096];
+        int   n = WideCharToMultiByte(CP_UTF8, 0, buf, (int)len,
+                                      utf8, (int)sizeof(utf8) - 1, NULL, NULL);
+        if (n > 0) {
+            utf8[n] = '\0';
+            WriteFile(hOut, utf8, (DWORD)n, &written, NULL);
+        }
+    }
+}
+
+// ============================================================
 // NT Type Definitions
 // ============================================================
 
@@ -2329,6 +2375,12 @@ static void LoadConfig() {
                           _wcsicmp(buf, L"true") == 0 ||
                           _wcsicmp(buf, L"yes")  == 0);
 
+    // ---- Read the verbose flag so Hook_CreateProcess* can print child info ----
+    if (GetEnvironmentVariableW(L"VLAUNCHER_VERBOSE", buf, 2047) > 0)
+        g_VerboseEnabled = (_wcsicmp(buf, L"1")    == 0 ||
+                            _wcsicmp(buf, L"true") == 0 ||
+                            _wcsicmp(buf, L"yes")  == 0);
+
     // ---- Registry virtualisation (VIRTLAUNCHER_REG) ----
     if (GetEnvironmentVariableW(L"VIRTLAUNCHER_REG", buf, 2047) > 0) {
         g_VirtNtBase = buf;
@@ -2390,7 +2442,7 @@ static void LoadConfig() {
     if (!g_DllPathA64[0] && g_DllPathA[0])
         strncpy(g_DllPathA64, g_DllPathA, MAX_PATH - 1);
 
-    VL_DBG(L"LoadConfig: DebugEnabled=%d", (int)g_DebugEnabled);
+    VL_DBG(L"LoadConfig: DebugEnabled=%d VerboseEnabled=%d", (int)g_DebugEnabled, (int)g_VerboseEnabled);
     VL_DBG(L"LoadConfig: RegEnabled=%d  VirtNtBase=%s",
            (int)g_RegEnabled, g_VirtNtBase.c_str());
     VL_DBG(L"LoadConfig:             RealNtBase=%s  HkcuNtBase=%s",
@@ -7768,6 +7820,106 @@ static const char* PickDllPath() {
 #endif
 }
 
+// ============================================================
+// Verbose child-injection helpers
+// ============================================================
+
+// Resolve the executable path from lpApplicationName / lpCommandLine,
+// replicating what CreateProcess does: prefer lpApplicationName when
+// non-null, otherwise take the first token of lpCommandLine.
+// Returns false if neither yields a non-empty string.
+static bool ResolveChildExePath(LPCWSTR appName, LPCWSTR cmdLine,
+                                 wchar_t* out, DWORD outCch)
+{
+    if (appName && appName[0]) {
+        wcsncpy(out, appName, outCch - 1);
+        out[outCch - 1] = L'\0';
+        return true;
+    }
+    if (!cmdLine || !cmdLine[0]) return false;
+
+    // First token of cmdLine (may be quoted).
+    if (cmdLine[0] == L'"') {
+        const wchar_t* end = wcschr(cmdLine + 1, L'"');
+        if (!end) end = cmdLine + wcslen(cmdLine);
+        DWORD n = (DWORD)(end - (cmdLine + 1));
+        if (n >= outCch) n = outCch - 1;
+        wcsncpy(out, cmdLine + 1, n);
+        out[n] = L'\0';
+    } else {
+        const wchar_t* end = cmdLine;
+        while (*end && *end != L' ' && *end != L'\t') ++end;
+        DWORD n = (DWORD)(end - cmdLine);
+        if (n >= outCch) n = outCch - 1;
+        wcsncpy(out, cmdLine, n);
+        out[n] = L'\0';
+    }
+    return out[0] != L'\0';
+}
+
+// Returns true when the PE at 'path' is a 64-bit image.
+// Returns false on any read error (safe default).
+static bool ChildIsPe64(const wchar_t* path) {
+    HANDLE hf = CreateFileW(path, GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             NULL, OPEN_EXISTING, 0, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+
+    DWORD rd = 0;
+    IMAGE_DOS_HEADER dos = {};
+    ReadFile(hf, &dos, sizeof(dos), &rd, NULL);
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE) { CloseHandle(hf); return false; }
+
+    SetFilePointer(hf, dos.e_lfanew, NULL, FILE_BEGIN);
+    DWORD sig = 0;
+    ReadFile(hf, &sig, 4, &rd, NULL);
+    if (sig != IMAGE_NT_SIGNATURE) { CloseHandle(hf); return false; }
+
+    IMAGE_FILE_HEADER fh = {};
+    ReadFile(hf, &fh, sizeof(fh), &rd, NULL);
+    CloseHandle(hf);
+    return fh.Machine == IMAGE_FILE_MACHINE_AMD64;
+}
+
+// Print the "[VirtLauncher] child injected" block that mirrors what
+// VirtLauncher.exe prints for the root process, but tagged as [VirtHook]
+// to distinguish it from the launcher's own output.
+static void VerboseChildInjected(LPCWSTR appName, LPCWSTR cmdLine,
+                                  const char* dllPath,
+                                  DWORD childPid)
+{
+    if (!g_VerboseEnabled) return;
+
+    wchar_t exePath[MAX_PATH] = {};
+    if (!ResolveChildExePath(appName, cmdLine, exePath, MAX_PATH))
+        wcsncpy(exePath, L"(unknown)", MAX_PATH - 1);
+
+    // Resolve to full path if possible (SearchPath handles unqualified names).
+    wchar_t fullPath[MAX_PATH] = {};
+    if (!SearchPathW(NULL, exePath, L".exe", MAX_PATH, fullPath, NULL))
+        wcsncpy(fullPath, exePath, MAX_PATH - 1);
+
+    bool child64 = ChildIsPe64(fullPath[0] ? fullPath : exePath);
+    bool self64  = (sizeof(void*) == 8);
+
+    // Convert ANSI DLL path back to wide for display.
+    wchar_t dllW[MAX_PATH] = {};
+    MultiByteToWideChar(CP_ACP, 0, dllPath, -1, dllW, MAX_PATH);
+
+    VL_INFO(L"[VirtLauncher] --- Child process injected ---");
+    VL_INFO(L"[VirtLauncher] Target  : %s (%s)",
+            fullPath[0] ? fullPath : exePath,
+            child64 ? L"64-bit" : L"32-bit");
+    VL_INFO(L"[VirtLauncher] Parent  : PID %u (%s)",
+            GetCurrentProcessId(), self64 ? L"64-bit" : L"32-bit");
+    VL_INFO(L"[VirtLauncher] Command : %s",
+            cmdLine && cmdLine[0] ? cmdLine : (appName ? appName : L"(unknown)"));
+    VL_INFO(L"[VirtLauncher] Child   : PID %u", childPid);
+    VL_INFO(L"[VirtLauncher] Injecting: %s", dllW);
+    if (child64 != self64)
+        VL_INFO(L"[VirtLauncher]           (cross-arch: Detours swapped 32<->64 suffix)");
+}
+
 // Disable WOW64 FS redirection.  No-op in 64-bit builds.
 // Returns true if redirection was actually disabled; caller must restore.
 static bool DisableWow64Redir(PVOID* pOld) {
@@ -7870,6 +8022,9 @@ static BOOL WINAPI Hook_CreateProcessW(
                                   lpProcessAttributes, lpThreadAttributes,
                                   bInheritHandles, dwCreationFlags, lpEnvironment,
                                   lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+    } else {
+        VerboseChildInjected(lpApplicationName, lpCommandLine, dllPath,
+                             lpProcessInformation ? lpProcessInformation->dwProcessId : 0);
     }
     return ok;
 }
@@ -7933,6 +8088,16 @@ static BOOL WINAPI Hook_CreateProcessA(
                                   lpProcessAttributes, lpThreadAttributes,
                                   bInheritHandles, dwCreationFlags, lpEnvironment,
                                   lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+    } else {
+        // Convert ANSI args to wide so VerboseChildInjected can do path resolution.
+        wchar_t wApp[MAX_PATH] = {}, wCmd[MAX_PATH * 2] = {};
+        if (lpApplicationName)
+            MultiByteToWideChar(CP_ACP, 0, lpApplicationName, -1, wApp, MAX_PATH);
+        if (lpCommandLine)
+            MultiByteToWideChar(CP_ACP, 0, lpCommandLine, -1, wCmd, MAX_PATH * 2 - 1);
+        VerboseChildInjected(wApp[0] ? wApp : NULL, wCmd[0] ? wCmd : NULL,
+                             dllPath,
+                             lpProcessInformation ? lpProcessInformation->dwProcessId : 0);
     }
     return ok;
 }
