@@ -7252,104 +7252,48 @@ static NTSTATUS NTAPI Hook_NtQueryInformationFile(
     // FILE_NAME_INFORMATION layout: { ULONG FileNameLength; WCHAR FileName[1]; }
     struct MY_FNI { ULONG FileNameLength; WCHAR FileName[1]; };
 
-    // -----------------------------------------------------------------------
     // Reverse-translate a FILE_NAME_INFORMATION block in-place.
     //
-    // Classes 9 and 21 return a VOLUME-RELATIVE path in FileName: it starts
-    // with '\' but carries no '\??\' prefix and no drive letter, e.g.:
-    //   \sandbox\C\myapp\data    (physical, on the sandbox volume)
+    // The kernel writes a VOLUME-RELATIVE path into FileName (e.g. \sandbox\C\dir\file.txt)
+    // relative to the PHYSICAL volume the handle lives on.  The original code passed
+    // this directly to ReverseApplyFsRedirect which only matches \??\ NT paths --
+    // a volume-relative path never matches, so translation was always a no-op.
     //
-    // To call ReverseApplyFsRedirect (which needs a full '\??\X:\...' NT path)
-    // we must prepend the correct PHYSICAL drive root -- the drive that the
-    // underlying file handle (e.hVirt) actually lives on.
+    // Correct approach: we already know the logical NT path -- it is e.logPath
+    // (e.g. \??\C:\dir\file.txt).  We only need to strip the \??\X: prefix to get
+    // the volume-relative logical path and write that back.
     //
-    // We get that by querying e.hVirt with NtQueryObject (ObjectNameInformation)
-    // which returns a '\Device\HarddiskVolumeX\...' path; DevicePathToDosPath
-    // converts it to '\??\X:\...' and we take the first 6 chars as the prefix.
+    // We skip translation when isRealOnly=true: in that case hVirt IS the real file
+    // at the logical path, so the kernel already returns the correct volume-relative
+    // path for the logical volume -- no fix needed.
     //
-    // e.logPath is NOT used here: it carries the LOGICAL drive letter, which
-    // differs from the physical one whenever the sandbox is on a different
-    // volume (the common case).  Using logPath would produce the wrong prefix
-    // and ReverseApplyFsRedirect would never match.
-    // -----------------------------------------------------------------------
-
-    // Derive the physical drive root ('\??\X:') from e.hVirt via NtQueryObject.
-    // If the query fails we skip translation rather than guess.
-    std::wstring physDriveRoot;
-    if (e.hVirt && Real_NtQueryObject) {
-        std::vector<BYTE> buf(1024, 0);
-        ULONG retLen = 0;
-        NTSTATUS qst = Real_NtQueryObject(e.hVirt, 1, &buf[0], (ULONG)buf.size(), &retLen);
-        if (qst == VL_STATUS_BUFFER_TOO_SMALL || qst == VL_STATUS_BUFFER_OVERFLOW) {
-            buf.assign(retLen + 8, 0);
-            qst = Real_NtQueryObject(e.hVirt, 1, &buf[0], (ULONG)buf.size(), &retLen);
-        }
-        if (NT_SUCCESS(qst) && retLen >= sizeof(VL_UNICODE_STRING)) {
-            VL_UNICODE_STRING* us = reinterpret_cast<VL_UNICODE_STRING*>(&buf[0]);
-            if (us->Buffer && us->Length >= 2 * sizeof(WCHAR)) {
-                std::wstring devPath(us->Buffer, us->Length / sizeof(WCHAR));
-                // Convert \Device\HarddiskVolumeX\... -> \??\X:\...
-                if (StartsWithI(devPath, L"\\Device\\"))
-                    devPath = DevicePathToDosPath(devPath);
-                // Take the '\??\X:' prefix (6 chars)
-                if (devPath.size() >= 6 &&
-                    devPath[0] == L'\\' && devPath[1] == L'?' &&
-                    devPath[2] == L'?' && devPath[3] == L'\\' &&
-                    iswalpha(devPath[4]) && devPath[5] == L':')
-                {
-                    physDriveRoot = devPath.substr(0, 6);
-                }
-            }
-        }
-    }
-
-    // If we couldn't determine the physical drive, skip translation entirely.
-    if (physDriveRoot.empty()) return st;
-
-    auto reverseTranslateVolRel = [&](MY_FNI* pFni, ULONG avail) {
+    // Safety: only write back if the result is non-empty and fits in the buffer.
+    // A bare drive root (\??\X: with no further path) gives volRel = "" which we
+    // treat as "\" rather than writing an empty FileNameLength back.
+    auto reverseTranslate = [&](MY_FNI* pFni, ULONG avail) {
+        if (e.isRealOnly) return;                          // already on logical volume
         if (pFni->FileNameLength == 0) return;
         if (avail < sizeof(ULONG) + pFni->FileNameLength) return;
 
-        // Volume-relative physical path (starts with '\').
-        std::wstring volRel(pFni->FileName, pFni->FileNameLength / sizeof(WCHAR));
+        // Extract volume-relative logical path from e.logPath (\??\X:\rest -> \rest).
+        // e.logPath is guaranteed to be at least 6 chars (\??\X:) for any tracked handle.
+        if (e.logPath.size() < 6) return;
+        std::wstring volRelLog = e.logPath.substr(6);      // strip \??\X:
+        if (volRelLog.empty()) volRelLog = L"\\";          // bare drive root -> "\"
 
-        // Reconstruct full physical NT path using the correct physical drive.
-        std::wstring fullPhys = physDriveRoot + volRel;
-
-        std::wstring fullLog = ReverseApplyFsRedirect(fullPhys);
-        if (fullLog == fullPhys) return;   // no redirect matched, nothing to do
-
-        // Strip the '\??\Y:' prefix (6 chars) to get the volume-relative
-        // logical path.  The logical drive may differ from the physical one.
-        //
-        // Edge case: if fullLog == '\??\Y:' exactly (bare drive root, 6 chars),
-        // the volume-relative form is '\', not empty string.  Writing back
-        // empty would zero FileNameLength and crash callers (e.g. cmd.exe CWD).
-        std::wstring volRelLog;
-        if (fullLog.size() >= 6 &&
-            fullLog[0] == L'\\' && fullLog[1] == L'?' &&
-            fullLog[2] == L'?' && fullLog[3] == L'\\' &&
-            iswalpha(fullLog[4]) && fullLog[5] == L':')
-        {
-            volRelLog = fullLog.substr(6);
-            if (volRelLog.empty()) volRelLog = L"\\";   // bare drive root -> '\'
-        } else {
-            volRelLog = fullLog;
-        }
-
-        // Write back only if non-empty and fits in the buffer.
-        if (!volRelLog.empty() && volRelLog.size() <= volRel.size()) {
+        // Only write back if it fits (logical path <= physical path after redirect).
+        if (volRelLog.size() * sizeof(WCHAR) <= pFni->FileNameLength) {
             ULONG newLen = (ULONG)(volRelLog.size() * sizeof(WCHAR));
             memcpy(pFni->FileName, volRelLog.c_str(), newLen);
             pFni->FileNameLength = newLen;
-            VL_DBG(L"Hook_NtQueryInformationFile: reversed vol-rel %s -> %s",
-                   volRel.c_str(), volRelLog.c_str());
+            VL_DBG(L"Hook_NtQueryInformationFile: reversed FileName -> %s", volRelLog.c_str());
         }
     };
 
     // FileNameInformation (class 9): buffer IS FILE_NAME_INFORMATION.
+    // Pre-existing USHORT type bug fixed: FileNameLength is ULONG, not USHORT.
     if (FileInformationClass == 9 && Length >= sizeof(ULONG))
-        reverseTranslateVolRel(reinterpret_cast<MY_FNI*>(FileInformation), Length);
+        reverseTranslate(reinterpret_cast<MY_FNI*>(FileInformation), Length);
 
     // FileAllInformation (class 21): composite structure with FILE_NAME_INFORMATION
     // embedded at a fixed offset of 96 bytes.
@@ -7364,44 +7308,34 @@ static NTSTATUS NTAPI Hook_NtQueryInformationFile(
     //   FILE_ALIGNMENT_INFORMATION   4 bytes  (ULONG)
     //   FILE_NAME_INFORMATION            <-- offset 96
     //
-    // Same volume-relative format as class 9; uses the same lambda.
+    // Without interception the embedded name leaks the physical virtual-store
+    // path -- same class of bug as the NtQueryKey FIX A above.
     if (FileInformationClass == 21) {
         const ULONG kNameOffset = 96u;
         if (Length > kNameOffset + sizeof(ULONG))
-            reverseTranslateVolRel(
+            reverseTranslate(
                 reinterpret_cast<MY_FNI*>(static_cast<BYTE*>(FileInformation) + kNameOffset),
                 Length - kNameOffset);
     }
 
-    // FileNormalizedNameInformation (class 48): FILE_NAME_INFORMATION whose
-    // FileName is a DEVICE path: \Device\HarddiskVolumeX\rest
-    // DevicePathToDosPath converts it to \??\X:\rest so ReverseApplyFsRedirect
-    // can match, then we write the result back as a device path.
-    if (FileInformationClass == 48 && Length >= sizeof(ULONG)) {
+    // FileNormalizedNameInformation (class 48): returns a full DEVICE path
+    // \Device\HarddiskVolumeX\rest rather than a volume-relative path.
+    // The reverseTranslate lambda above handles volume-relative (classes 9/21);
+    // class 48 needs different treatment: write e.logPath (\??\X:\rest) directly.
+    // \??\X:\rest is shorter than \Device\HarddiskVolumeX\rest so it always fits.
+    // Callers that query FileNormalizedNameInformation accept \??\ NT paths.
+    if (FileInformationClass == 48 && !e.isRealOnly &&
+        Length >= sizeof(ULONG) && e.logPath.size() >= 6)
+    {
         MY_FNI* pFni = reinterpret_cast<MY_FNI*>(FileInformation);
         if (pFni->FileNameLength > 0 &&
             Length >= sizeof(ULONG) + pFni->FileNameLength)
         {
-            std::wstring devPath(pFni->FileName, pFni->FileNameLength / sizeof(WCHAR));
-            // Convert \Device\HarddiskVolumeX\... -> \??\X:\...
-            std::wstring dosPath = DevicePathToDosPath(devPath);
-            if (dosPath != devPath) {
-                // dosPath is now in \??\X:\... form; reverse-apply redirect.
-                std::wstring logDos = ReverseApplyFsRedirect(dosPath);
-                if (logDos != dosPath) {
-                    // We cannot reconstruct the \Device\... form for an arbitrary
-                    // logical drive letter without re-querying QueryDosDevice, and
-                    // the result must fit in the original buffer.  Write the \??\
-                    // form instead; it is valid as a normalized name and all callers
-                    // that interpret this class accept NT paths.
-                    if (logDos.size() <= devPath.size()) {
-                        ULONG newLen = (ULONG)(logDos.size() * sizeof(WCHAR));
-                        memcpy(pFni->FileName, logDos.c_str(), newLen);
-                        pFni->FileNameLength = newLen;
-                        VL_DBG(L"Hook_NtQueryInformationFile cl48: reversed %s -> %s",
-                               devPath.c_str(), logDos.c_str());
-                    }
-                }
+            ULONG newLen = (ULONG)(e.logPath.size() * sizeof(WCHAR));
+            if (newLen <= pFni->FileNameLength) {
+                memcpy(pFni->FileName, e.logPath.c_str(), newLen);
+                pFni->FileNameLength = newLen;
+                VL_DBG(L"Hook_NtQueryInformationFile cl48: reversed -> %s", e.logPath.c_str());
             }
         }
     }
