@@ -5,6 +5,10 @@ Launches an application with a virtual file system and virtual registry by injec
 is this a sandboxie alternative?
 NO! sandboxie have better security sandboxing, i never had in mind security when i made this tool, in fact even sandboxie cannot be used safely to run unsecure code, so this tool should not be used for secure sandboxing, this is just a babysitter not a criminal prison
 
+# Debug
+set VLAUNCHER_VERBOSE=true  will print to console inicialisation injections in main and childs
+set VLAUNCHER_DEBUG=true will print debug logs, to view them you can use DebugView
+
 # Build instructions:
   - Install Visual Studio 10 or Windows SDK 7.1 for Windows 7
   - use BUILD.bat

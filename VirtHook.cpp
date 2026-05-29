@@ -37,6 +37,7 @@
 //     NtQueryInformationFile                           (path reverse-translate)
 //
 //   CHILDREN: CreateProcessW/A (propagate injection + prefix child lpTitle)
+//             NtCreateUserProcess (catch browsers/Electron that bypass CreateProcessW)
 //
 //   WINDOW TITLE PREFIXING (@ marker, same concept as Sandboxie's #):
 //     SetWindowTextW/A      — GUI app title changes
@@ -571,6 +572,37 @@ typedef NTSTATUS (NTAPI *PfnNtQueryDirectoryFileEx)(HANDLE, HANDLE, VL_PIO_APC_R
 typedef BOOL (WINAPI *PfnCreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
 typedef BOOL (WINAPI *PfnCreateProcessA)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
 
+// ---- NtCreateUserProcess (ntdll) ----
+// Firefox's sandbox broker calls this directly, bypassing CreateProcessW entirely.
+// We need to hook it at the NT layer to intercept those children.
+//
+// The full signature is documented in Geoff Chappell's research and the ReactOS
+// source.  We only need the fields required to implement suspend-inject-resume:
+//   ProcessHandle / ThreadHandle  -- output handles
+//   ProcessFlags / ThreadFlags    -- ULONG bitmasks; we OR in the suspend flag
+//   ProcessParameters             -- RTL_USER_PROCESS_PARAMETERS* (not used by hook)
+//   CreateInfo (PS_CREATE_INFO*)  -- in/out; we read State after the call
+//   AttributeList (PS_ATTRIBUTE_LIST*) -- may carry PROC_THREAD_ATTRIBUTE_* entries
+//
+// We use PVOID for the complex in/out structs we don't need to inspect.
+// The calling convention is the standard ntdll NTAPI (stdcall on x86, x64 ABI).
+
+// Thread-creation flags bitmask.  Bit 0 = CREATE_SUSPENDED equivalent at NT level.
+#define VL_THREAD_CREATE_FLAGS_CREATE_SUSPENDED  0x00000001UL
+
+typedef NTSTATUS (NTAPI *PfnNtCreateUserProcess)(
+    PHANDLE  ProcessHandle,
+    PHANDLE  ThreadHandle,
+    ACCESS_MASK ProcessDesiredAccess,
+    ACCESS_MASK ThreadDesiredAccess,
+    PVOID    ProcessObjectAttributes,   // POBJECT_ATTRIBUTES, optional
+    PVOID    ThreadObjectAttributes,    // POBJECT_ATTRIBUTES, optional
+    ULONG    ProcessFlags,              // PROCESS_CREATE_FLAGS_*
+    ULONG    ThreadFlags,               // THREAD_CREATE_FLAGS_*
+    PVOID    ProcessParameters,         // PRTL_USER_PROCESS_PARAMETERS
+    PVOID    CreateInfo,                // PPS_CREATE_INFO (in/out)
+    PVOID    AttributeList);            // PPS_ATTRIBUTE_LIST, optional
+
 // Window title prefixing (@)
 typedef BOOL  (WINAPI *PfnSetWindowTextW)(HWND, LPCWSTR);
 typedef BOOL  (WINAPI *PfnSetWindowTextA)(HWND, LPCSTR);
@@ -638,8 +670,9 @@ static PfnNtQueryDirectoryFile      Real_NtQueryDirectoryFile;
 static PfnNtQueryDirectoryFileEx    Real_NtQueryDirectoryFileEx;
 
 // ----- Children -----
-static PfnCreateProcessW  Real_CreateProcessW;
-static PfnCreateProcessA  Real_CreateProcessA;
+static PfnCreateProcessW       Real_CreateProcessW;
+static PfnCreateProcessA       Real_CreateProcessA;
+static PfnNtCreateUserProcess  Real_NtCreateUserProcess;  // ntdll low-level; used by Firefox sandbox broker
 
 // ----- Window title prefixing -----
 static PfnSetWindowTextW  Real_SetWindowTextW;
@@ -8147,6 +8180,249 @@ static BOOL WINAPI Hook_CreateProcessA(
 }
 
 // ============================================================
+// NtCreateUserProcess hook
+// ============================================================
+//
+// WHY THIS IS NEEDED
+// ------------------
+// Firefox's sandbox broker (and some other browsers / Electron apps) spawns
+// content/utility processes by calling NtCreateUserProcess in ntdll directly,
+// completely bypassing kernel32!CreateProcessW.  Our Hook_CreateProcessW never
+// fires for those children, so VirtHook.dll is never injected into them and
+// they escape the sandbox entirely.
+//
+// HOW IT WORKS
+// ------------
+// 1. Intercept NtCreateUserProcess.
+// 2. Force the new thread to start suspended by ORing
+//    VL_THREAD_CREATE_FLAGS_CREATE_SUSPENDED into ThreadFlags.
+// 3. Let the real NtCreateUserProcess run (it returns with the process created
+//    but its main thread blocked before any user code executes).
+// 4. Inject VirtHook.dll into the suspended process via the classic
+//    VirtualAllocEx / WriteProcessMemory / CreateRemoteThread technique.
+//    CreateRemoteThread calls LoadLibraryW in the target; we wait for it to
+//    complete so the DLL is fully loaded before the main thread resumes.
+// 5. Resume the main thread.
+// 6. If anything fails, resume the thread anyway so the child is not left
+//    permanently frozen.
+//
+// IMPORTANT DESIGN CONSTRAINTS
+// ----------------------------
+// * We must NOT call any of our own hooked functions from inside this hook
+//   (they would re-enter the hook table and could deadlock).  All Win32 calls
+//   here go through the real kernel32 / ntdll trampolines directly.
+//
+// * Firefox's broker passes EXTENDED_STARTUPINFO_PRESENT attributes inside
+//   the PS_ATTRIBUTE_LIST (PROC_THREAD_ATTRIBUTE_HANDLE_LIST, security token,
+//   etc.).  We leave the attribute list completely untouched -- the broker's
+//   sandboxing policy is its own business; we only add our DLL on top.
+//
+// * If the child already has VirtHook.dll in its import table (Detours patched
+//   it via CreateProcessW first), this hook is a no-op for it because
+//   Real_NtCreateUserProcess was replaced in that process's ntdll before we
+//   got here; the duplicate-load will simply return a second module handle
+//   (DllMain DLL_PROCESS_ATTACH is not called again) and the RemoteThread
+//   exits cleanly.
+//
+// * We guard with IsReentrant() so that the CreateRemoteThread call itself
+//   (which goes through ntdll and may re-enter NtCreateUserProcess) does not
+//   trigger a second injection attempt.
+
+static NTSTATUS NTAPI Hook_NtCreateUserProcess(
+    PHANDLE  ProcessHandle,
+    PHANDLE  ThreadHandle,
+    ACCESS_MASK ProcessDesiredAccess,
+    ACCESS_MASK ThreadDesiredAccess,
+    PVOID    ProcessObjectAttributes,
+    PVOID    ThreadObjectAttributes,
+    ULONG    ProcessFlags,
+    ULONG    ThreadFlags,
+    PVOID    ProcessParameters,
+    PVOID    CreateInfo,
+    PVOID    AttributeList)
+{
+    // ---- reentrancy guard ---------------------------------------------------
+    // CreateRemoteThread below eventually calls NtCreateUserProcess itself
+    // (to spawn the remote thread inside the child).  Without the guard that
+    // would re-enter this hook and attempt a second injection.
+    if (IsReentrant()) {
+        return Real_NtCreateUserProcess(
+            ProcessHandle, ThreadHandle,
+            ProcessDesiredAccess, ThreadDesiredAccess,
+            ProcessObjectAttributes, ThreadObjectAttributes,
+            ProcessFlags, ThreadFlags,
+            ProcessParameters, CreateInfo, AttributeList);
+    }
+
+    // ---- do we have a DLL to inject? ----------------------------------------
+    const char* dllPathA = PickDllPath();
+    if (!dllPathA || !dllPathA[0]) {
+        VL_DBG(L"Hook_NtCreateUserProcess: no DLL path, pass-through");
+        return Real_NtCreateUserProcess(
+            ProcessHandle, ThreadHandle,
+            ProcessDesiredAccess, ThreadDesiredAccess,
+            ProcessObjectAttributes, ThreadObjectAttributes,
+            ProcessFlags, ThreadFlags,
+            ProcessParameters, CreateInfo, AttributeList);
+    }
+
+    // ---- force the child's initial thread to start suspended ----------------
+    // We pick the right DLL arch (32 vs 64) the same way Hook_CreateProcessW
+    // does -- Detours suffix-swaps for cross-arch -- but here we do it manually
+    // because we are not going through Detours' CreateProcess wrapper.
+    // Pick arch-matched DLL path (wide).
+    const char* archDll = dllPathA;
+
+    ULONG suspendedThreadFlags = ThreadFlags | VL_THREAD_CREATE_FLAGS_CREATE_SUSPENDED;
+
+    SetReentrant(true);
+    NTSTATUS st = Real_NtCreateUserProcess(
+        ProcessHandle, ThreadHandle,
+        ProcessDesiredAccess, ThreadDesiredAccess,
+        ProcessObjectAttributes, ThreadObjectAttributes,
+        ProcessFlags, suspendedThreadFlags,
+        ProcessParameters, CreateInfo, AttributeList);
+    SetReentrant(false);
+
+    if (!NT_SUCCESS(st)) {
+        // Process creation failed; nothing to inject.
+        VL_DBG(L"Hook_NtCreateUserProcess: NtCreateUserProcess failed st=0x%08X", (ULONG)st);
+        return st;
+    }
+
+    // At this point the child process exists with its main thread suspended.
+    HANDLE hProcess = (ProcessHandle && *ProcessHandle) ? *ProcessHandle : NULL;
+    HANDLE hThread  = (ThreadHandle  && *ThreadHandle)  ? *ThreadHandle  : NULL;
+
+    if (!hProcess || !hThread) {
+        VL_DBG(L"Hook_NtCreateUserProcess: got NULL process/thread handle, skipping injection");
+        // Thread was forced suspended; we must resume it before returning.
+        if (hThread) ResumeThread(hThread);
+        return st;
+    }
+
+    VL_DBG(L"Hook_NtCreateUserProcess: child created (suspended), injecting %S", archDll);
+    VL_INFO(L"[VirtLauncher] [NtCreateUserProcess] child suspended, injecting %S", archDll);
+
+    // ---- choose the correct arch DLL ----------------------------------------
+    // The child's bitness might differ from ours (a 64-bit broker spawning a
+    // 32-bit shim, or vice-versa).  We detect the child's arch by reading its
+    // PEB.IsWow64 flag and choose g_DllPathA32 / g_DllPathA64 accordingly.
+    // If detection fails we fall back to the caller's own arch.
+    bool childIs64 = false;
+    {
+        BOOL isWow64Child = FALSE;
+        // IsWow64Process returns TRUE for a 32-bit process on a 64-bit OS.
+        typedef BOOL (WINAPI *PfnIsWow64)(HANDLE, PBOOL);
+        static PfnIsWow64 s_isWow64 = (PfnIsWow64)GetProcAddress(
+            GetModuleHandleA("kernel32.dll"), "IsWow64Process");
+        if (s_isWow64 && s_isWow64(hProcess, &isWow64Child)) {
+#ifdef _WIN64
+            // We are 64-bit.  isWow64Child==TRUE means child is 32-bit WOW64.
+            childIs64 = !isWow64Child;
+#else
+            // We are 32-bit.  isWow64Child==FALSE means child is also 32-bit.
+            childIs64 = false;  // 32-bit process cannot spawn a 64-bit child directly
+#endif
+        } else {
+#ifdef _WIN64
+            childIs64 = true;   // default: same arch as caller
+#else
+            childIs64 = false;
+#endif
+        }
+    }
+
+    const char* injectDll = childIs64
+        ? (g_DllPathA64[0] ? g_DllPathA64 : archDll)
+        : (g_DllPathA32[0] ? g_DllPathA32 : archDll);
+
+    // Convert DLL path to wide for WriteProcessMemory.
+    wchar_t dllPathW[MAX_PATH] = {};
+    MultiByteToWideChar(CP_ACP, 0, injectDll, -1, dllPathW, MAX_PATH);
+    SIZE_T dllPathBytes = (wcslen(dllPathW) + 1) * sizeof(wchar_t);
+
+    bool injected = false;
+
+    // ---- allocate memory in child for the DLL path string -------------------
+    SetReentrant(true);
+    LPVOID remoteBuf = VirtualAllocEx(hProcess, NULL, dllPathBytes,
+                                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (remoteBuf) {
+        SIZE_T written = 0;
+        if (WriteProcessMemory(hProcess, remoteBuf, dllPathW, dllPathBytes, &written)
+            && written == dllPathBytes)
+        {
+            // ---- resolve LoadLibraryW in the child ---------------------------
+            // LoadLibraryW lives in kernel32.dll at the same VA in every process
+            // on the same OS session (ASLR shifts the whole image, but all
+            // processes share the same shift for kernel32 within a session).
+            HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+            LPTHREAD_START_ROUTINE pfnLoadLib = hK32
+                ? (LPTHREAD_START_ROUTINE)GetProcAddress(hK32, "LoadLibraryW")
+                : NULL;
+
+            if (pfnLoadLib) {
+                // ---- CreateRemoteThread to call LoadLibraryW(dllPathW) ------
+                HANDLE hRemote = CreateRemoteThread(
+                    hProcess,
+                    NULL,             // default security
+                    0,                // default stack size
+                    pfnLoadLib,       // LoadLibraryW
+                    remoteBuf,        // argument: pointer to DLL path in child
+                    0,                // run immediately
+                    NULL);
+
+                if (hRemote) {
+                    // Wait for LoadLibraryW to finish (DllMain must complete
+                    // before we resume the main thread or we risk a race where
+                    // the main thread starts executing before hooks are installed).
+                    WaitForSingleObject(hRemote, 10000);   // 10 s timeout
+                    DWORD remoteResult = 0;
+                    GetExitCodeThread(hRemote, &remoteResult);
+                    CloseHandle(hRemote);
+                    injected = (remoteResult != 0);  // LoadLibraryW returns HMODULE (!=0 on success)
+                    VL_DBG(L"Hook_NtCreateUserProcess: LoadLibraryW remote exit=0x%X (%s)",
+                           remoteResult, injected ? L"OK" : L"FAILED");
+                    VL_INFO(L"[VirtLauncher] [NtCreateUserProcess] injection %s",
+                            injected ? L"succeeded" : L"FAILED (LoadLibraryW returned NULL)");
+                } else {
+                    VL_DBG(L"Hook_NtCreateUserProcess: CreateRemoteThread FAILED err=%u",
+                           GetLastError());
+                    VL_INFO(L"[VirtLauncher] [NtCreateUserProcess] CreateRemoteThread FAILED err=%u",
+                            GetLastError());
+                }
+            } else {
+                VL_DBG(L"Hook_NtCreateUserProcess: could not resolve LoadLibraryW");
+            }
+        } else {
+            VL_DBG(L"Hook_NtCreateUserProcess: WriteProcessMemory FAILED err=%u",
+                   GetLastError());
+        }
+
+        // Always free the remote buffer; the DLL has already been loaded
+        // (or the attempt failed) and the string is no longer needed.
+        VirtualFreeEx(hProcess, remoteBuf, 0, MEM_RELEASE);
+    } else {
+        VL_DBG(L"Hook_NtCreateUserProcess: VirtualAllocEx FAILED err=%u",
+               GetLastError());
+        VL_INFO(L"[VirtLauncher] [NtCreateUserProcess] VirtualAllocEx FAILED err=%u -- child escapes sandbox",
+                GetLastError());
+    }
+    SetReentrant(false);
+
+    // ---- resume the main thread regardless of injection outcome -------------
+    // If injection failed the child runs un-hooked (same as the pre-fix
+    // behaviour), which is better than leaving it permanently suspended.
+    DWORD prevCount = ResumeThread(hThread);
+    (void)prevCount;
+    VL_DBG(L"Hook_NtCreateUserProcess: ResumeThread prevSuspendCount=%u injected=%d",
+           prevCount, (int)injected);
+
+    return st;
+}
+
+// ============================================================
 // Hook Install / Uninstall
 // ============================================================
 
@@ -8402,6 +8678,9 @@ static void InstallHooks() {
     VL_GETPROC(ntdll, NtQueryObject);
     VL_GETPROC(k32,   CreateProcessW);
     VL_GETPROC(k32,   CreateProcessA);
+    // NtCreateUserProcess: present on Vista+.  Browsers / Electron apps call
+    // it directly to spawn sandboxed children, bypassing CreateProcessW.
+    VL_GETPROC(ntdll, NtCreateUserProcess);
 
     // Window title prefixing — user32.dll
     {
@@ -8523,6 +8802,7 @@ static void InstallHooks() {
     VL_ATTACH(NtClose);
     VL_ATTACH(CreateProcessW);
     VL_ATTACH(CreateProcessA);
+    if (Real_NtCreateUserProcess) VL_ATTACH(NtCreateUserProcess);
 
     // Window title prefixing
     if (Real_SetWindowTextW)  VL_ATTACH(SetWindowTextW);
@@ -8595,6 +8875,7 @@ static void UninstallHooks() {
     VL_DETACH(NtClose);
     VL_DETACH(CreateProcessW);
     VL_DETACH(CreateProcessA);
+    if (Real_NtCreateUserProcess) VL_DETACH(NtCreateUserProcess);
 
     // Window title prefixing
     if (Real_SetWindowTextW)  VL_DETACH(SetWindowTextW);

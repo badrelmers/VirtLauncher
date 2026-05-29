@@ -16,8 +16,8 @@ rem rmdir /Q /S c:\virtl 2>nul
 
 echo virtual store: C:\virtl
 rem VirtLauncher64.exe -r -f C:\virtl -e E:\archivosdeprogramas\FirefoxPortableLegacy115\FirefoxPortable.exe
-VirtLauncher64.exe -r -f C:\virtl -e "E:\archivosdeprogramas\FirefoxPortableLegacy115\App\Firefox64\firefox.exe"
-rem VirtLauncher64.exe -r -f C:\virtl -e "E:\archivosdeprogramas\FirefoxPortableLegacy115\App\Firefox64\firefox.exe" -no-sandbox
+rem VirtLauncher64.exe -r -f C:\virtl -e "E:\archivosdeprogramas\FirefoxPortableLegacy115\App\Firefox64\firefox.exe"
+VirtLauncher64.exe -r -f C:\virtl -e "E:\archivosdeprogramas\FirefoxPortableLegacy115\App\Firefox64\firefox.exe" -no-sandbox
 
 @rem this will not run
 rem if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
