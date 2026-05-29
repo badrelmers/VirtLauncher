@@ -7255,27 +7255,56 @@ static NTSTATUS NTAPI Hook_NtQueryInformationFile(
     // -----------------------------------------------------------------------
     // Reverse-translate a FILE_NAME_INFORMATION block in-place.
     //
-    // Classes 9 and 21 return a VOLUME-RELATIVE path: the FileName starts with
-    // '\' but has no '\??\' prefix and no drive letter, e.g.:
-    //   \VirtL\C\foo\bar.txt   (physical, inside the virtual store)
+    // Classes 9 and 21 return a VOLUME-RELATIVE path in FileName: it starts
+    // with '\' but carries no '\??\' prefix and no drive letter, e.g.:
+    //   \sandbox\C\myapp\data    (physical, on the sandbox volume)
     //
-    // ReverseApplyFsRedirect works on full '\??\X:\...' NT paths, so we must:
-    //   1. Reconstruct the full NT path by prepending the drive root extracted
-    //      from e.logPath  (e.g. '\??\C:' + '\VirtL\C\foo\bar.txt').
-    //   2. Call ReverseApplyFsRedirect to get the logical NT path.
-    //   3. Strip the '\??\X:' prefix back off and write only the
-    //      volume-relative portion into FileName.
+    // To call ReverseApplyFsRedirect (which needs a full '\??\X:\...' NT path)
+    // we must prepend the correct PHYSICAL drive root -- the drive that the
+    // underlying file handle (e.hVirt) actually lives on.
     //
-    // e.logPath is the full '\??\X:\...' logical path tracked when the handle
-    // was opened, so its first 6 characters are '\??\X:'.
+    // We get that by querying e.hVirt with NtQueryObject (ObjectNameInformation)
+    // which returns a '\Device\HarddiskVolumeX\...' path; DevicePathToDosPath
+    // converts it to '\??\X:\...' and we take the first 6 chars as the prefix.
+    //
+    // e.logPath is NOT used here: it carries the LOGICAL drive letter, which
+    // differs from the physical one whenever the sandbox is on a different
+    // volume (the common case).  Using logPath would produce the wrong prefix
+    // and ReverseApplyFsRedirect would never match.
     // -----------------------------------------------------------------------
 
-    // Extract '\??\X:' (6 chars) from the tracked logical path.
-    // If logPath is too short (shouldn't happen for a tracked file handle),
-    // fall through without translation.
-    const std::wstring& logPath = e.logPath;
-    if (logPath.size() < 6) return st;
-    const std::wstring driveRoot = logPath.substr(0, 6);   // e.g. L"\\??\\C:"
+    // Derive the physical drive root ('\??\X:') from e.hVirt via NtQueryObject.
+    // If the query fails we skip translation rather than guess.
+    std::wstring physDriveRoot;
+    if (e.hVirt && Real_NtQueryObject) {
+        std::vector<BYTE> buf(1024, 0);
+        ULONG retLen = 0;
+        NTSTATUS qst = Real_NtQueryObject(e.hVirt, 1, &buf[0], (ULONG)buf.size(), &retLen);
+        if (qst == VL_STATUS_BUFFER_TOO_SMALL || qst == VL_STATUS_BUFFER_OVERFLOW) {
+            buf.assign(retLen + 8, 0);
+            qst = Real_NtQueryObject(e.hVirt, 1, &buf[0], (ULONG)buf.size(), &retLen);
+        }
+        if (NT_SUCCESS(qst) && retLen >= sizeof(VL_UNICODE_STRING)) {
+            VL_UNICODE_STRING* us = reinterpret_cast<VL_UNICODE_STRING*>(&buf[0]);
+            if (us->Buffer && us->Length >= 2 * sizeof(WCHAR)) {
+                std::wstring devPath(us->Buffer, us->Length / sizeof(WCHAR));
+                // Convert \Device\HarddiskVolumeX\... -> \??\X:\...
+                if (StartsWithI(devPath, L"\\Device\\"))
+                    devPath = DevicePathToDosPath(devPath);
+                // Take the '\??\X:' prefix (6 chars)
+                if (devPath.size() >= 6 &&
+                    devPath[0] == L'\\' && devPath[1] == L'?' &&
+                    devPath[2] == L'?' && devPath[3] == L'\\' &&
+                    iswalpha(devPath[4]) && devPath[5] == L':')
+                {
+                    physDriveRoot = devPath.substr(0, 6);
+                }
+            }
+        }
+    }
+
+    // If we couldn't determine the physical drive, skip translation entirely.
+    if (physDriveRoot.empty()) return st;
 
     auto reverseTranslateVolRel = [&](MY_FNI* pFni, ULONG avail) {
         if (pFni->FileNameLength == 0) return;
@@ -7284,36 +7313,31 @@ static NTSTATUS NTAPI Hook_NtQueryInformationFile(
         // Volume-relative physical path (starts with '\').
         std::wstring volRel(pFni->FileName, pFni->FileNameLength / sizeof(WCHAR));
 
-        // Reconstruct full NT path: '\??\X:' + '\VirtL\C\foo\bar.txt'
-        std::wstring fullPhys = driveRoot + volRel;
+        // Reconstruct full physical NT path using the correct physical drive.
+        std::wstring fullPhys = physDriveRoot + volRel;
 
         std::wstring fullLog = ReverseApplyFsRedirect(fullPhys);
         if (fullLog == fullPhys) return;   // no redirect matched, nothing to do
 
-        // Strip the '\??\X:' prefix (exactly 6 chars: \??\Y:) back to get the
-        // volume-relative logical path.  The logical drive letter may differ from
-        // the physical one when config rules map across drives.
+        // Strip the '\??\Y:' prefix (6 chars) to get the volume-relative
+        // logical path.  The logical drive may differ from the physical one.
         //
-        // Edge case: ReverseApplyFsRedirect may return exactly '\??\Y:' (6 chars,
-        // no further path component) when the physical path was the virtual store's
-        // drive-root folder itself  e.g. sandbox\F\ -> \??\F:  .
-        // The volume-relative form of a bare drive root is '\' (one backslash),
-        // NOT an empty string.  Writing back empty crashes callers (cmd.exe CWD).
+        // Edge case: if fullLog == '\??\Y:' exactly (bare drive root, 6 chars),
+        // the volume-relative form is '\', not empty string.  Writing back
+        // empty would zero FileNameLength and crash callers (e.g. cmd.exe CWD).
         std::wstring volRelLog;
         if (fullLog.size() >= 6 &&
             fullLog[0] == L'\\' && fullLog[1] == L'?' &&
             fullLog[2] == L'?' && fullLog[3] == L'\\' &&
             iswalpha(fullLog[4]) && fullLog[5] == L':')
         {
-            volRelLog = fullLog.substr(6);          // e.g. '\foo\bar.txt'
-            if (volRelLog.empty()) volRelLog = L"\\"; // bare drive root -> '\'
+            volRelLog = fullLog.substr(6);
+            if (volRelLog.empty()) volRelLog = L"\\";   // bare drive root -> '\'
         } else {
-            volRelLog = fullLog;   // unexpected format; use as-is
+            volRelLog = fullLog;
         }
 
-        // Only write back if the result is non-empty and fits in the buffer.
-        // (The logical path must always be <= the physical length after reversal,
-        // but guard explicitly so a logic error never overflows the buffer.)
+        // Write back only if non-empty and fits in the buffer.
         if (!volRelLog.empty() && volRelLog.size() <= volRel.size()) {
             ULONG newLen = (ULONG)(volRelLog.size() * sizeof(WCHAR));
             memcpy(pFni->FileName, volRelLog.c_str(), newLen);
