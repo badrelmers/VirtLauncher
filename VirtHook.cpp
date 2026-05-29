@@ -7253,18 +7253,40 @@ static NTSTATUS NTAPI Hook_NtQueryInformationFile(
     struct MY_FNI { ULONG FileNameLength; WCHAR FileName[1]; };
 
     // Reverse-translate a FILE_NAME_INFORMATION block in-place.
-    // avail = bytes available from pFni to end of buffer.
-    // ReverseApplyFsRedirect always produces a path <= the physical length,
-    // so in-place shrink never overflows.
-    auto reverseTranslate = [](MY_FNI* pFni, ULONG avail) {
+    //
+    // The kernel writes a VOLUME-RELATIVE path into FileName (e.g. \sandbox\C\dir\file.txt)
+    // relative to the PHYSICAL volume the handle lives on.  The original code passed
+    // this directly to ReverseApplyFsRedirect which only matches \??\ NT paths --
+    // a volume-relative path never matches, so translation was always a no-op.
+    //
+    // Correct approach: we already know the logical NT path -- it is e.logPath
+    // (e.g. \??\C:\dir\file.txt).  We only need to strip the \??\X: prefix to get
+    // the volume-relative logical path and write that back.
+    //
+    // We skip translation when isRealOnly=true: in that case hVirt IS the real file
+    // at the logical path, so the kernel already returns the correct volume-relative
+    // path for the logical volume -- no fix needed.
+    //
+    // Safety: only write back if the result is non-empty and fits in the buffer.
+    // A bare drive root (\??\X: with no further path) gives volRel = "" which we
+    // treat as "\" rather than writing an empty FileNameLength back.
+    auto reverseTranslate = [&](MY_FNI* pFni, ULONG avail) {
+        if (e.isRealOnly) return;                          // already on logical volume
         if (pFni->FileNameLength == 0) return;
         if (avail < sizeof(ULONG) + pFni->FileNameLength) return;
-        std::wstring phys(pFni->FileName, pFni->FileNameLength / sizeof(WCHAR));
-        std::wstring log = ReverseApplyFsRedirect(phys);
-        if (log != phys && log.size() <= phys.size()) {
-            ULONG newLen = (ULONG)(log.size() * sizeof(WCHAR));
-            memcpy(pFni->FileName, log.c_str(), newLen);
+
+        // Extract volume-relative logical path from e.logPath (\??\X:\rest -> \rest).
+        // e.logPath is guaranteed to be at least 6 chars (\??\X:) for any tracked handle.
+        if (e.logPath.size() < 6) return;
+        std::wstring volRelLog = e.logPath.substr(6);      // strip \??\X:
+        if (volRelLog.empty()) volRelLog = L"\\";          // bare drive root -> "\"
+
+        // Only write back if it fits (logical path <= physical path after redirect).
+        if (volRelLog.size() * sizeof(WCHAR) <= pFni->FileNameLength) {
+            ULONG newLen = (ULONG)(volRelLog.size() * sizeof(WCHAR));
+            memcpy(pFni->FileName, volRelLog.c_str(), newLen);
             pFni->FileNameLength = newLen;
+            VL_DBG(L"Hook_NtQueryInformationFile: reversed FileName -> %s", volRelLog.c_str());
         }
     };
 
@@ -7294,6 +7316,28 @@ static NTSTATUS NTAPI Hook_NtQueryInformationFile(
             reverseTranslate(
                 reinterpret_cast<MY_FNI*>(static_cast<BYTE*>(FileInformation) + kNameOffset),
                 Length - kNameOffset);
+    }
+
+    // FileNormalizedNameInformation (class 48): returns a full DEVICE path
+    // \Device\HarddiskVolumeX\rest rather than a volume-relative path.
+    // The reverseTranslate lambda above handles volume-relative (classes 9/21);
+    // class 48 needs different treatment: write e.logPath (\??\X:\rest) directly.
+    // \??\X:\rest is shorter than \Device\HarddiskVolumeX\rest so it always fits.
+    // Callers that query FileNormalizedNameInformation accept \??\ NT paths.
+    if (FileInformationClass == 48 && !e.isRealOnly &&
+        Length >= sizeof(ULONG) && e.logPath.size() >= 6)
+    {
+        MY_FNI* pFni = reinterpret_cast<MY_FNI*>(FileInformation);
+        if (pFni->FileNameLength > 0 &&
+            Length >= sizeof(ULONG) + pFni->FileNameLength)
+        {
+            ULONG newLen = (ULONG)(e.logPath.size() * sizeof(WCHAR));
+            if (newLen <= pFni->FileNameLength) {
+                memcpy(pFni->FileName, e.logPath.c_str(), newLen);
+                pFni->FileNameLength = newLen;
+                VL_DBG(L"Hook_NtQueryInformationFile cl48: reversed -> %s", e.logPath.c_str());
+            }
+        }
     }
 
     return st;
