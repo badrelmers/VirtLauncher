@@ -44,7 +44,41 @@ static bool g_Debug   = false;  // --debug   / VLAUNCHER_DEBUG
 
 // Verbose-only informational output.
 // Errors use wprintf directly so they always appear.
-#define VL_INFO(...)  do { if (g_Verbose) wprintf(__VA_ARGS__); } while(0)
+//
+// Writes to two destinations simultaneously:
+//   1. wprintf  -- the console window (existing behaviour).
+//   2. OutputDebugStringW -- DebugView / any attached debugger,
+//      using the same "[PID] message" format as VirtHook.dll's VL_INFO
+//      so all [VirtLauncher] messages from every process in the tree
+//      appear together in a single DebugView session.
+//
+// The trailing newline is stripped for OutputDebugString because
+// DebugView adds its own line separator; wprintf keeps it for the console.
+static void VL_INFO_impl(const wchar_t* fmt, ...) {
+    wchar_t buf[2048];
+    va_list va;
+    va_start(va, fmt);
+    _vsnwprintf(buf, 2047, fmt, va);
+    va_end(va);
+    buf[2047] = L'\0';
+
+    // Console output (original behaviour).
+    wprintf(L"%s", buf);
+
+    // DebugView output: strip trailing CR/LF so DebugView displays the
+    // message on a single line, then prepend the PID as VirtHook.dll does.
+    size_t len = wcslen(buf);
+    while (len > 0 && (buf[len - 1] == L'\n' || buf[len - 1] == L'\r'))
+        buf[--len] = L'\0';
+
+    if (len > 0) {
+        wchar_t dbg[2200];
+        _snwprintf(dbg, 2199, L"[%u] %s", GetCurrentProcessId(), buf);
+        dbg[2199] = L'\0';
+        OutputDebugStringW(dbg);
+    }
+}
+#define VL_INFO(...)  do { if (g_Verbose) VL_INFO_impl(__VA_ARGS__); } while(0)
 
 // ============================================================
 // Utilities
