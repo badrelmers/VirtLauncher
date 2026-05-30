@@ -131,18 +131,129 @@ static inline void VL_DBG(const wchar_t*, ...) {}
 // ============================================================
 // Verbose info logging -- stdout output matching VirtLauncher's
 // [VirtLauncher] prefix style, active when VLAUNCHER_VERBOSE=1.
-//
-// Uses WriteFile on the inherited stdout handle so output works
-// correctly from inside a DLL (avoids CRT stdio state issues).
-// Only active for child processes injected via Hook_CreateProcess*;
-// the root process is already handled by VirtLauncher.exe itself.
 // ============================================================
+//
+// WHY GetStdHandle IS NOT SUFFICIENT
+// ------------------------------------
+// When VirtLauncher.exe launches a Windows GUI application (firefox.exe,
+// chrome.exe, any /SUBSYSTEM:WINDOWS binary) directly, that process has no
+// console attached and GetStdHandle(STD_OUTPUT_HANDLE) returns NULL.  The
+// original implementation exited immediately on NULL, so VL_INFO was
+// completely silent in those processes -- even though VLAUNCHER_VERBOSE=1
+// was set in the environment.
+//
+// As a result StdHandleInjectIntoChild also returned early (it called
+// GetStdHandle which returned NULL), so no stdout handle was ever injected
+// into NtCreateUserProcess-spawned children either.
+//
+// EnsureVerboseOutput() RESOLVER
+// --------------------------------
+// EnsureVerboseOutput() is a lazy, one-shot resolver that runs the first
+// time VL_INFO is called in a given process.  Resolution order:
+//
+//   1. GetStdHandle(STD_OUTPUT_HANDLE) -- covers console apps and processes
+//      whose ProcessParameters.StandardOutput was set by VirtLauncher or by
+//      StdHandleInjectIntoChild (the NtCreateUserProcess hook helper).
+//
+//   2. AttachConsole(ATTACH_PARENT_PROCESS) + CreateFile("CONOUT$") --
+//      covers GUI processes (e.g. the Firefox broker, PID 7932) launched
+//      directly by VirtLauncher.  VirtLauncher remains alive in
+//      WaitForSingleObject, so its console is still open.
+//      AttachConsole(ATTACH_PARENT_PROCESS) attaches the current process to
+//      the parent's console; CreateFile("CONOUT$") then gives an independent
+//      file handle to the console screen buffer that remains valid even if
+//      the process later calls FreeConsole().
+//
+//   3. NULL -- no console reachable (deep-sandboxed child where the sandbox
+//      blocks conhost IPC).  VL_INFO falls back to OutputDebugString with
+//      the [VirtLauncher] prefix so the message still appears in DebugView
+//      alongside the [VirtHook] debug messages.
+//
+// INTERACTION WITH StdHandleInjectIntoChild
+// ------------------------------------------
+// StdHandleInjectIntoChild is called from Hook_NtCreateUserProcess (in the
+// Firefox broker process, PID 7932) to pre-populate the child's
+// ProcessParameters.StandardOutput before the child's thread runs.
+// It calls EnsureVerboseOutput() to obtain the broker's console handle.
+// After the broker resolves its own output via AttachConsole (step 2 above),
+// EnsureVerboseOutput() returns a valid CONOUT$ handle.  That handle is
+// duplicated into the child's handle table and written to the child's PEB,
+// so the child's GetStdHandle() returns a real, writable console handle.
+// For sandbox-restricted children where even that write is blocked,
+// VL_INFO's OutputDebugString fallback (step 3) ensures visibility.
+//
+// THREAD SAFETY
+// -------------
+// g_hVerboseOutputReady / g_hVerboseOutput are written once, never cleared.
+// A benign race where two threads both call EnsureVerboseOutput before the
+// flag is set is possible but harmless: at worst one extra console handle is
+// opened and immediately superseded; both threads converge to the same state.
+//
+// CALLING CONTEXT
+// ---------------
+// EnsureVerboseOutput() (and therefore VL_INFO) must NOT be called from
+// DllMain -- AttachConsole acquires internal loader/console state that would
+// deadlock against the loader lock held by DllMain.  All VL_INFO call sites
+// are in hook functions (Hook_CreateProcessW, Hook_NtCreateUserProcess) which
+// are invoked well after DllMain has returned.  DllMain itself uses only
+// VL_DBG (OutputDebugString), which is safe from any context.
 
 // Initialized to false; set to true by LoadConfig() when VLAUNCHER_VERBOSE=1.
-static bool g_VerboseEnabled = false;
+static bool   g_VerboseEnabled      = false;
 
-static void VL_INFO(const wchar_t* fmt, ...) {
+// Cached console output handle for VL_INFO.
+// false  = not yet resolved (EnsureVerboseOutput has not run).
+// true + NULL handle   = resolved, no console reachable (use OutputDebugString).
+// true + valid handle  = resolved, writes go here.
+static bool   g_hVerboseOutputReady  = false;
+static HANDLE g_hVerboseOutput       = NULL;
+
+// EnsureVerboseOutput -- lazy resolver, called from VL_INFO and
+// StdHandleInjectIntoChild.  Never call from DllMain (see above).
+static HANDLE EnsureVerboseOutput()
+{
+    if (g_hVerboseOutputReady) return g_hVerboseOutput;
+
+    // 1. Inherited / injected stdout.
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h && h != INVALID_HANDLE_VALUE) {
+        g_hVerboseOutput      = h;
+        g_hVerboseOutputReady = true;
+        return h;
+    }
+
+    // 2. Attach to the parent process's console (handles GUI-subsystem
+    //    processes launched directly by VirtLauncher, e.g. firefox.exe).
+    //    AttachConsole fails with ERROR_ACCESS_DENIED if the process already
+    //    has a console -- that case is handled by branch 1 above.
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        // Open an explicit handle to the console screen buffer.
+        // Unlike GetStdHandle, this handle survives a later FreeConsole()
+        // call (the kernel object remains alive as long as we hold it).
+        h = CreateFileW(L"CONOUT$",
+                        GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        NULL, OPEN_EXISTING, 0, NULL);
+        if (h && h != INVALID_HANDLE_VALUE) {
+            g_hVerboseOutput      = h;
+            g_hVerboseOutputReady = true;
+            return h;
+        }
+        // Failed to open screen buffer; undo the attach so we don't leave
+        // the process in a partially-attached state.
+        FreeConsole();
+    }
+
+    // 3. No console reachable.  VL_INFO will use OutputDebugString.
+    g_hVerboseOutput      = NULL;
+    g_hVerboseOutputReady = true;
+    return NULL;
+}
+
+static void VL_INFO(const wchar_t* fmt, ...)
+{
     if (!g_VerboseEnabled) return;
+
     wchar_t buf[2048];
     va_list va;
     va_start(va, fmt);
@@ -150,27 +261,38 @@ static void VL_INFO(const wchar_t* fmt, ...) {
     va_end(va);
     buf[2047] = L'\0';
 
-    // Append newline
+    // Append newline.
     size_t len = wcslen(buf);
     if (len < 2047) { buf[len] = L'\n'; buf[len + 1] = L'\0'; ++len; }
 
-    // Write UTF-16 converted to the current console code page via WriteConsoleW,
-    // falling back to WriteFile with a UTF-8 conversion so output is readable
-    // whether stdout is a console or a redirected pipe/file.
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hOut == INVALID_HANDLE_VALUE || hOut == NULL) return;
+    HANDLE hOut = EnsureVerboseOutput();   // never NULL after first call (cached)
+    DWORD  written = 0;
+    bool   ok = false;
 
-    DWORD written = 0;
-    // Try WriteConsoleW first (works when stdout is an attached console).
-    if (!WriteConsoleW(hOut, buf, (DWORD)len, &written, NULL)) {
-        // stdout is a pipe or file: convert to UTF-8 and use WriteFile.
-        char  utf8[4096];
-        int   n = WideCharToMultiByte(CP_UTF8, 0, buf, (int)len,
-                                      utf8, (int)sizeof(utf8) - 1, NULL, NULL);
-        if (n > 0) {
-            utf8[n] = '\0';
-            WriteFile(hOut, utf8, (DWORD)n, &written, NULL);
+    if (hOut) {
+        // WriteConsoleW: works when the process is attached to the console.
+        if (WriteConsoleW(hOut, buf, (DWORD)len, &written, NULL) && written > 0) {
+            ok = true;
+        } else {
+            // Pipe / file redirect, or sandboxed child where WriteConsoleW
+            // is blocked: fall back to WriteFile with UTF-8 encoding.
+            char utf8[4096];
+            int  n = WideCharToMultiByte(CP_UTF8, 0, buf, (int)len,
+                                         utf8, (int)sizeof(utf8) - 1, NULL, NULL);
+            if (n > 0 && WriteFile(hOut, utf8, (DWORD)n, &written, NULL) && written > 0)
+                ok = true;
         }
+    }
+
+    if (!ok) {
+        // Final fallback: OutputDebugString.
+        // Works in every context including deep-sandboxed Firefox content
+        // processes where conhost IPC is blocked by the job object policy.
+        // Uses the same [VirtLauncher] prefix so messages are identifiable
+        // in DebugView alongside [VirtHook] debug messages.
+        wchar_t dbg[2100];
+        _snwprintf_s(dbg, _countof(dbg), _TRUNCATE, L"[VirtLauncher] %s", buf);
+        OutputDebugStringW(dbg);
     }
 }
 
@@ -8407,9 +8529,19 @@ static void StdHandleInjectIntoChild(HANDLE hProcess, bool childIs64)
                                   "NtQueryInformationProcess");
     if (!s_ntqip) return;
 
-    // Nothing to do if we have no output handle ourselves.
-    HANDLE hMyOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (!hMyOut || hMyOut == INVALID_HANDLE_VALUE) return;
+    // Obtain the console handle via EnsureVerboseOutput() rather than
+    // GetStdHandle().  When the calling process is a GUI-subsystem app
+    // (e.g. the Firefox broker launched directly by VirtLauncher),
+    // GetStdHandle(STD_OUTPUT_HANDLE) returns NULL.  EnsureVerboseOutput()
+    // transparently calls AttachConsole(ATTACH_PARENT_PROCESS) + CONOUT$
+    // in that case, giving us a real, writable handle to VirtLauncher's
+    // console.  Without this, StdHandleInjectIntoChild would always bail
+    // out here and inject nothing into any child.
+    HANDLE hMyOut = EnsureVerboseOutput();
+    if (!hMyOut) {
+        VL_DBG(L"StdHandleInjectIntoChild: EnsureVerboseOutput returned NULL, skip");
+        return;
+    }
 
     // Duplicate our stdout into the child's handle table.
     // bInheritHandle = FALSE: the child's child processes should not further
