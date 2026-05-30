@@ -8339,6 +8339,184 @@ static BOOL WINAPI Hook_CreateProcessA(
 //       integrity levels; Firefox 115 itself requires Windows 7.
 // There is therefore no need to hook NtCreateProcessEx or RtlCreateUserProcess.
 
+// ============================================================
+// StdHandleInjectIntoChild
+// ============================================================
+// Duplicates the calling process's STD_OUTPUT_HANDLE into a freshly-created
+// suspended child process and writes the duplicate value into the child's
+// PEB -> ProcessParameters -> StandardOutput (and StandardError).
+//
+// WHY THIS IS NEEDED
+// ------------------
+// VL_INFO writes to GetStdHandle(STD_OUTPUT_HANDLE).  Children created by
+// NtCreateUserProcess (Firefox content/GPU/socket processes, Electron sandbox
+// workers, etc.) are spawned with PROC_THREAD_ATTRIBUTE_HANDLE_LIST, which
+// restricts which handles the child inherits to only those the broker
+// explicitly listed.  The terminal/console stdout handle from the original
+// VirtLauncher session is NOT in that list, so the child's
+// GetStdHandle(STD_OUTPUT_HANDLE) returns NULL and VL_INFO silently returns.
+//
+// WHY PEB PATCHING IS THE CORRECT APPROACH
+// -----------------------------------------
+// GetStdHandle() is not a true "get a handle by type" API — it simply reads a
+// field from the process's RTL_USER_PROCESS_PARAMETERS structure:
+//
+//   GetStdHandle(STD_OUTPUT_HANDLE)
+//     → PEB->ProcessParameters->StandardOutput
+//
+// So the correct fix is the same thing CreateProcessW does when it copies
+// STARTUPINFO.hStdOutput into a child: DuplicateHandle creates a valid entry
+// in the child's handle table; WriteProcessMemory patches the StandardOutput
+// field so GetStdHandle finds it.
+//
+// FIELD OFFSETS (stable Windows Vista – Windows 11)
+// -------------------------------------------------
+//   Arch     PEB.ProcessParameters   PP.StandardOutput   PP.StandardError
+//   64-bit   PEB + 0x20              PP + 0x28           PP + 0x30
+//   32-bit   PEB + 0x10              PP + 0x1C           PP + 0x20
+//
+// For a 32-bit (WOW64) child seen from a 64-bit host, the child's 32-bit code
+// reads from the 32-bit PEB, whose address is returned by
+// NtQueryInformationProcess(ProcessWow64Information = 26).  The 32-bit offsets
+// above apply to that PEB.
+//
+// This function is a best-effort helper: if any step fails (bad handle,
+// ReadProcessMemory error, etc.) it returns silently.  The child will simply
+// have no verbose output, which is the pre-fix behaviour.
+
+// Minimal PROCESS_BASIC_INFORMATION layout — matches winternl.h.
+// Using PVOID for Reserved1 (instead of NTSTATUS) is intentional: on 64-bit
+// the compiler inserts 4 bytes of padding after NTSTATUS to align the next
+// PVOID, which brings PebBaseAddress to offset 8.  PVOID occupies 8 bytes on
+// 64-bit and 4 bytes on 32-bit, so the layout matches on both architectures
+// without any explicit padding members.
+struct VL_PBI {
+    PVOID Reserved1;        // ExitStatus  (NTSTATUS + implicit padding on 64-bit)
+    PVOID PebBaseAddress;   // offset 8 (64-bit) / offset 4 (32-bit)
+    PVOID Reserved2[2];
+    PVOID UniqueProcessId;
+    PVOID Reserved3;
+};
+
+static void StdHandleInjectIntoChild(HANDLE hProcess, bool childIs64)
+{
+    // Resolve NtQueryInformationProcess once.
+    typedef NTSTATUS (NTAPI *PfnNtQIP)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static PfnNtQIP s_ntqip =
+        (PfnNtQIP)GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                                  "NtQueryInformationProcess");
+    if (!s_ntqip) return;
+
+    // Nothing to do if we have no output handle ourselves.
+    HANDLE hMyOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!hMyOut || hMyOut == INVALID_HANDLE_VALUE) return;
+
+    // Duplicate our stdout into the child's handle table.
+    // bInheritHandle = FALSE: the child's child processes should not further
+    // inherit this handle unless they are also managed by our hook.
+    HANDLE hChildOut = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), hMyOut,
+                         hProcess, &hChildOut,
+                         0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        VL_DBG(L"StdHandleInjectIntoChild: DuplicateHandle failed err=%u",
+               GetLastError());
+        return;
+    }
+
+    // Determine the child PEB address and the correct field offsets.
+    ULONG_PTR pebBase = 0;
+    SIZE_T     ptrSize = 0;           // size of a pointer in the child
+    SIZE_T     procParamsOff = 0;     // PEB → ProcessParameters byte offset
+    SIZE_T     stdOutOff = 0;         // ProcessParameters → StandardOutput offset
+    SIZE_T     stdErrOff = 0;         // ProcessParameters → StandardError  offset
+
+#ifdef _WIN64
+    if (childIs64) {
+        // 64-bit child: use ProcessBasicInformation (class 0).
+        VL_PBI pbi = {};
+        if (!NT_SUCCESS(s_ntqip(hProcess, 0, &pbi, sizeof(pbi), NULL))) goto fail;
+        pebBase        = (ULONG_PTR)pbi.PebBaseAddress;
+        ptrSize        = 8;
+        procParamsOff  = 0x20;
+        stdOutOff      = 0x28;
+        stdErrOff      = 0x30;
+    } else {
+        // 32-bit (WOW64) child seen from a 64-bit host: the child's 32-bit code
+        // reads from the 32-bit PEB.  ProcessWow64Information (class 26) returns
+        // a ULONG_PTR containing the 32-bit PEB address.
+        ULONG_PTR wow64Peb = 0;
+        if (!NT_SUCCESS(s_ntqip(hProcess, 26, &wow64Peb, sizeof(wow64Peb), NULL))
+            || !wow64Peb) goto fail;
+        pebBase        = wow64Peb;
+        ptrSize        = 4;
+        procParamsOff  = 0x10;
+        stdOutOff      = 0x1C;
+        stdErrOff      = 0x20;
+    }
+#else
+    // 32-bit host: child is always 32-bit.
+    {
+        VL_PBI pbi = {};
+        if (!NT_SUCCESS(s_ntqip(hProcess, 0, &pbi, sizeof(pbi), NULL))) goto fail;
+        pebBase        = (ULONG_PTR)pbi.PebBaseAddress;
+        ptrSize        = 4;
+        procParamsOff  = 0x10;
+        stdOutOff      = 0x1C;
+        stdErrOff      = 0x20;
+    }
+#endif
+
+    if (!pebBase) goto fail;
+
+    // Read the ProcessParameters pointer out of the child's PEB.
+    ULONG_PTR ppPtr = 0;
+    SIZE_T     nRead = 0;
+    if (!ReadProcessMemory(hProcess,
+                           reinterpret_cast<LPCVOID>(pebBase + procParamsOff),
+                           &ppPtr, ptrSize, &nRead)
+        || !ppPtr) {
+        VL_DBG(L"StdHandleInjectIntoChild: ReadProcessMemory(PEB) failed err=%u",
+               GetLastError());
+        goto fail;
+    }
+
+    // Write the duplicated handle into StandardOutput and StandardError.
+    // We store only ptrSize bytes so 32-bit children get a ULONG, not a ULONG64.
+    {
+        ULONG64 val = (ULONG64)(ULONG_PTR)hChildOut;
+        SIZE_T  nWritten = 0;
+        BOOL okOut = WriteProcessMemory(hProcess,
+                                        reinterpret_cast<LPVOID>(ppPtr + stdOutOff),
+                                        &val, ptrSize, &nWritten);
+        BOOL okErr = WriteProcessMemory(hProcess,
+                                        reinterpret_cast<LPVOID>(ppPtr + stdErrOff),
+                                        &val, ptrSize, &nWritten);
+        if (!okOut || !okErr) {
+            VL_DBG(L"StdHandleInjectIntoChild: WriteProcessMemory failed err=%u",
+                   GetLastError());
+            goto fail;
+        }
+    }
+
+    VL_DBG(L"StdHandleInjectIntoChild: PID=%u parent_out=0x%p child_out=0x%p"
+           L" (peb=0x%p pp=0x%p)",
+           GetProcessId(hProcess), hMyOut, hChildOut,
+           (PVOID)pebBase, (PVOID)ppPtr);
+    return;   // hChildOut is now owned by the child; do not CloseHandle here
+
+fail:
+    // We placed hChildOut into the child's handle table via DuplicateHandle.
+    // Close it there by duplicating it back with DUPLICATE_CLOSE_SOURCE.
+    {
+        HANDLE tmp = NULL;
+        DuplicateHandle(hProcess, hChildOut,
+                        GetCurrentProcess(), &tmp,
+                        0, FALSE,
+                        DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE);
+        if (tmp) CloseHandle(tmp);
+    }
+}
+
 static NTSTATUS NTAPI Hook_NtCreateUserProcess(
     PHANDLE     ProcessHandle,
     PHANDLE     ThreadHandle,
@@ -8475,6 +8653,28 @@ static NTSTATUS NTAPI Hook_NtCreateUserProcess(
         // it is not left frozen forever.  It will run without our DLL injected,
         // same behaviour as pre-fix.
     }
+
+    // Propagate the verbose output handle into the child's ProcessParameters.
+    //
+    // NtCreateUserProcess-spawned children (Firefox content/GPU processes, etc.)
+    // are created with PROC_THREAD_ATTRIBUTE_HANDLE_LIST, which restricts handle
+    // inheritance to only the handles the broker explicitly listed.  The
+    // VirtLauncher console stdout is NOT in that list, so GetStdHandle returns
+    // NULL in those children, silencing VL_INFO output even though
+    // VLAUNCHER_VERBOSE=1 is in the environment.
+    //
+    // StdHandleInjectIntoChild duplicates our stdout into the child's handle
+    // table and writes the result into the child's PEB.ProcessParameters.
+    // StandardOutput before the first thread runs.  This is the correct and
+    // stable mechanism — the same one CreateProcessW uses for STARTUPINFO.hStdOutput.
+    //
+    // We call this regardless of whether DetourUpdateProcessWithDll succeeded:
+    // if patching failed the child has no VirtHook.dll and VL_INFO is never
+    // called anyway, so the call is a cheap no-op in that case.  When patching
+    // did succeed, the child must have a working stdout before LdrInitializeThunk
+    // runs (which loads our DLL and immediately calls VL_INFO from DllMain).
+    if (g_VerboseEnabled)
+        StdHandleInjectIntoChild(hProcess, childIs64);
 
     // Resume the initial thread ONLY if we added the suspend bit ourselves.
     // If the broker originally requested suspension (callerWantedSuspended),
