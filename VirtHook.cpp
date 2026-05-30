@@ -265,34 +265,37 @@ static void VL_INFO(const wchar_t* fmt, ...)
     size_t len = wcslen(buf);
     if (len < 2047) { buf[len] = L'\n'; buf[len + 1] = L'\0'; ++len; }
 
-    HANDLE hOut = EnsureVerboseOutput();   // never NULL after first call (cached)
-    DWORD  written = 0;
-    bool   ok = false;
+    // --- OutputDebugString (UNCONDITIONAL) ---
+    // Write to every process in the tree, including deep sandboxed children
+    // where console writes are blocked.  Format mirrors VL_DBG so all
+    // [VirtLauncher] and [VirtHook] messages share the same PID-tagged
+    // stream in DebugView and are easily filtered.
+    // buf already begins with "[VirtLauncher]" from the caller's format string;
+    // we only prepend the PID to match the "[PID] [tag] message" convention.
+    {
+        wchar_t dbg[2200];
+        _snwprintf_s(dbg, _countof(dbg), _TRUNCATE,
+                     L"[%u] %s", GetCurrentProcessId(), buf);
+        OutputDebugStringW(dbg);
+    }
 
+    // --- Console / stdout (best-effort) ---
+    // EnsureVerboseOutput() attaches to the parent console when stdout is
+    // absent (GUI-subsystem process launched directly by VirtLauncher).
+    // Writes here make the message appear in the terminal window as well.
+    HANDLE hOut = EnsureVerboseOutput();
     if (hOut) {
-        // WriteConsoleW: works when the process is attached to the console.
-        if (WriteConsoleW(hOut, buf, (DWORD)len, &written, NULL) && written > 0) {
-            ok = true;
-        } else {
-            // Pipe / file redirect, or sandboxed child where WriteConsoleW
-            // is blocked: fall back to WriteFile with UTF-8 encoding.
+        DWORD written = 0;
+        // WriteConsoleW: works when the process owns/shares the console.
+        if (!WriteConsoleW(hOut, buf, (DWORD)len, &written, NULL) || !written) {
+            // Pipe / file redirect fallback: UTF-8 via WriteFile.
             char utf8[4096];
             int  n = WideCharToMultiByte(CP_UTF8, 0, buf, (int)len,
                                          utf8, (int)sizeof(utf8) - 1, NULL, NULL);
-            if (n > 0 && WriteFile(hOut, utf8, (DWORD)n, &written, NULL) && written > 0)
-                ok = true;
+            if (n > 0) {
+                WriteFile(hOut, utf8, (DWORD)n, &written, NULL);
+            }
         }
-    }
-
-    if (!ok) {
-        // Final fallback: OutputDebugString.
-        // Works in every context including deep-sandboxed Firefox content
-        // processes where conhost IPC is blocked by the job object policy.
-        // Uses the same [VirtLauncher] prefix so messages are identifiable
-        // in DebugView alongside [VirtHook] debug messages.
-        wchar_t dbg[2100];
-        _snwprintf_s(dbg, _countof(dbg), _TRUNCATE, L"[VirtLauncher] %s", buf);
-        OutputDebugStringW(dbg);
     }
 }
 
@@ -8151,7 +8154,8 @@ static bool ChildIsPe64(const wchar_t* path) {
 // to distinguish it from the launcher's own output.
 static void VerboseChildInjected(LPCWSTR appName, LPCWSTR cmdLine,
                                   const char* dllPath,
-                                  DWORD childPid)
+                                  DWORD childPid,
+                                  const wchar_t* funcLabel)   // e.g. L"CreateProcessW"
 {
     if (!g_VerboseEnabled) return;
 
@@ -8171,18 +8175,21 @@ static void VerboseChildInjected(LPCWSTR appName, LPCWSTR cmdLine,
     wchar_t dllW[MAX_PATH] = {};
     MultiByteToWideChar(CP_ACP, 0, dllPath, -1, dllW, MAX_PATH);
 
-    VL_INFO(L"[VirtLauncher] --- Child process injected ---");
-    VL_INFO(L"[VirtLauncher] Target  : %s (%s)",
+    VL_INFO(L"[VirtLauncher] [%s] child PID %u", funcLabel, childPid);
+    VL_INFO(L"[VirtLauncher] [%s] Target  : %s (%s)",
+            funcLabel,
             fullPath[0] ? fullPath : exePath,
             child64 ? L"64-bit" : L"32-bit");
-    VL_INFO(L"[VirtLauncher] Parent  : PID %u (%s)",
+    VL_INFO(L"[VirtLauncher] [%s] Parent  : PID %u (%s)",
+            funcLabel,
             GetCurrentProcessId(), self64 ? L"64-bit" : L"32-bit");
-    VL_INFO(L"[VirtLauncher] Command : %s",
+    VL_INFO(L"[VirtLauncher] [%s] Command : %s",
+            funcLabel,
             cmdLine && cmdLine[0] ? cmdLine : (appName ? appName : L"(unknown)"));
-    VL_INFO(L"[VirtLauncher] Child   : PID %u", childPid);
-    VL_INFO(L"[VirtLauncher] Injecting: %s", dllW);
+    VL_INFO(L"[VirtLauncher] [%s] Injecting: %s", funcLabel, dllW);
     if (child64 != self64)
-        VL_INFO(L"[VirtLauncher]           (cross-arch: Detours swapped 32<->64 suffix)");
+        VL_INFO(L"[VirtLauncher] [%s] (cross-arch: Detours swapped 32<->64 suffix)",
+                funcLabel);
 }
 
 // Disable WOW64 FS redirection.  No-op in 64-bit builds.
@@ -8302,7 +8309,8 @@ static BOOL WINAPI Hook_CreateProcessW(
                                   lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     } else {
         VerboseChildInjected(lpApplicationName, lpCommandLine, dllPath,
-                             lpProcessInformation ? lpProcessInformation->dwProcessId : 0);
+                             lpProcessInformation ? lpProcessInformation->dwProcessId : 0,
+                             L"CreateProcessW");
     }
     return ok;
 }
@@ -8379,7 +8387,8 @@ static BOOL WINAPI Hook_CreateProcessA(
             MultiByteToWideChar(CP_ACP, 0, lpCommandLine, -1, wCmd, MAX_PATH * 2 - 1);
         VerboseChildInjected(wApp[0] ? wApp : NULL, wCmd[0] ? wCmd : NULL,
                              dllPath,
-                             lpProcessInformation ? lpProcessInformation->dwProcessId : 0);
+                             lpProcessInformation ? lpProcessInformation->dwProcessId : 0,
+                             L"CreateProcessA");
     }
     return ok;
 }
@@ -9345,7 +9354,7 @@ static void UninstallHooks() {
 // DllMain
 // ============================================================
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
 
     if (DetourIsHelperProcess()) return TRUE;
 
@@ -9393,6 +9402,46 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
         VL_DBG(L"DllMain: hooks installed OK");
     }
     else if (reason == DLL_PROCESS_DETACH) {
+        // lpvReserved != NULL  →  actual process termination (ExitProcess /
+        //                         TerminateProcess), not a FreeLibrary call.
+        // lpvReserved == NULL  →  DLL is being unloaded while the process
+        //                         continues; no "exit" to report.
+        if (reserved && g_VerboseEnabled) {
+            // Print the exit message BEFORE UninstallHooks so the hook
+            // infrastructure is still intact if anything inside needs it.
+            //
+            // We intentionally do NOT call EnsureVerboseOutput() here because
+            // AttachConsole is unsafe under the loader lock that DllMain holds
+            // during DLL_PROCESS_DETACH.  Instead we write directly:
+            //   (a) to the cached g_hVerboseOutput handle if already resolved
+            //       (the process had console access while running), and
+            //   (b) always to OutputDebugString, which is safe in any context.
+            wchar_t msgbuf[256];
+            _snwprintf_s(msgbuf, _countof(msgbuf), _TRUNCATE,
+                         L"[VirtLauncher] [ProcessExit] PID=%u exiting\n",
+                         GetCurrentProcessId());
+            size_t msglen = wcslen(msgbuf);
+
+            if (g_hVerboseOutputReady && g_hVerboseOutput) {
+                DWORD n = 0;
+                if (!WriteConsoleW(g_hVerboseOutput, msgbuf, (DWORD)msglen, &n, NULL)
+                    || !n)
+                {
+                    char utf8[512];
+                    int c = WideCharToMultiByte(CP_UTF8, 0, msgbuf, (int)msglen,
+                                               utf8, (int)sizeof(utf8) - 1,
+                                               NULL, NULL);
+                    if (c > 0) WriteFile(g_hVerboseOutput, utf8, (DWORD)c, &n, NULL);
+                }
+            }
+
+            wchar_t dbg[300];
+            _snwprintf_s(dbg, _countof(dbg), _TRUNCATE,
+                         L"[%u] [VirtLauncher] [ProcessExit] PID=%u exiting",
+                         GetCurrentProcessId(), GetCurrentProcessId());
+            OutputDebugStringW(dbg);
+        }
+
         UninstallHooks();
 
         EnterCriticalSection(&g_KeyMapLock);
