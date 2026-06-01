@@ -8658,6 +8658,49 @@ fail:
     }
 }
 
+// -----------------------------------------------------------------------
+// ChildCommandLineContains
+//
+// Reads the CommandLine field from the child's RTL_USER_PROCESS_PARAMETERS
+// (already constructed in the PARENT address space by the time
+// NtCreateUserProcess returns) and checks whether it contains 'needle'
+// (case-insensitive substring match).
+//
+// Structure offsets (match StdHandleInjectIntoChild layout):
+//   RTL_USER_PROCESS_PARAMETERS::CommandLine (UNICODE_STRING)
+//     32-bit: struct at +0x40, Buffer pointer at +0x44
+//     64-bit: struct at +0x70, Buffer pointer at +0x78
+//
+// Used to detect Chrome/Chromium sandboxed child types before injection.
+static bool ChildCommandLineContains(PVOID pParams, bool childIs64,
+                                     const wchar_t* needle)
+{
+    if (!pParams || !needle || !*needle) return false;
+    __try {
+        const SIZE_T cmdOff = childIs64 ? (SIZE_T)0x70u : (SIZE_T)0x40u;
+        const SIZE_T bufOff = childIs64 ? (SIZE_T)0x78u : (SIZE_T)0x44u;
+        const SIZE_T ptrSz  = childIs64 ? (SIZE_T)8u    : (SIZE_T)4u;
+
+        USHORT cmdLen = 0;
+        memcpy(&cmdLen, (const BYTE*)pParams + cmdOff, sizeof(USHORT));
+        if (cmdLen == 0) return false;
+
+        ULONG_PTR bufPtr = 0;
+        memcpy(&bufPtr, (const BYTE*)pParams + bufOff, ptrSz);
+        if (!bufPtr) return false;
+
+        const SIZE_T wchars = cmdLen / sizeof(wchar_t);
+        const SIZE_T nlen   = wcslen(needle);
+        if (nlen > wchars) return false;
+
+        const wchar_t* buf = reinterpret_cast<const wchar_t*>(bufPtr);
+        for (SIZE_T i = 0; i + nlen <= wchars; ++i) {
+            if (_wcsnicmp(buf + i, needle, nlen) == 0) return true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return false;
+}
+
 static NTSTATUS NTAPI Hook_NtCreateUserProcess(
     PHANDLE     ProcessHandle,
     PHANDLE     ThreadHandle,
@@ -8761,6 +8804,51 @@ static NTSTATUS NTAPI Hook_NtCreateUserProcess(
     const char* injectDll = childIs64
         ? (g_DllPathA64[0] ? g_DllPathA64 : dllPath)
         : (g_DllPathA32[0] ? g_DllPathA32 : dllPath);
+
+    // -----------------------------------------------------------------------
+    // (C) ACG-incompatible sandbox child detection.
+    //
+    // Chrome/Chromium's broker applies ProcessDynamicCodePolicy (ACG) to
+    // RENDERER processes (and some utility/extension processes) BEFORE calling
+    // ResumeThread.  Once ACG is active, Detours' DetourTransactionCommit
+    // cannot call VirtualProtect(PAGE_EXECUTE_READWRITE) on ntdll pages.
+    // The failure mode is partial hook installation: Detours writes the first
+    // byte of a JMP stub, VirtualProtect to restore PAGE_EXECUTE_READ then
+    // fails, leaving orphaned 0xCC (INT3) bytes → STATUS_BREAKPOINT the next
+    // time any hooked ntdll function is called from the renderer.
+    //
+    // Fix: detect the process type from its CommandLine before injection.
+    // --type=renderer  → Chrome/Chromium renderer (ACG enabled, strict sandbox)
+    // --type=utility   → Chrome utility process (may also have ACG)
+    //
+    // GPU and network-service processes do NOT receive ACG and are handled
+    // safely by the IsAcgEnabled() guard inside InstallHooks() (belt-and-
+    // suspenders fallback for any process type we didn't predict here).
+    //
+    // When we skip injection we still obey callerWantedSuspended so the
+    // broker's sandbox-setup sequence is not disturbed.
+    // -----------------------------------------------------------------------
+    const bool skipForAcgSandbox =
+        ChildCommandLineContains(ProcessParameters, childIs64, L"--type=renderer") ||
+        ChildCommandLineContains(ProcessParameters, childIs64, L"--type=utility");
+
+    if (skipForAcgSandbox) {
+        const DWORD childPid = GetProcessId(hProcess);
+        VL_DBG(L"Hook_NtCreateUserProcess: child PID=%u has ACG-incompatible "
+               L"--type flag -- skipping import table injection.", childPid);
+        VL_INFO(L"[VirtLauncher] [NtCreateUserProcess] child PID=%u: skipping "
+                L"injection (ACG sandbox type)", childPid);
+
+        if (!callerWantedSuspended) {
+            DWORD prev = ResumeThread(hThread);
+            VL_DBG(L"Hook_NtCreateUserProcess: ResumeThread prevCount=%u "
+                   L"(no injection)", prev);
+        } else {
+            VL_DBG(L"Hook_NtCreateUserProcess: leaving child suspended "
+                   L"(caller requested, no injection)");
+        }
+        return st;
+    }
 
     VL_DBG(L"Hook_NtCreateUserProcess: child PID=%u (%s), patching import table with %S",
            GetProcessId(hProcess), childIs64 ? L"64-bit" : L"32-bit", injectDll);
@@ -9080,7 +9168,63 @@ static BOOL WINAPI Hook_SetConsoleTitleA(LPCSTR lpConsoleTitle) {
     return Real_SetConsoleTitleA(lpConsoleTitle);
 }
 
+// ============================================================
+// ACG (Arbitrary Code Guard) detection
+// ============================================================
+//
+// Returns true if ProcessDynamicCodePolicy (ACG) is active in the current
+// process.  Used by InstallHooks() to skip Detours hook installation in
+// ACG-protected processes (e.g. Chrome renderer), where VirtualProtect on
+// ntdll code pages is blocked and would leave orphaned INT3 bytes.
+//
+// Implementation deliberately avoids Win8 SDK types (PROCESS_MITIGATION_POLICY,
+// PROCESS_MITIGATION_DYNAMIC_CODE_POLICY) so the code compiles with VS2010.
+// GetProcessMitigationPolicy is resolved via GetProcAddress at runtime; on
+// pre-Win8 systems where it is absent the function safely returns false.
+//
+//   ProcessDynamicCodePolicy == 2  (PROCESS_MITIGATION_POLICY enum, Win8+)
+//   PROCESS_MITIGATION_DYNAMIC_CODE_POLICY::Flags bit 0 == ProhibitDynamicCode
+static bool IsAcgEnabled() {
+    // Signature uses plain int/PVOID/SIZE_T to avoid Win8 SDK enum dependency.
+    typedef BOOL (WINAPI *PfnGetPMP)(HANDLE, int, PVOID, SIZE_T);
+    static PfnGetPMP s_fn = reinterpret_cast<PfnGetPMP>(
+        GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                       "GetProcessMitigationPolicy"));
+    if (!s_fn) return false;   // Pre-Win8: ACG does not exist
+
+    // PROCESS_MITIGATION_DYNAMIC_CODE_POLICY is a DWORD Flags field;
+    // bit 0 is ProhibitDynamicCode.  Use a plain DWORD to stay VS2010-safe.
+    DWORD pol = 0;
+    if (!s_fn(GetCurrentProcess(), 2 /*ProcessDynamicCodePolicy*/, &pol, sizeof(pol)))
+        return false;
+    return (pol & 0x1u) != 0;  // bit 0 = ProhibitDynamicCode
+}
+
 static void InstallHooks() {
+    // -----------------------------------------------------------------------
+    // ACG guard: Detours installs hooks by calling VirtualProtect to make ntdll
+    // code pages writable, writing JMP trampolines, then restoring protection.
+    // Both VirtualProtect calls are blocked when ProcessDynamicCodePolicy (ACG)
+    // is active, causing a partial write that leaves INT3 bytes in ntdll stubs
+    // → STATUS_BREAKPOINT on the next call to any hooked function.
+    //
+    // Chrome applies ACG to RENDERER processes before ResumeThread.  The three
+    // non-renderer Chromium process types (gpu-process, utility, network-service)
+    // seen in the debug log do NOT have ACG and hook successfully.
+    //
+    // When ACG is detected we skip hook installation entirely.  The DLL is
+    // already loaded into the process (via import table patching) so this is a
+    // graceful no-op: the process runs without virtualization rather than
+    // crashing.  The companion fix in Hook_NtCreateUserProcess (below) also
+    // prevents injection into renderer/utility children in the first place,
+    // so this guard is a belt-and-suspenders safety net.
+    // -----------------------------------------------------------------------
+    if (IsAcgEnabled()) {
+        VL_DBG(L"InstallHooks: ProcessDynamicCodePolicy (ACG) is active -- "
+               L"skipping Detours hook installation to avoid INT3 corruption.");
+        return;
+    }
+
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
     HMODULE k32   = GetModuleHandleA("kernel32.dll");
     if (!ntdll || !k32) return;
