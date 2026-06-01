@@ -8838,11 +8838,78 @@ static NTSTATUS NTAPI Hook_NtCreateUserProcess(
 // Hook Install / Uninstall
 // ============================================================
 
+// ---- NtStubIsExternallyPatched ------------------------------------------
+// Returns true when an ntdll syscall stub has been patched by an external
+// agent BEFORE our Detours hooks run (e.g. Chrome / Edge / Brave sandbox
+// InterceptionManager, Electron sandbox, DBI frameworks).
+//
+// WHY WE NEED THIS
+// ----------------
+// Browser sandbox brokers patch renderer ntdll stubs with JMP instructions
+// pointing to their own IPC thunks while the renderer is suspended (before
+// LdrInitializeThunk runs).  The thunks identify which function intercepted
+// them by checking the call's return address against a table of registered
+// interception sites.
+//
+// If Detours then patches the same stub on top (in VirtHook DllMain), calls
+// reach the IPC thunk via Detours's trampoline buffer.  The trampoline
+// address is NOT in the broker's table → the broker calls __debugbreak()
+// → the renderer crashes with STATUS_BREAKPOINT ("Aw Snap", "Aw Shucks").
+//
+// This is exactly the Chrome sandbox tab-crash bug reproduced by VirtHook:
+//   • Chrome opens fine (broker process is not patched this way)
+//   • A new tab crashes immediately with STATUS_BREAKPOINT
+//   • --no-sandbox eliminates the broker's ntdll patches → no conflict
+//
+// THE CHECK
+// ---------
+// Every unmodified ntdll syscall stub on x64 begins with 0x4C — the REX.W
+// prefix byte of "mov r10, rcx" (4C 8B D1), which is the FIRST instruction
+// in every syscall stub since Windows Vista.  This byte never changes across
+// Windows versions or build numbers.
+//
+// On x86, unmodified stubs begin with 0xB8 ("mov eax, <syscall_number>").
+//
+// If the first byte is anything else (0xE9 = near JMP used by Chrome; 0xFF
+// = indirect JMP; 0xCC = int3 used by some breakpoint-based interceptors)
+// the stub was externally modified and we must not hook it.
+//
+// SCOPE
+// -----
+// This check ONLY applies to ntdll Nt* syscall stubs, never to kernel32 or
+// user32 exports.  CreateProcessW, SetWindowTextW, etc. have diverse
+// function prologues that do not follow the 0x4C / 0xB8 pattern; applying
+// the check to them would incorrectly skip those hooks.
+static bool NtStubIsExternallyPatched(PVOID fn)
+{
+    if (!fn) return false;
+    const BYTE first = *reinterpret_cast<const BYTE*>(fn);
+#ifdef _WIN64
+    return first != 0x4C;   // 0x4C = REX.W prefix of "mov r10, rcx"
+#else
+    return first != 0xB8;   // 0xB8 = "mov eax, <syscall_number>"
+#endif
+}
+
 #define VL_GETPROC(mod, name) \
     Real_##name = reinterpret_cast<Pfn##name>(GetProcAddress(mod, #name))
 
 #define VL_ATTACH(fn) \
     if (Real_##fn) DetourAttach(reinterpret_cast<PVOID*>(&Real_##fn), Hook_##fn)
+
+// VL_ATTACH_NT: variant for ntdll Nt* syscall stubs only.
+// Skips DetourAttach when the stub has already been patched by an external
+// agent (browser sandbox, DBI tool, etc.) to avoid breaking its IPC chain.
+#define VL_ATTACH_NT(fn) \
+    if (Real_##fn) { \
+        if (NtStubIsExternallyPatched(reinterpret_cast<PVOID>(Real_##fn))) { \
+            VL_DBG(L"InstallHooks: SKIP " L#fn \
+                   L" -- externally patched (first byte=0x%02X)", \
+                   (unsigned)*reinterpret_cast<const BYTE*>(Real_##fn)); \
+        } else { \
+            DetourAttach(reinterpret_cast<PVOID*>(&Real_##fn), Hook_##fn); \
+        } \
+    }
 
 #define VL_DETACH(fn) \
     if (Real_##fn) DetourDetach(reinterpret_cast<PVOID*>(&Real_##fn), Hook_##fn)
@@ -9211,10 +9278,10 @@ static void InstallHooks() {
     DetourUpdateThread(GetCurrentThread());
 
     // Always
-    VL_ATTACH(NtClose);
+    VL_ATTACH_NT(NtClose);
     VL_ATTACH(CreateProcessW);
     VL_ATTACH(CreateProcessA);
-    if (Real_NtCreateUserProcess) VL_ATTACH(NtCreateUserProcess);
+    if (Real_NtCreateUserProcess) VL_ATTACH_NT(NtCreateUserProcess);
 
     // Window title prefixing
     if (Real_SetWindowTextW)  VL_ATTACH(SetWindowTextW);
@@ -9227,53 +9294,53 @@ static void InstallHooks() {
 
     // Registry
     if (g_RegEnabled) {
-        VL_ATTACH(NtOpenKey);
-        if (Real_NtOpenKeyEx)           VL_ATTACH(NtOpenKeyEx);
-        if (Real_NtOpenKeyTransacted)    VL_ATTACH(NtOpenKeyTransacted);
-        if (Real_NtOpenKeyTransactedEx)  VL_ATTACH(NtOpenKeyTransactedEx);
-        VL_ATTACH(NtCreateKey);
-        if (Real_NtCreateKeyTransacted)  VL_ATTACH(NtCreateKeyTransacted);
-        VL_ATTACH(NtDeleteKey);
-        VL_ATTACH(NtDeleteValueKey);
-        VL_ATTACH(NtEnumerateKey);
-        VL_ATTACH(NtEnumerateValueKey);
-        VL_ATTACH(NtQueryKey);
-        VL_ATTACH(NtQueryValueKey);
-        if (Real_NtQueryMultipleValueKey) VL_ATTACH(NtQueryMultipleValueKey);
-        VL_ATTACH(NtSetValueKey);
-        if (Real_NtRenameKey)            VL_ATTACH(NtRenameKey);
-        if (Real_NtReplaceKey)           VL_ATTACH(NtReplaceKey);
-        if (Real_NtSaveKey)              VL_ATTACH(NtSaveKey);
-        if (Real_NtSaveKeyEx)            VL_ATTACH(NtSaveKeyEx);
-        if (Real_NtLoadKey)              VL_ATTACH(NtLoadKey);
-        if (Real_NtLoadKey2)             VL_ATTACH(NtLoadKey2);
-        if (Real_NtLoadKeyEx)            VL_ATTACH(NtLoadKeyEx);
-        if (Real_NtLoadKey3)             VL_ATTACH(NtLoadKey3);
-        VL_ATTACH(NtNotifyChangeKey);
-        if (Real_NtNotifyChangeMultipleKeys) VL_ATTACH(NtNotifyChangeMultipleKeys);
-        if (Real_NtFlushKey)             VL_ATTACH(NtFlushKey);
-        if (Real_NtRestoreKey)           VL_ATTACH(NtRestoreKey);
-        if (Real_NtSetInformationKey)    VL_ATTACH(NtSetInformationKey);
-        if (Real_NtUnloadKey)            VL_ATTACH(NtUnloadKey);
+        VL_ATTACH_NT(NtOpenKey);
+        if (Real_NtOpenKeyEx)           VL_ATTACH_NT(NtOpenKeyEx);
+        if (Real_NtOpenKeyTransacted)    VL_ATTACH_NT(NtOpenKeyTransacted);
+        if (Real_NtOpenKeyTransactedEx)  VL_ATTACH_NT(NtOpenKeyTransactedEx);
+        VL_ATTACH_NT(NtCreateKey);
+        if (Real_NtCreateKeyTransacted)  VL_ATTACH_NT(NtCreateKeyTransacted);
+        VL_ATTACH_NT(NtDeleteKey);
+        VL_ATTACH_NT(NtDeleteValueKey);
+        VL_ATTACH_NT(NtEnumerateKey);
+        VL_ATTACH_NT(NtEnumerateValueKey);
+        VL_ATTACH_NT(NtQueryKey);
+        VL_ATTACH_NT(NtQueryValueKey);
+        if (Real_NtQueryMultipleValueKey) VL_ATTACH_NT(NtQueryMultipleValueKey);
+        VL_ATTACH_NT(NtSetValueKey);
+        if (Real_NtRenameKey)            VL_ATTACH_NT(NtRenameKey);
+        if (Real_NtReplaceKey)           VL_ATTACH_NT(NtReplaceKey);
+        if (Real_NtSaveKey)              VL_ATTACH_NT(NtSaveKey);
+        if (Real_NtSaveKeyEx)            VL_ATTACH_NT(NtSaveKeyEx);
+        if (Real_NtLoadKey)              VL_ATTACH_NT(NtLoadKey);
+        if (Real_NtLoadKey2)             VL_ATTACH_NT(NtLoadKey2);
+        if (Real_NtLoadKeyEx)            VL_ATTACH_NT(NtLoadKeyEx);
+        if (Real_NtLoadKey3)             VL_ATTACH_NT(NtLoadKey3);
+        VL_ATTACH_NT(NtNotifyChangeKey);
+        if (Real_NtNotifyChangeMultipleKeys) VL_ATTACH_NT(NtNotifyChangeMultipleKeys);
+        if (Real_NtFlushKey)             VL_ATTACH_NT(NtFlushKey);
+        if (Real_NtRestoreKey)           VL_ATTACH_NT(NtRestoreKey);
+        if (Real_NtSetInformationKey)    VL_ATTACH_NT(NtSetInformationKey);
+        if (Real_NtUnloadKey)            VL_ATTACH_NT(NtUnloadKey);
     }
 
     // Files
     if (g_FsEnabled) {
-        VL_ATTACH(NtCreateFile);
-        VL_ATTACH(NtOpenFile);
-        if (Real_NtCreateDirectoryObject) VL_ATTACH(NtCreateDirectoryObject);
-        if (Real_NtOpenDirectoryObject)   VL_ATTACH(NtOpenDirectoryObject);
-        if (Real_NtCreateMailslotFile)    VL_ATTACH(NtCreateMailslotFile);
-        if (Real_NtCreateNamedPipeFile)   VL_ATTACH(NtCreateNamedPipeFile);
-        if (Real_NtDeleteFile)            VL_ATTACH(NtDeleteFile);
-        if (Real_NtQueryAttributesFile)   VL_ATTACH(NtQueryAttributesFile);
-        if (Real_NtQueryFullAttributesFile) VL_ATTACH(NtQueryFullAttributesFile);
-        if (Real_NtQueryInformationByName)  VL_ATTACH(NtQueryInformationByName);
-        if (Real_NtSetInformationFile)    VL_ATTACH(NtSetInformationFile);
-        if (Real_NtFsControlFile)         VL_ATTACH(NtFsControlFile);
-        if (Real_NtQueryDirectoryFile)    VL_ATTACH(NtQueryDirectoryFile);
-        if (Real_NtQueryDirectoryFileEx)  VL_ATTACH(NtQueryDirectoryFileEx);
-        if (Real_NtQueryInformationFile)  VL_ATTACH(NtQueryInformationFile);
+        VL_ATTACH_NT(NtCreateFile);
+        VL_ATTACH_NT(NtOpenFile);
+        if (Real_NtCreateDirectoryObject) VL_ATTACH_NT(NtCreateDirectoryObject);
+        if (Real_NtOpenDirectoryObject)   VL_ATTACH_NT(NtOpenDirectoryObject);
+        if (Real_NtCreateMailslotFile)    VL_ATTACH_NT(NtCreateMailslotFile);
+        if (Real_NtCreateNamedPipeFile)   VL_ATTACH_NT(NtCreateNamedPipeFile);
+        if (Real_NtDeleteFile)            VL_ATTACH_NT(NtDeleteFile);
+        if (Real_NtQueryAttributesFile)   VL_ATTACH_NT(NtQueryAttributesFile);
+        if (Real_NtQueryFullAttributesFile) VL_ATTACH_NT(NtQueryFullAttributesFile);
+        if (Real_NtQueryInformationByName)  VL_ATTACH_NT(NtQueryInformationByName);
+        if (Real_NtSetInformationFile)    VL_ATTACH_NT(NtSetInformationFile);
+        if (Real_NtFsControlFile)         VL_ATTACH_NT(NtFsControlFile);
+        if (Real_NtQueryDirectoryFile)    VL_ATTACH_NT(NtQueryDirectoryFile);
+        if (Real_NtQueryDirectoryFileEx)  VL_ATTACH_NT(NtQueryDirectoryFileEx);
+        if (Real_NtQueryInformationFile)  VL_ATTACH_NT(NtQueryInformationFile);
     }
 
     LONG commitResult = DetourTransactionCommit();
