@@ -37,6 +37,7 @@
 //     NtQueryInformationFile                           (path reverse-translate)
 //
 //   CHILDREN: CreateProcessW/A (propagate injection + prefix child lpTitle)
+//             NtCreateUserProcess (catch browsers/Electron that bypass CreateProcessW)
 //
 //   WINDOW TITLE PREFIXING (@ marker, same concept as Sandboxie's #):
 //     SetWindowTextW/A      — GUI app title changes
@@ -130,18 +131,129 @@ static inline void VL_DBG(const wchar_t*, ...) {}
 // ============================================================
 // Verbose info logging -- stdout output matching VirtLauncher's
 // [VirtLauncher] prefix style, active when VLAUNCHER_VERBOSE=1.
-//
-// Uses WriteFile on the inherited stdout handle so output works
-// correctly from inside a DLL (avoids CRT stdio state issues).
-// Only active for child processes injected via Hook_CreateProcess*;
-// the root process is already handled by VirtLauncher.exe itself.
 // ============================================================
+//
+// WHY GetStdHandle IS NOT SUFFICIENT
+// ------------------------------------
+// When VirtLauncher.exe launches a Windows GUI application (firefox.exe,
+// chrome.exe, any /SUBSYSTEM:WINDOWS binary) directly, that process has no
+// console attached and GetStdHandle(STD_OUTPUT_HANDLE) returns NULL.  The
+// original implementation exited immediately on NULL, so VL_INFO was
+// completely silent in those processes -- even though VLAUNCHER_VERBOSE=1
+// was set in the environment.
+//
+// As a result StdHandleInjectIntoChild also returned early (it called
+// GetStdHandle which returned NULL), so no stdout handle was ever injected
+// into NtCreateUserProcess-spawned children either.
+//
+// EnsureVerboseOutput() RESOLVER
+// --------------------------------
+// EnsureVerboseOutput() is a lazy, one-shot resolver that runs the first
+// time VL_INFO is called in a given process.  Resolution order:
+//
+//   1. GetStdHandle(STD_OUTPUT_HANDLE) -- covers console apps and processes
+//      whose ProcessParameters.StandardOutput was set by VirtLauncher or by
+//      StdHandleInjectIntoChild (the NtCreateUserProcess hook helper).
+//
+//   2. AttachConsole(ATTACH_PARENT_PROCESS) + CreateFile("CONOUT$") --
+//      covers GUI processes (e.g. the Firefox broker, PID 7932) launched
+//      directly by VirtLauncher.  VirtLauncher remains alive in
+//      WaitForSingleObject, so its console is still open.
+//      AttachConsole(ATTACH_PARENT_PROCESS) attaches the current process to
+//      the parent's console; CreateFile("CONOUT$") then gives an independent
+//      file handle to the console screen buffer that remains valid even if
+//      the process later calls FreeConsole().
+//
+//   3. NULL -- no console reachable (deep-sandboxed child where the sandbox
+//      blocks conhost IPC).  VL_INFO falls back to OutputDebugString with
+//      the [VirtLauncher] prefix so the message still appears in DebugView
+//      alongside the [VirtHook] debug messages.
+//
+// INTERACTION WITH StdHandleInjectIntoChild
+// ------------------------------------------
+// StdHandleInjectIntoChild is called from Hook_NtCreateUserProcess (in the
+// Firefox broker process, PID 7932) to pre-populate the child's
+// ProcessParameters.StandardOutput before the child's thread runs.
+// It calls EnsureVerboseOutput() to obtain the broker's console handle.
+// After the broker resolves its own output via AttachConsole (step 2 above),
+// EnsureVerboseOutput() returns a valid CONOUT$ handle.  That handle is
+// duplicated into the child's handle table and written to the child's PEB,
+// so the child's GetStdHandle() returns a real, writable console handle.
+// For sandbox-restricted children where even that write is blocked,
+// VL_INFO's OutputDebugString fallback (step 3) ensures visibility.
+//
+// THREAD SAFETY
+// -------------
+// g_hVerboseOutputReady / g_hVerboseOutput are written once, never cleared.
+// A benign race where two threads both call EnsureVerboseOutput before the
+// flag is set is possible but harmless: at worst one extra console handle is
+// opened and immediately superseded; both threads converge to the same state.
+//
+// CALLING CONTEXT
+// ---------------
+// EnsureVerboseOutput() (and therefore VL_INFO) must NOT be called from
+// DllMain -- AttachConsole acquires internal loader/console state that would
+// deadlock against the loader lock held by DllMain.  All VL_INFO call sites
+// are in hook functions (Hook_CreateProcessW, Hook_NtCreateUserProcess) which
+// are invoked well after DllMain has returned.  DllMain itself uses only
+// VL_DBG (OutputDebugString), which is safe from any context.
 
 // Initialized to false; set to true by LoadConfig() when VLAUNCHER_VERBOSE=1.
-static bool g_VerboseEnabled = false;
+static bool   g_VerboseEnabled      = false;
 
-static void VL_INFO(const wchar_t* fmt, ...) {
+// Cached console output handle for VL_INFO.
+// false  = not yet resolved (EnsureVerboseOutput has not run).
+// true + NULL handle   = resolved, no console reachable (use OutputDebugString).
+// true + valid handle  = resolved, writes go here.
+static bool   g_hVerboseOutputReady  = false;
+static HANDLE g_hVerboseOutput       = NULL;
+
+// EnsureVerboseOutput -- lazy resolver, called from VL_INFO and
+// StdHandleInjectIntoChild.  Never call from DllMain (see above).
+static HANDLE EnsureVerboseOutput()
+{
+    if (g_hVerboseOutputReady) return g_hVerboseOutput;
+
+    // 1. Inherited / injected stdout.
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h && h != INVALID_HANDLE_VALUE) {
+        g_hVerboseOutput      = h;
+        g_hVerboseOutputReady = true;
+        return h;
+    }
+
+    // 2. Attach to the parent process's console (handles GUI-subsystem
+    //    processes launched directly by VirtLauncher, e.g. firefox.exe).
+    //    AttachConsole fails with ERROR_ACCESS_DENIED if the process already
+    //    has a console -- that case is handled by branch 1 above.
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        // Open an explicit handle to the console screen buffer.
+        // Unlike GetStdHandle, this handle survives a later FreeConsole()
+        // call (the kernel object remains alive as long as we hold it).
+        h = CreateFileW(L"CONOUT$",
+                        GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        NULL, OPEN_EXISTING, 0, NULL);
+        if (h && h != INVALID_HANDLE_VALUE) {
+            g_hVerboseOutput      = h;
+            g_hVerboseOutputReady = true;
+            return h;
+        }
+        // Failed to open screen buffer; undo the attach so we don't leave
+        // the process in a partially-attached state.
+        FreeConsole();
+    }
+
+    // 3. No console reachable.  VL_INFO will use OutputDebugString.
+    g_hVerboseOutput      = NULL;
+    g_hVerboseOutputReady = true;
+    return NULL;
+}
+
+static void VL_INFO(const wchar_t* fmt, ...)
+{
     if (!g_VerboseEnabled) return;
+
     wchar_t buf[2048];
     va_list va;
     va_start(va, fmt);
@@ -149,26 +261,40 @@ static void VL_INFO(const wchar_t* fmt, ...) {
     va_end(va);
     buf[2047] = L'\0';
 
-    // Append newline
+    // Append newline.
     size_t len = wcslen(buf);
     if (len < 2047) { buf[len] = L'\n'; buf[len + 1] = L'\0'; ++len; }
 
-    // Write UTF-16 converted to the current console code page via WriteConsoleW,
-    // falling back to WriteFile with a UTF-8 conversion so output is readable
-    // whether stdout is a console or a redirected pipe/file.
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hOut == INVALID_HANDLE_VALUE || hOut == NULL) return;
+    // --- OutputDebugString (UNCONDITIONAL) ---
+    // Write to every process in the tree, including deep sandboxed children
+    // where console writes are blocked.  Format mirrors VL_DBG so all
+    // [VirtLauncher] and [VirtHook] messages share the same PID-tagged
+    // stream in DebugView and are easily filtered.
+    // buf already begins with "[VirtLauncher]" from the caller's format string;
+    // we only prepend the PID to match the "[PID] [tag] message" convention.
+    {
+        wchar_t dbg[2200];
+        _snwprintf_s(dbg, _countof(dbg), _TRUNCATE,
+                     L"[%u] %s", GetCurrentProcessId(), buf);
+        OutputDebugStringW(dbg);
+    }
 
-    DWORD written = 0;
-    // Try WriteConsoleW first (works when stdout is an attached console).
-    if (!WriteConsoleW(hOut, buf, (DWORD)len, &written, NULL)) {
-        // stdout is a pipe or file: convert to UTF-8 and use WriteFile.
-        char  utf8[4096];
-        int   n = WideCharToMultiByte(CP_UTF8, 0, buf, (int)len,
-                                      utf8, (int)sizeof(utf8) - 1, NULL, NULL);
-        if (n > 0) {
-            utf8[n] = '\0';
-            WriteFile(hOut, utf8, (DWORD)n, &written, NULL);
+    // --- Console / stdout (best-effort) ---
+    // EnsureVerboseOutput() attaches to the parent console when stdout is
+    // absent (GUI-subsystem process launched directly by VirtLauncher).
+    // Writes here make the message appear in the terminal window as well.
+    HANDLE hOut = EnsureVerboseOutput();
+    if (hOut) {
+        DWORD written = 0;
+        // WriteConsoleW: works when the process owns/shares the console.
+        if (!WriteConsoleW(hOut, buf, (DWORD)len, &written, NULL) || !written) {
+            // Pipe / file redirect fallback: UTF-8 via WriteFile.
+            char utf8[4096];
+            int  n = WideCharToMultiByte(CP_UTF8, 0, buf, (int)len,
+                                         utf8, (int)sizeof(utf8) - 1, NULL, NULL);
+            if (n > 0) {
+                WriteFile(hOut, utf8, (DWORD)n, &written, NULL);
+            }
         }
     }
 }
@@ -571,6 +697,37 @@ typedef NTSTATUS (NTAPI *PfnNtQueryDirectoryFileEx)(HANDLE, HANDLE, VL_PIO_APC_R
 typedef BOOL (WINAPI *PfnCreateProcessW)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
 typedef BOOL (WINAPI *PfnCreateProcessA)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
 
+// ---- NtCreateUserProcess (ntdll) ----
+// Firefox's sandbox broker calls this directly, bypassing CreateProcessW entirely.
+// We need to hook it at the NT layer to intercept those children.
+//
+// The full signature is documented in Geoff Chappell's research and the ReactOS
+// source.  We only need the fields required to implement suspend-inject-resume:
+//   ProcessHandle / ThreadHandle  -- output handles
+//   ProcessFlags / ThreadFlags    -- ULONG bitmasks; we OR in the suspend flag
+//   ProcessParameters             -- RTL_USER_PROCESS_PARAMETERS* (not used by hook)
+//   CreateInfo (PS_CREATE_INFO*)  -- in/out; we read State after the call
+//   AttributeList (PS_ATTRIBUTE_LIST*) -- may carry PROC_THREAD_ATTRIBUTE_* entries
+//
+// We use PVOID for the complex in/out structs we don't need to inspect.
+// The calling convention is the standard ntdll NTAPI (stdcall on x86, x64 ABI).
+
+// Thread-creation flags bitmask.  Bit 0 = CREATE_SUSPENDED equivalent at NT level.
+#define VL_THREAD_CREATE_FLAGS_CREATE_SUSPENDED  0x00000001UL
+
+typedef NTSTATUS (NTAPI *PfnNtCreateUserProcess)(
+    PHANDLE  ProcessHandle,
+    PHANDLE  ThreadHandle,
+    ACCESS_MASK ProcessDesiredAccess,
+    ACCESS_MASK ThreadDesiredAccess,
+    PVOID    ProcessObjectAttributes,   // POBJECT_ATTRIBUTES, optional
+    PVOID    ThreadObjectAttributes,    // POBJECT_ATTRIBUTES, optional
+    ULONG    ProcessFlags,              // PROCESS_CREATE_FLAGS_*
+    ULONG    ThreadFlags,               // THREAD_CREATE_FLAGS_*
+    PVOID    ProcessParameters,         // PRTL_USER_PROCESS_PARAMETERS
+    PVOID    CreateInfo,                // PPS_CREATE_INFO (in/out)
+    PVOID    AttributeList);            // PPS_ATTRIBUTE_LIST, optional
+
 // Window title prefixing (@)
 typedef BOOL  (WINAPI *PfnSetWindowTextW)(HWND, LPCWSTR);
 typedef BOOL  (WINAPI *PfnSetWindowTextA)(HWND, LPCSTR);
@@ -638,8 +795,9 @@ static PfnNtQueryDirectoryFile      Real_NtQueryDirectoryFile;
 static PfnNtQueryDirectoryFileEx    Real_NtQueryDirectoryFileEx;
 
 // ----- Children -----
-static PfnCreateProcessW  Real_CreateProcessW;
-static PfnCreateProcessA  Real_CreateProcessA;
+static PfnCreateProcessW       Real_CreateProcessW;
+static PfnCreateProcessA       Real_CreateProcessA;
+static PfnNtCreateUserProcess  Real_NtCreateUserProcess;  // ntdll low-level; used by Firefox sandbox broker
 
 // ----- Window title prefixing -----
 static PfnSetWindowTextW  Real_SetWindowTextW;
@@ -7252,48 +7410,104 @@ static NTSTATUS NTAPI Hook_NtQueryInformationFile(
     // FILE_NAME_INFORMATION layout: { ULONG FileNameLength; WCHAR FileName[1]; }
     struct MY_FNI { ULONG FileNameLength; WCHAR FileName[1]; };
 
+    // -----------------------------------------------------------------------
     // Reverse-translate a FILE_NAME_INFORMATION block in-place.
     //
-    // The kernel writes a VOLUME-RELATIVE path into FileName (e.g. \sandbox\C\dir\file.txt)
-    // relative to the PHYSICAL volume the handle lives on.  The original code passed
-    // this directly to ReverseApplyFsRedirect which only matches \??\ NT paths --
-    // a volume-relative path never matches, so translation was always a no-op.
+    // Classes 9 and 21 return a VOLUME-RELATIVE path in FileName: it starts
+    // with '\' but carries no '\??\' prefix and no drive letter, e.g.:
+    //   \sandbox\C\myapp\data    (physical, on the sandbox volume)
     //
-    // Correct approach: we already know the logical NT path -- it is e.logPath
-    // (e.g. \??\C:\dir\file.txt).  We only need to strip the \??\X: prefix to get
-    // the volume-relative logical path and write that back.
+    // To call ReverseApplyFsRedirect (which needs a full '\??\X:\...' NT path)
+    // we must prepend the correct PHYSICAL drive root -- the drive that the
+    // underlying file handle (e.hVirt) actually lives on.
     //
-    // We skip translation when isRealOnly=true: in that case hVirt IS the real file
-    // at the logical path, so the kernel already returns the correct volume-relative
-    // path for the logical volume -- no fix needed.
+    // We get that by querying e.hVirt with NtQueryObject (ObjectNameInformation)
+    // which returns a '\Device\HarddiskVolumeX\...' path; DevicePathToDosPath
+    // converts it to '\??\X:\...' and we take the first 6 chars as the prefix.
     //
-    // Safety: only write back if the result is non-empty and fits in the buffer.
-    // A bare drive root (\??\X: with no further path) gives volRel = "" which we
-    // treat as "\" rather than writing an empty FileNameLength back.
-    auto reverseTranslate = [&](MY_FNI* pFni, ULONG avail) {
-        if (e.isRealOnly) return;                          // already on logical volume
+    // e.logPath is NOT used here: it carries the LOGICAL drive letter, which
+    // differs from the physical one whenever the sandbox is on a different
+    // volume (the common case).  Using logPath would produce the wrong prefix
+    // and ReverseApplyFsRedirect would never match.
+    // -----------------------------------------------------------------------
+
+    // Derive the physical drive root ('\??\X:') from e.hVirt via NtQueryObject.
+    // If the query fails we skip translation rather than guess.
+    std::wstring physDriveRoot;
+    if (e.hVirt && Real_NtQueryObject) {
+        std::vector<BYTE> buf(1024, 0);
+        ULONG retLen = 0;
+        NTSTATUS qst = Real_NtQueryObject(e.hVirt, 1, &buf[0], (ULONG)buf.size(), &retLen);
+        if (qst == VL_STATUS_BUFFER_TOO_SMALL || qst == VL_STATUS_BUFFER_OVERFLOW) {
+            buf.assign(retLen + 8, 0);
+            qst = Real_NtQueryObject(e.hVirt, 1, &buf[0], (ULONG)buf.size(), &retLen);
+        }
+        if (NT_SUCCESS(qst) && retLen >= sizeof(VL_UNICODE_STRING)) {
+            VL_UNICODE_STRING* us = reinterpret_cast<VL_UNICODE_STRING*>(&buf[0]);
+            if (us->Buffer && us->Length >= 2 * sizeof(WCHAR)) {
+                std::wstring devPath(us->Buffer, us->Length / sizeof(WCHAR));
+                // Convert \Device\HarddiskVolumeX\... -> \??\X:\...
+                if (StartsWithI(devPath, L"\\Device\\"))
+                    devPath = DevicePathToDosPath(devPath);
+                // Take the '\??\X:' prefix (6 chars)
+                if (devPath.size() >= 6 &&
+                    devPath[0] == L'\\' && devPath[1] == L'?' &&
+                    devPath[2] == L'?' && devPath[3] == L'\\' &&
+                    iswalpha(devPath[4]) && devPath[5] == L':')
+                {
+                    physDriveRoot = devPath.substr(0, 6);
+                }
+            }
+        }
+    }
+
+    // If we couldn't determine the physical drive, skip translation entirely.
+    if (physDriveRoot.empty()) return st;
+
+    auto reverseTranslateVolRel = [&](MY_FNI* pFni, ULONG avail) {
         if (pFni->FileNameLength == 0) return;
         if (avail < sizeof(ULONG) + pFni->FileNameLength) return;
 
-        // Extract volume-relative logical path from e.logPath (\??\X:\rest -> \rest).
-        // e.logPath is guaranteed to be at least 6 chars (\??\X:) for any tracked handle.
-        if (e.logPath.size() < 6) return;
-        std::wstring volRelLog = e.logPath.substr(6);      // strip \??\X:
-        if (volRelLog.empty()) volRelLog = L"\\";          // bare drive root -> "\"
+        // Volume-relative physical path (starts with '\').
+        std::wstring volRel(pFni->FileName, pFni->FileNameLength / sizeof(WCHAR));
 
-        // Only write back if it fits (logical path <= physical path after redirect).
-        if (volRelLog.size() * sizeof(WCHAR) <= pFni->FileNameLength) {
+        // Reconstruct full physical NT path using the correct physical drive.
+        std::wstring fullPhys = physDriveRoot + volRel;
+
+        std::wstring fullLog = ReverseApplyFsRedirect(fullPhys);
+        if (fullLog == fullPhys) return;   // no redirect matched, nothing to do
+
+        // Strip the '\??\Y:' prefix (6 chars) to get the volume-relative
+        // logical path.  The logical drive may differ from the physical one.
+        //
+        // Edge case: if fullLog == '\??\Y:' exactly (bare drive root, 6 chars),
+        // the volume-relative form is '\', not empty string.  Writing back
+        // empty would zero FileNameLength and crash callers (e.g. cmd.exe CWD).
+        std::wstring volRelLog;
+        if (fullLog.size() >= 6 &&
+            fullLog[0] == L'\\' && fullLog[1] == L'?' &&
+            fullLog[2] == L'?' && fullLog[3] == L'\\' &&
+            iswalpha(fullLog[4]) && fullLog[5] == L':')
+        {
+            volRelLog = fullLog.substr(6);
+            if (volRelLog.empty()) volRelLog = L"\\";   // bare drive root -> '\'
+        } else {
+            volRelLog = fullLog;
+        }
+
+        // Write back only if non-empty and fits in the buffer.
+        if (!volRelLog.empty() && volRelLog.size() <= volRel.size()) {
             ULONG newLen = (ULONG)(volRelLog.size() * sizeof(WCHAR));
             memcpy(pFni->FileName, volRelLog.c_str(), newLen);
             pFni->FileNameLength = newLen;
-            VL_DBG(L"Hook_NtQueryInformationFile: reversed FileName -> %s", volRelLog.c_str());
+            VL_DBG(L"Hook_NtQueryInformationFile: reversed vol-rel %s -> %s",
+                   volRel.c_str(), volRelLog.c_str());
         }
     };
 
     // FileNameInformation (class 9): buffer IS FILE_NAME_INFORMATION.
-    // Pre-existing USHORT type bug fixed: FileNameLength is ULONG, not USHORT.
     if (FileInformationClass == 9 && Length >= sizeof(ULONG))
-        reverseTranslate(reinterpret_cast<MY_FNI*>(FileInformation), Length);
+        reverseTranslateVolRel(reinterpret_cast<MY_FNI*>(FileInformation), Length);
 
     // FileAllInformation (class 21): composite structure with FILE_NAME_INFORMATION
     // embedded at a fixed offset of 96 bytes.
@@ -7308,34 +7522,44 @@ static NTSTATUS NTAPI Hook_NtQueryInformationFile(
     //   FILE_ALIGNMENT_INFORMATION   4 bytes  (ULONG)
     //   FILE_NAME_INFORMATION            <-- offset 96
     //
-    // Without interception the embedded name leaks the physical virtual-store
-    // path -- same class of bug as the NtQueryKey FIX A above.
+    // Same volume-relative format as class 9; uses the same lambda.
     if (FileInformationClass == 21) {
         const ULONG kNameOffset = 96u;
         if (Length > kNameOffset + sizeof(ULONG))
-            reverseTranslate(
+            reverseTranslateVolRel(
                 reinterpret_cast<MY_FNI*>(static_cast<BYTE*>(FileInformation) + kNameOffset),
                 Length - kNameOffset);
     }
 
-    // FileNormalizedNameInformation (class 48): returns a full DEVICE path
-    // \Device\HarddiskVolumeX\rest rather than a volume-relative path.
-    // The reverseTranslate lambda above handles volume-relative (classes 9/21);
-    // class 48 needs different treatment: write e.logPath (\??\X:\rest) directly.
-    // \??\X:\rest is shorter than \Device\HarddiskVolumeX\rest so it always fits.
-    // Callers that query FileNormalizedNameInformation accept \??\ NT paths.
-    if (FileInformationClass == 48 && !e.isRealOnly &&
-        Length >= sizeof(ULONG) && e.logPath.size() >= 6)
-    {
+    // FileNormalizedNameInformation (class 48): FILE_NAME_INFORMATION whose
+    // FileName is a DEVICE path: \Device\HarddiskVolumeX\rest
+    // DevicePathToDosPath converts it to \??\X:\rest so ReverseApplyFsRedirect
+    // can match, then we write the result back as a device path.
+    if (FileInformationClass == 48 && Length >= sizeof(ULONG)) {
         MY_FNI* pFni = reinterpret_cast<MY_FNI*>(FileInformation);
         if (pFni->FileNameLength > 0 &&
             Length >= sizeof(ULONG) + pFni->FileNameLength)
         {
-            ULONG newLen = (ULONG)(e.logPath.size() * sizeof(WCHAR));
-            if (newLen <= pFni->FileNameLength) {
-                memcpy(pFni->FileName, e.logPath.c_str(), newLen);
-                pFni->FileNameLength = newLen;
-                VL_DBG(L"Hook_NtQueryInformationFile cl48: reversed -> %s", e.logPath.c_str());
+            std::wstring devPath(pFni->FileName, pFni->FileNameLength / sizeof(WCHAR));
+            // Convert \Device\HarddiskVolumeX\... -> \??\X:\...
+            std::wstring dosPath = DevicePathToDosPath(devPath);
+            if (dosPath != devPath) {
+                // dosPath is now in \??\X:\... form; reverse-apply redirect.
+                std::wstring logDos = ReverseApplyFsRedirect(dosPath);
+                if (logDos != dosPath) {
+                    // We cannot reconstruct the \Device\... form for an arbitrary
+                    // logical drive letter without re-querying QueryDosDevice, and
+                    // the result must fit in the original buffer.  Write the \??\
+                    // form instead; it is valid as a normalized name and all callers
+                    // that interpret this class accept NT paths.
+                    if (logDos.size() <= devPath.size()) {
+                        ULONG newLen = (ULONG)(logDos.size() * sizeof(WCHAR));
+                        memcpy(pFni->FileName, logDos.c_str(), newLen);
+                        pFni->FileNameLength = newLen;
+                        VL_DBG(L"Hook_NtQueryInformationFile cl48: reversed %s -> %s",
+                               devPath.c_str(), logDos.c_str());
+                    }
+                }
             }
         }
     }
@@ -7930,7 +8154,8 @@ static bool ChildIsPe64(const wchar_t* path) {
 // to distinguish it from the launcher's own output.
 static void VerboseChildInjected(LPCWSTR appName, LPCWSTR cmdLine,
                                   const char* dllPath,
-                                  DWORD childPid)
+                                  DWORD childPid,
+                                  const wchar_t* funcLabel)   // e.g. L"CreateProcessW"
 {
     if (!g_VerboseEnabled) return;
 
@@ -7950,18 +8175,21 @@ static void VerboseChildInjected(LPCWSTR appName, LPCWSTR cmdLine,
     wchar_t dllW[MAX_PATH] = {};
     MultiByteToWideChar(CP_ACP, 0, dllPath, -1, dllW, MAX_PATH);
 
-    VL_INFO(L"[VirtLauncher] --- Child process injected ---");
-    VL_INFO(L"[VirtLauncher] Target  : %s (%s)",
+    VL_INFO(L"[VirtLauncher] [%s] child PID %u", funcLabel, childPid);
+    VL_INFO(L"[VirtLauncher] [%s] Target  : %s (%s)",
+            funcLabel,
             fullPath[0] ? fullPath : exePath,
             child64 ? L"64-bit" : L"32-bit");
-    VL_INFO(L"[VirtLauncher] Parent  : PID %u (%s)",
+    VL_INFO(L"[VirtLauncher] [%s] Parent  : PID %u (%s)",
+            funcLabel,
             GetCurrentProcessId(), self64 ? L"64-bit" : L"32-bit");
-    VL_INFO(L"[VirtLauncher] Command : %s",
+    VL_INFO(L"[VirtLauncher] [%s] Command : %s",
+            funcLabel,
             cmdLine && cmdLine[0] ? cmdLine : (appName ? appName : L"(unknown)"));
-    VL_INFO(L"[VirtLauncher] Child   : PID %u", childPid);
-    VL_INFO(L"[VirtLauncher] Injecting: %s", dllW);
+    VL_INFO(L"[VirtLauncher] [%s] Injecting: %s", funcLabel, dllW);
     if (child64 != self64)
-        VL_INFO(L"[VirtLauncher]           (cross-arch: Detours swapped 32<->64 suffix)");
+        VL_INFO(L"[VirtLauncher] [%s] (cross-arch: Detours swapped 32<->64 suffix)",
+                funcLabel);
 }
 
 // Disable WOW64 FS redirection.  No-op in 64-bit builds.
@@ -8049,6 +8277,17 @@ static BOOL WINAPI Hook_CreateProcessW(
     PVOID wow64Old = NULL;
     bool  wow64Off = DisableWow64Redir(&wow64Old);
     const char* dlls[1] = { dllPath };
+
+    // CRITICAL: mark the current thread as reentrant for the duration of
+    // DetourCreateProcessWithDllsW.  That function calls Real_CreateProcessW
+    // (original kernel32 code), which internally calls ntdll!NtCreateUserProcess.
+    // Our Hook_NtCreateUserProcess is installed at the ntdll trampoline and would
+    // fire for that call — which is the SAME child being handled here by Detours.
+    // Without the guard, Hook_NtCreateUserProcess would:
+    //   (a) also inject the DLL  → duplicate import-table entry, and
+    //   (b) call ResumeThread    → child runs while DetourCreateProcessWithDllsW
+    //       is still trying to patch it → crash / corruption.
+    SetReentrant(true);
     BOOL ok = DetourCreateProcessWithDllsW(
         lpApplicationName, lpCommandLine,
         lpProcessAttributes, lpThreadAttributes,
@@ -8056,19 +8295,22 @@ static BOOL WINAPI Hook_CreateProcessW(
         lpCurrentDirectory, pSIW, lpProcessInformation,
         1, dlls,
         Real_CreateProcessW);  // bypass our hook; avoids re-entrancy
+    SetReentrant(false);       // always clear before any further work
 
     RestoreWow64Redir(wow64Off, wow64Old);
     if (!ok) {
         VL_DBG(L"Hook_CreateProcessW: DetourCreateProcessWithDllsW FAILED err=%u"
                L" -- falling back to unhooked launch", GetLastError());
-        // Fall back: create without injection so the child at least runs.
+        // Fall back: Real_CreateProcessW will trigger Hook_NtCreateUserProcess
+        // (reentrancy flag is now clear) which will inject via import-table patch.
         ok = Real_CreateProcessW(lpApplicationName, lpCommandLine,
                                   lpProcessAttributes, lpThreadAttributes,
                                   bInheritHandles, dwCreationFlags, lpEnvironment,
                                   lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     } else {
         VerboseChildInjected(lpApplicationName, lpCommandLine, dllPath,
-                             lpProcessInformation ? lpProcessInformation->dwProcessId : 0);
+                             lpProcessInformation ? lpProcessInformation->dwProcessId : 0,
+                             L"CreateProcessW");
     }
     return ok;
 }
@@ -8116,6 +8358,9 @@ static BOOL WINAPI Hook_CreateProcessA(
     PVOID wow64Old = NULL;
     bool  wow64Off = DisableWow64Redir(&wow64Old);
     const char* dlls[1] = { dllPath };
+
+    // Same reentrancy guard as Hook_CreateProcessW — see detailed comment there.
+    SetReentrant(true);
     BOOL ok = DetourCreateProcessWithDllsA(
         lpApplicationName, lpCommandLine,
         lpProcessAttributes, lpThreadAttributes,
@@ -8123,6 +8368,7 @@ static BOOL WINAPI Hook_CreateProcessA(
         lpCurrentDirectory, pSIA, lpProcessInformation,
         1, dlls,
         Real_CreateProcessA);  // bypass our hook; avoids re-entrancy
+    SetReentrant(false);       // always clear before any further work
 
     RestoreWow64Redir(wow64Off, wow64Old);
     if (!ok) {
@@ -8141,9 +8387,451 @@ static BOOL WINAPI Hook_CreateProcessA(
             MultiByteToWideChar(CP_ACP, 0, lpCommandLine, -1, wCmd, MAX_PATH * 2 - 1);
         VerboseChildInjected(wApp[0] ? wApp : NULL, wCmd[0] ? wCmd : NULL,
                              dllPath,
-                             lpProcessInformation ? lpProcessInformation->dwProcessId : 0);
+                             lpProcessInformation ? lpProcessInformation->dwProcessId : 0,
+                             L"CreateProcessA");
     }
     return ok;
+}
+
+// ============================================================
+// NtCreateUserProcess hook
+// ============================================================
+//
+// WHY THIS IS NEEDED
+// ------------------
+// Firefox's sandbox broker (and Chromium-based browsers, Electron apps, etc.)
+// spawns content/utility/GPU processes by calling ntdll!NtCreateUserProcess
+// directly, completely bypassing kernel32!CreateProcessW.
+// Hook_CreateProcessW therefore never fires for those children, so VirtHook.dll
+// is never injected into them and they escape the virtualization layer.
+//
+// CALL-SITE TAXONOMY
+// ------------------
+// There are two distinct sources of NtCreateUserProcess calls in a hooked
+// process tree, and they must be handled differently:
+//
+//   (A) Via Hook_CreateProcessW / Hook_CreateProcessA:
+//       The chain is  Hook_CreateProcessW
+//                       → DetourCreateProcessWithDllsW
+//                         → Real_CreateProcessW  (original kernel32 code)
+//                           → CreateProcessInternalW
+//                             → NtCreateUserProcess  ← our hook fires
+//       In this case Detours is ALREADY handling the injection: it will call
+//       DetourUpdateProcessWithDll after NtCreateUserProcess returns.
+//       We must not inject again (duplicate import entry) and must not resume
+//       the thread (Detours expects it still suspended).
+//       Detection: Hook_CreateProcessW sets SetReentrant(true) for the duration
+//       of DetourCreateProcessWithDllsW; we check IsReentrant() and pass through.
+//
+//   (B) Direct call from a browser / Electron sandbox broker:
+//       NtCreateUserProcess is called with no CreateProcessW in the call chain.
+//       IsReentrant() is false.  We must inject our DLL and handle suspension.
+//
+// WHY DetourUpdateProcessWithDll, NOT CreateRemoteThread+LoadLibraryW
+// -------------------------------------------------------------------
+// When NtCreateUserProcess creates a new process, the kernel maps only ntdll
+// into the child's address space.  The process's import table has NOT been
+// processed yet — kernel32, user32, etc. are not loaded, and the PEB loader
+// data structures (PEB->Ldr) are uninitialised.  Calling CreateRemoteThread
+// then LoadLibraryW in that state invokes kernel32 code against uninitialised
+// loader state → undefined behaviour → crashes / "only first child injected".
+//
+// DetourUpdateProcessWithDll patches the child's PE import table (a plain
+// in-memory data structure) via ReadProcessMemory/WriteProcessMemory.
+// No code is executed in the child at this stage.  When the child's main
+// thread later runs LdrInitializeThunk, the NT loader finds our DLL in the
+// import table and loads it exactly like any statically linked DLL — before
+// any application code executes.  This is the same mechanism used internally
+// by DetourCreateProcessWithDllsW, so it is known-correct for this scenario.
+//
+// SUSPENSION PROTOCOL
+// -------------------
+// Firefox's broker calls NtCreateUserProcess expecting a SUSPENDED child so
+// it can configure the security token, job object, and IPC handles before the
+// child runs.  We must honour that expectation:
+//
+//   • If the caller already set VL_THREAD_CREATE_FLAGS_CREATE_SUSPENDED in
+//     ThreadFlags, the child must remain suspended on return — we injected but
+//     did NOT resume.  The caller (the broker) will resume when ready.
+//   • If the caller did NOT set the suspend bit, we added it ourselves for
+//     the duration of injection, then resume before returning.
+//
+// WINDOWS XP NOTE
+// ---------------
+// NtCreateUserProcess was introduced in Windows Vista (NT 6.0).  On XP (NT 5.1)
+// the equivalent path is NtCreateProcessEx + NtCreateThread, both called by
+// kernel32!CreateProcessInternalW.  Because:
+//   (a) Real_NtCreateUserProcess is NULL on XP (GetProcAddress returns NULL),
+//       the VL_ATTACH macro does nothing — no hook is installed, no crash.
+//   (b) Every XP process creation still goes through CreateProcessW/A, which
+//       we already hook, so injection works correctly on XP without any
+//       additional NT-layer hook.
+//   (c) The Firefox sandbox that makes this hook necessary requires Vista+
+//       integrity levels; Firefox 115 itself requires Windows 7.
+// There is therefore no need to hook NtCreateProcessEx or RtlCreateUserProcess.
+
+// ============================================================
+// StdHandleInjectIntoChild
+// ============================================================
+// Duplicates the calling process's STD_OUTPUT_HANDLE into a freshly-created
+// suspended child process and writes the duplicate value into the child's
+// PEB -> ProcessParameters -> StandardOutput (and StandardError).
+//
+// WHY THIS IS NEEDED
+// ------------------
+// VL_INFO writes to GetStdHandle(STD_OUTPUT_HANDLE).  Children created by
+// NtCreateUserProcess (Firefox content/GPU/socket processes, Electron sandbox
+// workers, etc.) are spawned with PROC_THREAD_ATTRIBUTE_HANDLE_LIST, which
+// restricts which handles the child inherits to only those the broker
+// explicitly listed.  The terminal/console stdout handle from the original
+// VirtLauncher session is NOT in that list, so the child's
+// GetStdHandle(STD_OUTPUT_HANDLE) returns NULL and VL_INFO silently returns.
+//
+// WHY PEB PATCHING IS THE CORRECT APPROACH
+// -----------------------------------------
+// GetStdHandle() is not a true "get a handle by type" API — it simply reads a
+// field from the process's RTL_USER_PROCESS_PARAMETERS structure:
+//
+//   GetStdHandle(STD_OUTPUT_HANDLE)
+//     → PEB->ProcessParameters->StandardOutput
+//
+// So the correct fix is the same thing CreateProcessW does when it copies
+// STARTUPINFO.hStdOutput into a child: DuplicateHandle creates a valid entry
+// in the child's handle table; WriteProcessMemory patches the StandardOutput
+// field so GetStdHandle finds it.
+//
+// FIELD OFFSETS (stable Windows Vista – Windows 11)
+// -------------------------------------------------
+//   Arch     PEB.ProcessParameters   PP.StandardOutput   PP.StandardError
+//   64-bit   PEB + 0x20              PP + 0x28           PP + 0x30
+//   32-bit   PEB + 0x10              PP + 0x1C           PP + 0x20
+//
+// For a 32-bit (WOW64) child seen from a 64-bit host, the child's 32-bit code
+// reads from the 32-bit PEB, whose address is returned by
+// NtQueryInformationProcess(ProcessWow64Information = 26).  The 32-bit offsets
+// above apply to that PEB.
+//
+// This function is a best-effort helper: if any step fails (bad handle,
+// ReadProcessMemory error, etc.) it returns silently.  The child will simply
+// have no verbose output, which is the pre-fix behaviour.
+
+// Minimal PROCESS_BASIC_INFORMATION layout — matches winternl.h.
+// Using PVOID for Reserved1 (instead of NTSTATUS) is intentional: on 64-bit
+// the compiler inserts 4 bytes of padding after NTSTATUS to align the next
+// PVOID, which brings PebBaseAddress to offset 8.  PVOID occupies 8 bytes on
+// 64-bit and 4 bytes on 32-bit, so the layout matches on both architectures
+// without any explicit padding members.
+struct VL_PBI {
+    PVOID Reserved1;        // ExitStatus  (NTSTATUS + implicit padding on 64-bit)
+    PVOID PebBaseAddress;   // offset 8 (64-bit) / offset 4 (32-bit)
+    PVOID Reserved2[2];
+    PVOID UniqueProcessId;
+    PVOID Reserved3;
+};
+
+static void StdHandleInjectIntoChild(HANDLE hProcess, bool childIs64)
+{
+    // Resolve NtQueryInformationProcess once.
+    typedef NTSTATUS (NTAPI *PfnNtQIP)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static PfnNtQIP s_ntqip =
+        (PfnNtQIP)GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                                  "NtQueryInformationProcess");
+    if (!s_ntqip) return;
+
+    // Obtain the console handle via EnsureVerboseOutput() rather than
+    // GetStdHandle().  When the calling process is a GUI-subsystem app
+    // (e.g. the Firefox broker launched directly by VirtLauncher),
+    // GetStdHandle(STD_OUTPUT_HANDLE) returns NULL.  EnsureVerboseOutput()
+    // transparently calls AttachConsole(ATTACH_PARENT_PROCESS) + CONOUT$
+    // in that case, giving us a real, writable handle to VirtLauncher's
+    // console.  Without this, StdHandleInjectIntoChild would always bail
+    // out here and inject nothing into any child.
+    HANDLE hMyOut = EnsureVerboseOutput();
+    if (!hMyOut) {
+        VL_DBG(L"StdHandleInjectIntoChild: EnsureVerboseOutput returned NULL, skip");
+        return;
+    }
+
+    // Duplicate our stdout into the child's handle table.
+    // bInheritHandle = FALSE: the child's child processes should not further
+    // inherit this handle unless they are also managed by our hook.
+    HANDLE hChildOut = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), hMyOut,
+                         hProcess, &hChildOut,
+                         0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        VL_DBG(L"StdHandleInjectIntoChild: DuplicateHandle failed err=%u",
+               GetLastError());
+        return;
+    }
+
+    // Determine the child PEB address and the correct field offsets.
+    ULONG_PTR pebBase = 0;
+    SIZE_T     ptrSize = 0;           // size of a pointer in the child
+    SIZE_T     procParamsOff = 0;     // PEB → ProcessParameters byte offset
+    SIZE_T     stdOutOff = 0;         // ProcessParameters → StandardOutput offset
+    SIZE_T     stdErrOff = 0;         // ProcessParameters → StandardError  offset
+
+#ifdef _WIN64
+    if (childIs64) {
+        // 64-bit child: use ProcessBasicInformation (class 0).
+        VL_PBI pbi = {};
+        if (!NT_SUCCESS(s_ntqip(hProcess, 0, &pbi, sizeof(pbi), NULL))) goto fail;
+        pebBase        = (ULONG_PTR)pbi.PebBaseAddress;
+        ptrSize        = 8;
+        procParamsOff  = 0x20;
+        stdOutOff      = 0x28;
+        stdErrOff      = 0x30;
+    } else {
+        // 32-bit (WOW64) child seen from a 64-bit host: the child's 32-bit code
+        // reads from the 32-bit PEB.  ProcessWow64Information (class 26) returns
+        // a ULONG_PTR containing the 32-bit PEB address.
+        ULONG_PTR wow64Peb = 0;
+        if (!NT_SUCCESS(s_ntqip(hProcess, 26, &wow64Peb, sizeof(wow64Peb), NULL))
+            || !wow64Peb) goto fail;
+        pebBase        = wow64Peb;
+        ptrSize        = 4;
+        procParamsOff  = 0x10;
+        stdOutOff      = 0x1C;
+        stdErrOff      = 0x20;
+    }
+#else
+    // 32-bit host: child is always 32-bit.
+    {
+        VL_PBI pbi = {};
+        if (!NT_SUCCESS(s_ntqip(hProcess, 0, &pbi, sizeof(pbi), NULL))) goto fail;
+        pebBase        = (ULONG_PTR)pbi.PebBaseAddress;
+        ptrSize        = 4;
+        procParamsOff  = 0x10;
+        stdOutOff      = 0x1C;
+        stdErrOff      = 0x20;
+    }
+#endif
+
+    if (!pebBase) goto fail;
+
+    // Read the ProcessParameters pointer out of the child's PEB.
+    ULONG_PTR ppPtr = 0;
+    SIZE_T     nRead = 0;
+    if (!ReadProcessMemory(hProcess,
+                           reinterpret_cast<LPCVOID>(pebBase + procParamsOff),
+                           &ppPtr, ptrSize, &nRead)
+        || !ppPtr) {
+        VL_DBG(L"StdHandleInjectIntoChild: ReadProcessMemory(PEB) failed err=%u",
+               GetLastError());
+        goto fail;
+    }
+
+    // Write the duplicated handle into StandardOutput and StandardError.
+    // We store only ptrSize bytes so 32-bit children get a ULONG, not a ULONG64.
+    {
+        ULONG64 val = (ULONG64)(ULONG_PTR)hChildOut;
+        SIZE_T  nWritten = 0;
+        BOOL okOut = WriteProcessMemory(hProcess,
+                                        reinterpret_cast<LPVOID>(ppPtr + stdOutOff),
+                                        &val, ptrSize, &nWritten);
+        BOOL okErr = WriteProcessMemory(hProcess,
+                                        reinterpret_cast<LPVOID>(ppPtr + stdErrOff),
+                                        &val, ptrSize, &nWritten);
+        if (!okOut || !okErr) {
+            VL_DBG(L"StdHandleInjectIntoChild: WriteProcessMemory failed err=%u",
+                   GetLastError());
+            goto fail;
+        }
+    }
+
+    VL_DBG(L"StdHandleInjectIntoChild: PID=%u parent_out=0x%p child_out=0x%p"
+           L" (peb=0x%p pp=0x%p)",
+           GetProcessId(hProcess), hMyOut, hChildOut,
+           (PVOID)pebBase, (PVOID)ppPtr);
+    return;   // hChildOut is now owned by the child; do not CloseHandle here
+
+fail:
+    // We placed hChildOut into the child's handle table via DuplicateHandle.
+    // Close it there by duplicating it back with DUPLICATE_CLOSE_SOURCE.
+    {
+        HANDLE tmp = NULL;
+        DuplicateHandle(hProcess, hChildOut,
+                        GetCurrentProcess(), &tmp,
+                        0, FALSE,
+                        DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE);
+        if (tmp) CloseHandle(tmp);
+    }
+}
+
+static NTSTATUS NTAPI Hook_NtCreateUserProcess(
+    PHANDLE     ProcessHandle,
+    PHANDLE     ThreadHandle,
+    ACCESS_MASK ProcessDesiredAccess,
+    ACCESS_MASK ThreadDesiredAccess,
+    PVOID       ProcessObjectAttributes,
+    PVOID       ThreadObjectAttributes,
+    ULONG       ProcessFlags,
+    ULONG       ThreadFlags,
+    PVOID       ProcessParameters,
+    PVOID       CreateInfo,
+    PVOID       AttributeList)
+{
+    // -----------------------------------------------------------------------
+    // (A) Reentrancy guard: we are inside Hook_CreateProcessW/A
+    //     DetourCreateProcessWithDllsW is managing this child — pass through
+    //     completely and let it do its own import-table patching.
+    // -----------------------------------------------------------------------
+    if (IsReentrant()) {
+        return Real_NtCreateUserProcess(
+            ProcessHandle, ThreadHandle,
+            ProcessDesiredAccess, ThreadDesiredAccess,
+            ProcessObjectAttributes, ThreadObjectAttributes,
+            ProcessFlags, ThreadFlags,
+            ProcessParameters, CreateInfo, AttributeList);
+    }
+
+    // -----------------------------------------------------------------------
+    // (B) Direct browser/sandbox call — we handle injection ourselves.
+    // -----------------------------------------------------------------------
+
+    // No DLL configured → nothing to inject, pure pass-through.
+    const char* dllPath = PickDllPath();
+    if (!dllPath || !dllPath[0]) {
+        VL_DBG(L"Hook_NtCreateUserProcess: no DLL path, pass-through");
+        return Real_NtCreateUserProcess(
+            ProcessHandle, ThreadHandle,
+            ProcessDesiredAccess, ThreadDesiredAccess,
+            ProcessObjectAttributes, ThreadObjectAttributes,
+            ProcessFlags, ThreadFlags,
+            ProcessParameters, CreateInfo, AttributeList);
+    }
+
+    // Remember whether the CALLER originally wanted the child thread suspended.
+    // Firefox's broker sets this bit so it can configure the sandbox before
+    // the child runs.  We must preserve that expectation: if the bit was
+    // already set, leave the child suspended on return; if we added it, resume.
+    const bool callerWantedSuspended =
+        (ThreadFlags & VL_THREAD_CREATE_FLAGS_CREATE_SUSPENDED) != 0;
+
+    // Force the initial thread suspended so the PE import table is stable
+    // (no code in the child running) while DetourUpdateProcessWithDll patches it.
+    const ULONG modifiedThreadFlags =
+        ThreadFlags | VL_THREAD_CREATE_FLAGS_CREATE_SUSPENDED;
+
+    // Create the child process.  No reentrancy wrapper needed here — this is
+    // a direct syscall that goes to kernel mode and cannot re-enter our hook.
+    NTSTATUS st = Real_NtCreateUserProcess(
+        ProcessHandle, ThreadHandle,
+        ProcessDesiredAccess, ThreadDesiredAccess,
+        ProcessObjectAttributes, ThreadObjectAttributes,
+        ProcessFlags, modifiedThreadFlags,
+        ProcessParameters, CreateInfo, AttributeList);
+
+    if (!NT_SUCCESS(st)) {
+        VL_DBG(L"Hook_NtCreateUserProcess: syscall failed st=0x%08X", (ULONG)st);
+        return st;
+    }
+
+    HANDLE hProcess = (ProcessHandle && *ProcessHandle) ? *ProcessHandle : NULL;
+    HANDLE hThread  = (ThreadHandle  && *ThreadHandle)  ? *ThreadHandle  : NULL;
+
+    if (!hProcess || !hThread) {
+        // Handles came back NULL — cannot inject.  If we added the suspend bit
+        // ourselves, we have no thread to resume; just return as-is.
+        VL_DBG(L"Hook_NtCreateUserProcess: NULL handles returned, cannot inject");
+        return st;
+    }
+
+    // Determine the child's bitness so we inject the correct arch DLL.
+    // IsWow64Process: returns TRUE when hProcess is a 32-bit WOW64 process on
+    // a 64-bit OS.  On a 32-bit OS the function may not exist (XP 32-bit).
+    bool childIs64 = false;
+#ifdef _WIN64
+    {
+        BOOL isWow64Child = FALSE;
+        typedef BOOL (WINAPI *PfnIsWow64)(HANDLE, PBOOL);
+        static PfnIsWow64 s_isWow64 =
+            (PfnIsWow64)GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                       "IsWow64Process");
+        if (s_isWow64 && s_isWow64(hProcess, &isWow64Child))
+            childIs64 = !isWow64Child;      // WOW64 == 32-bit child
+        else
+            childIs64 = true;               // detection failed: assume same as us (64)
+    }
+#else
+    childIs64 = false;  // 32-bit host cannot spawn a native 64-bit child
+#endif
+
+    // Pick the arch-matched DLL path (same logic as Hook_CreateProcessW).
+    const char* injectDll = childIs64
+        ? (g_DllPathA64[0] ? g_DllPathA64 : dllPath)
+        : (g_DllPathA32[0] ? g_DllPathA32 : dllPath);
+
+    VL_DBG(L"Hook_NtCreateUserProcess: child PID=%u (%s), patching import table with %S",
+           GetProcessId(hProcess), childIs64 ? L"64-bit" : L"32-bit", injectDll);
+    VL_INFO(L"[VirtLauncher] [NtCreateUserProcess] child PID=%u (%s)",
+            GetProcessId(hProcess), childIs64 ? L"64-bit" : L"32-bit");
+    VL_INFO(L"[VirtLauncher] [NtCreateUserProcess] patching import table: %S", injectDll);
+
+    // Patch the child's PE import table.
+    //
+    // DetourUpdateProcessWithDll reads the child's PE headers via
+    // ReadProcessMemory, adds an import entry for injectDll, and writes the
+    // patched table back via WriteProcessMemory.  No code executes in the
+    // child.  When LdrInitializeThunk runs (after ResumeThread below),
+    // the NT loader finds injectDll in the import table and loads it before
+    // any application code — exactly like a statically linked DLL.
+    //
+    // This is safe to call with the child's thread suspended and before any
+    // DLLs have been loaded in the child, because it operates only on the
+    // in-memory PE structures, not on live code.
+    const char* dlls[1] = { injectDll };
+    BOOL patched = DetourUpdateProcessWithDll(hProcess, dlls, 1);
+
+    if (patched) {
+        VL_INFO(L"[VirtLauncher] [NtCreateUserProcess] import table patched OK");
+    } else {
+        VL_DBG(L"Hook_NtCreateUserProcess: DetourUpdateProcessWithDll FAILED err=%u",
+               GetLastError());
+        VL_INFO(L"[VirtLauncher] [NtCreateUserProcess] FAILED to patch (err=%u)"
+                L" -- child may escape sandbox", GetLastError());
+        // Child is still suspended; fall through to the resume logic below so
+        // it is not left frozen forever.  It will run without our DLL injected,
+        // same behaviour as pre-fix.
+    }
+
+    // Propagate the verbose output handle into the child's ProcessParameters.
+    //
+    // NtCreateUserProcess-spawned children (Firefox content/GPU processes, etc.)
+    // are created with PROC_THREAD_ATTRIBUTE_HANDLE_LIST, which restricts handle
+    // inheritance to only the handles the broker explicitly listed.  The
+    // VirtLauncher console stdout is NOT in that list, so GetStdHandle returns
+    // NULL in those children, silencing VL_INFO output even though
+    // VLAUNCHER_VERBOSE=1 is in the environment.
+    //
+    // StdHandleInjectIntoChild duplicates our stdout into the child's handle
+    // table and writes the result into the child's PEB.ProcessParameters.
+    // StandardOutput before the first thread runs.  This is the correct and
+    // stable mechanism — the same one CreateProcessW uses for STARTUPINFO.hStdOutput.
+    //
+    // We call this regardless of whether DetourUpdateProcessWithDll succeeded:
+    // if patching failed the child has no VirtHook.dll and VL_INFO is never
+    // called anyway, so the call is a cheap no-op in that case.  When patching
+    // did succeed, the child must have a working stdout before LdrInitializeThunk
+    // runs (which loads our DLL and immediately calls VL_INFO from DllMain).
+    if (g_VerboseEnabled)
+        StdHandleInjectIntoChild(hProcess, childIs64);
+
+    // Resume the initial thread ONLY if we added the suspend bit ourselves.
+    // If the broker originally requested suspension (callerWantedSuspended),
+    // leave the child suspended — the broker will resume it after setting up
+    // its security token, job object, and IPC channel, which is the correct
+    // Firefox sandbox initialisation sequence.
+    // Resuming early would cause the child to start with an incomplete sandbox
+    // configuration → tab crash.
+    if (!callerWantedSuspended) {
+        DWORD prev = ResumeThread(hThread);
+        VL_DBG(L"Hook_NtCreateUserProcess: ResumeThread prevSuspendCount=%u", prev);
+    } else {
+        VL_DBG(L"Hook_NtCreateUserProcess: leaving child suspended (caller requested)");
+    }
+
+    return st;
 }
 
 // ============================================================
@@ -8402,6 +9090,9 @@ static void InstallHooks() {
     VL_GETPROC(ntdll, NtQueryObject);
     VL_GETPROC(k32,   CreateProcessW);
     VL_GETPROC(k32,   CreateProcessA);
+    // NtCreateUserProcess: present on Vista+.  Browsers / Electron apps call
+    // it directly to spawn sandboxed children, bypassing CreateProcessW.
+    VL_GETPROC(ntdll, NtCreateUserProcess);
 
     // Window title prefixing — user32.dll
     {
@@ -8523,6 +9214,7 @@ static void InstallHooks() {
     VL_ATTACH(NtClose);
     VL_ATTACH(CreateProcessW);
     VL_ATTACH(CreateProcessA);
+    if (Real_NtCreateUserProcess) VL_ATTACH(NtCreateUserProcess);
 
     // Window title prefixing
     if (Real_SetWindowTextW)  VL_ATTACH(SetWindowTextW);
@@ -8595,6 +9287,7 @@ static void UninstallHooks() {
     VL_DETACH(NtClose);
     VL_DETACH(CreateProcessW);
     VL_DETACH(CreateProcessA);
+    if (Real_NtCreateUserProcess) VL_DETACH(NtCreateUserProcess);
 
     // Window title prefixing
     if (Real_SetWindowTextW)  VL_DETACH(SetWindowTextW);
@@ -8661,7 +9354,7 @@ static void UninstallHooks() {
 // DllMain
 // ============================================================
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
 
     if (DetourIsHelperProcess()) return TRUE;
 
@@ -8709,6 +9402,46 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
         VL_DBG(L"DllMain: hooks installed OK");
     }
     else if (reason == DLL_PROCESS_DETACH) {
+        // lpvReserved != NULL  →  actual process termination (ExitProcess /
+        //                         TerminateProcess), not a FreeLibrary call.
+        // lpvReserved == NULL  →  DLL is being unloaded while the process
+        //                         continues; no "exit" to report.
+        if (reserved && g_VerboseEnabled) {
+            // Print the exit message BEFORE UninstallHooks so the hook
+            // infrastructure is still intact if anything inside needs it.
+            //
+            // We intentionally do NOT call EnsureVerboseOutput() here because
+            // AttachConsole is unsafe under the loader lock that DllMain holds
+            // during DLL_PROCESS_DETACH.  Instead we write directly:
+            //   (a) to the cached g_hVerboseOutput handle if already resolved
+            //       (the process had console access while running), and
+            //   (b) always to OutputDebugString, which is safe in any context.
+            wchar_t msgbuf[256];
+            _snwprintf_s(msgbuf, _countof(msgbuf), _TRUNCATE,
+                         L"[VirtLauncher] [ProcessExit] PID=%u exiting\n",
+                         GetCurrentProcessId());
+            size_t msglen = wcslen(msgbuf);
+
+            if (g_hVerboseOutputReady && g_hVerboseOutput) {
+                DWORD n = 0;
+                if (!WriteConsoleW(g_hVerboseOutput, msgbuf, (DWORD)msglen, &n, NULL)
+                    || !n)
+                {
+                    char utf8[512];
+                    int c = WideCharToMultiByte(CP_UTF8, 0, msgbuf, (int)msglen,
+                                               utf8, (int)sizeof(utf8) - 1,
+                                               NULL, NULL);
+                    if (c > 0) WriteFile(g_hVerboseOutput, utf8, (DWORD)c, &n, NULL);
+                }
+            }
+
+            wchar_t dbg[300];
+            _snwprintf_s(dbg, _countof(dbg), _TRUNCATE,
+                         L"[%u] [VirtLauncher] [ProcessExit] PID=%u exiting",
+                         GetCurrentProcessId(), GetCurrentProcessId());
+            OutputDebugStringW(dbg);
+        }
+
         UninstallHooks();
 
         EnterCriticalSection(&g_KeyMapLock);

@@ -4,7 +4,7 @@ CD /D "%~dp0"
 
 ::_______________________________________________
 set VLAUNCHER_VERBOSE=true
-rem set VLAUNCHER_DEBUG=true
+set VLAUNCHER_DEBUG=true
 
 
 ::_______________________________________________
@@ -15,10 +15,12 @@ rem if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
 rem rmdir /Q /S c:\virtl 2>nul
 
 echo virtual store: C:\virtl
-rem VirtLauncher64.exe -r -f C:\virtl -e E:\archivosdeprogramas\FirefoxPortableLegacy115\FirefoxPortable.exe
 
-VirtLauncher64.exe -r -f C:\virtl -e "E:\archivosdeprogramas\FirefoxPortableLegacy115\App\Firefox64\firefox.exe" -profile D:\zbala\FirefoxPortableLegacy115Profileeeeee
-
+set ProfilePath=D:\zbala\GoogleChromePortableProfileeeeeeddd
+VirtLauncher64.exe -r -f C:\virtl -e "E:\archivosdeprogramas\GoogleChromePortable\_last\_chrome\_last\chrome_for_tests.exe"  --start-maximized --new-window --user-data-dir="%ProfilePath%" --restore-last-session --no-default-browser-check --allow-file-access-from-files
+ 
+ 
+ 
 @rem this will not run
 rem if exist "%CD%\VIRTL" rmdir /Q /S "%CD%\VIRTL"
 rem rmdir /Q /S c:\virtl 2>nul

@@ -8,9 +8,19 @@
 ☐ max path 255
     ☐ allow write to paths longuer than 255
     ☐ or add to the doc and help a reminder to users saying: to keep the virtual store short to prevent 255 charachter limit in old os where 32k is not supported so echo and cmd do not have problems inside the virtual world, for example  _test9_exclude_and_filesystem_suite.bat gave multiple errors when virtual folder is inside this long path "F:\_bin\_src\_launcher_virtualization\__VirtLauncher\_testsss\files\final2_fix_rename - Copy - Copyffffffffffffffffffffffffffffffffffffffffffffff\build"
-   
+
+________________   
 ☐ firefox is not sandboxed , should i disable firefox sandbox for my sandbox to work? or is there a better solution to force it run inside my sandbox without disabling firefox sandbox?
 
+NtCreateUserProcess does not exist in Windows XP. It was introduced later as the native, low-level process creation API in Windows Vista (Windows NT kernel version 6.0). [https://community.osr.com/t/ssdt-hooks-for-process-creation-xp-vista-w7/39080, https://forum.madshi.net/viewtopic.php?t=4941]
+In Windows XP (NT kernel version 5.1), the kernel used older, legacy process creation APIs. we would typically work with these alternatives: [https://forum.madshi.net/viewtopic.php?t=4941, https://www.evilsocket.net/2014/02/11/On-Windows-syscall-mechanism-and-syscall-numbers-extraction-methods/]
+• NtCreateProcess / NtCreateProcessEx: The foundational system calls used in Windows XP to establish the core process structures in the kernel.
+• RtlCreateUserProcess: The documented, user-mode NTDLL function that wraps the process setup logic in XP. [https://forum.madshi.net/viewtopic.php?t=4941, https://stackoverflow.com/questions/15424900/do-all-user-mode-processes-started-in-windows-go-through-createprocess, https://www.linkedin.com/pulse/rtlcreateuserprocess-dana-behling-u0yoc]
+
+__________________________
+
+
+☐ use a Job Object — assign the initial process to a job with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 
 ☐ should i use the more low level function than CreateProcessW? i mean should i inject the ntdll equivalent of CreateProcessW or my current method is sufficient? what if an app use ntdll function to start a child the child will not be injected in that case
 
