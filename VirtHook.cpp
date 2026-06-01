@@ -8658,6 +8658,79 @@ fail:
     }
 }
 
+// ============================================================
+// IsChromiumSandboxWorker
+// ============================================================
+// Returns true when the about-to-be-created process is a Chromium sandbox
+// worker (renderer, GPU, network service, utility, crashpad-handler, …).
+//
+// WHY WE MUST SKIP INJECTION FOR THESE PROCESSES
+// -----------------------------------------------
+// Chrome's broker passes PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY in the
+// AttributeList of NtCreateUserProcess.  For sandbox workers, this policy
+// includes PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES
+// (a Code-Integrity-Guard variant) which prevents loading DLLs that are not
+// signed by Microsoft.  VirtHook.dll is unsigned.  When LdrInitializeThunk
+// tries to resolve VirtHook.dll from the import table we patched via
+// DetourUpdateProcessWithDll, CIG rejects the load → the renderer process
+// raises STATUS_BREAKPOINT → Chrome shows "Aw, Snap / STATUS_BREAKPOINT".
+// This only happens with Chrome's sandbox active; --no-sandbox disables CIG
+// on renderer processes, which is why that workaround works.
+//
+// DETECTION
+// ---------
+// Chromium always passes "--type=<worker-type>" (renderer, gpu-process,
+// utility, network, crashpad-handler, …) to every sandboxed child.  The
+// browser / broker process, which has NO sandbox restrictions and where
+// VirtHook works perfectly, does NOT receive this flag.
+//
+// We read ProcessParameters.CommandLine in the CALLER'S (broker's) address
+// space — this is safe because ProcessParameters is a plain pointer to data
+// in the current process.  The kernel copies it into the child's address
+// space later; we read it in the broker here.
+//
+// RTL_USER_PROCESS_PARAMETERS.CommandLine offsets (stable Vista – Win11):
+//   x64: UNICODE_STRING.Length  @ ProcParams + 0x70  (USHORT, size in bytes)
+//        UNICODE_STRING.Buffer  @ ProcParams + 0x78  (PWSTR)
+//   x86: UNICODE_STRING.Length  @ ProcParams + 0x40  (USHORT, size in bytes)
+//        UNICODE_STRING.Buffer  @ ProcParams + 0x44  (PWSTR)
+//
+// VIRTUALIZATION COVERAGE
+// -----------------------
+// Skipping injection in the renderer does NOT lose Chrome data virtualization:
+// Chrome's renderer accesses user-data files through Chrome's own IPC (it
+// calls the broker for all file operations that need policy checks).  The
+// broker IS fully virtualized by VirtHook, so every file/registry access
+// the renderer routes through the broker gets redirected as expected.
+static bool IsChromiumSandboxWorker(PVOID ProcessParameters)
+{
+    if (!ProcessParameters) return false;
+    const BYTE* pp = reinterpret_cast<const BYTE*>(ProcessParameters);
+
+#ifdef _WIN64
+    USHORT       lenBytes = *reinterpret_cast<const USHORT*>(pp + 0x70);
+    const WCHAR* buf      = *reinterpret_cast<const WCHAR* const*>(pp + 0x78);
+#else
+    USHORT       lenBytes = *reinterpret_cast<const USHORT*>(pp + 0x40);
+    const WCHAR* buf      = *reinterpret_cast<const WCHAR* const*>(pp + 0x44);
+#endif
+
+    if (!buf || lenBytes < 7 * sizeof(WCHAR)) return false;
+
+    // Search for "--type=" anywhere in the command line.
+    // We do NOT use std::wstring here to avoid heap allocation in a context
+    // that may be called from a hook (keep it plain and allocation-free).
+    const USHORT nChars = lenBytes / (USHORT)sizeof(WCHAR);
+    for (USHORT i = 0; i + 7 <= nChars; ++i) {
+        if (buf[i]   == L'-' && buf[i+1] == L'-' &&
+            buf[i+2] == L't' && buf[i+3] == L'y' &&
+            buf[i+4] == L'p' && buf[i+5] == L'e' &&
+            buf[i+6] == L'=')
+            return true;
+    }
+    return false;
+}
+
 static NTSTATUS NTAPI Hook_NtCreateUserProcess(
     PHANDLE     ProcessHandle,
     PHANDLE     ThreadHandle,
@@ -8698,6 +8771,34 @@ static NTSTATUS NTAPI Hook_NtCreateUserProcess(
             ProcessDesiredAccess, ThreadDesiredAccess,
             ProcessObjectAttributes, ThreadObjectAttributes,
             ProcessFlags, ThreadFlags,
+            ProcessParameters, CreateInfo, AttributeList);
+    }
+
+    // -----------------------------------------------------------------------
+    // (C) Chromium / Electron sandbox worker — skip injection entirely.
+    //
+    // Chrome's broker sets PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_
+    // MICROSOFT_BINARIES (CIG) on renderer, GPU, network-service and other
+    // sandboxed workers via PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY.  This
+    // blocks loading unsigned DLLs; VirtHook.dll is unsigned.  If we patch
+    // the import table with DetourUpdateProcessWithDll, LdrInitializeThunk
+    // will try to load VirtHook.dll, CIG will reject it, and the process
+    // raises STATUS_BREAKPOINT → "Aw, Snap" tab crash.
+    //
+    // Detection: Chromium always passes "--type=<worker>" to every sandboxed
+    // child; the broker (main process) has no "--type=" flag and is injected
+    // normally.  We pass the ORIGINAL ThreadFlags (no forced-suspend) so
+    // Chrome's broker receives the child in exactly the state it created it.
+    // -----------------------------------------------------------------------
+    if (IsChromiumSandboxWorker(ProcessParameters)) {
+        VL_DBG(L"Hook_NtCreateUserProcess: Chromium --type= worker detected, skipping injection");
+        VL_INFO(L"[VirtLauncher] [NtCreateUserProcess] Chromium sandbox worker"
+                L" -- skipping injection (CIG policy blocks unsigned DLLs)");
+        return Real_NtCreateUserProcess(
+            ProcessHandle, ThreadHandle,
+            ProcessDesiredAccess, ThreadDesiredAccess,
+            ProcessObjectAttributes, ThreadObjectAttributes,
+            ProcessFlags, ThreadFlags,      // original flags, NOT modified
             ProcessParameters, CreateInfo, AttributeList);
     }
 
