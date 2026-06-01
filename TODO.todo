@@ -24,6 +24,16 @@ __________________________
 
 ☐ should i use the more low level function than CreateProcessW? i mean should i inject the ntdll equivalent of CreateProcessW or my current method is sufficient? what if an app use ntdll function to start a child the child will not be injected in that case
 
+
+☐ Important Considerations for Your Sandbox
+While hooking NtCreateUserProcess is technically sufficient for the "entry point," a robust sandbox needs to account for a few edge cases: -
+
+  Multiple Entry Points: Do not rely solely on NtCreateUserProcess. Newer versions of Windows and different compilers may sometimes use legacy functions like NtCreateProcess or NtCreateProcessEx for specific tasks. If an application uses these older APIs, your hook on NtCreateUserProcess will be bypassed.
+
+  Bypassing via Direct Syscalls: Sophisticated malware or advanced applications often bypass ntdll.dll entirely by executing the syscall instruction directly from their own memory space. If the application doesn't call the ntdll function at all, your hook (which relies on ntdll being loaded and used) will be bypassed. To detect this, you would need to use Kernel-Mode callback routines (like PsSetCreateProcessNotifyRoutine).
+
+  The Ldr Functions: If you are building a sandbox, remember that processes can also be created/manipulated through loaders. Hooking process creation is a great start, but monitor NtMapViewOfSection and NtWriteVirtualMemory as well, as these are often used to inject code into the new process before it fully starts.
+
 - Low priority tasks:                                                 
 
 ☐ @low add mingw compile https://github.com/microsoft/Detours/blob/f4c0fc91b8a93fc09ccbbd6e4277efe6872784fe/src/detours.h#L53
