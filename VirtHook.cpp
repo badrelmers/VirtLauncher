@@ -8658,46 +8658,76 @@ fail:
     }
 }
 
-// -----------------------------------------------------------------------
-// ChildCommandLineContains
+// ============================================================
+// IsChromiumSandboxWorker
+// ============================================================
+// Returns true when the about-to-be-created process is a Chromium sandbox
+// worker (renderer, GPU, network service, utility, crashpad-handler, …).
 //
-// Reads the CommandLine field from the child's RTL_USER_PROCESS_PARAMETERS
-// (already constructed in the PARENT address space by the time
-// NtCreateUserProcess returns) and checks whether it contains 'needle'
-// (case-insensitive substring match).
+// WHY WE MUST SKIP INJECTION FOR THESE PROCESSES
+// -----------------------------------------------
+// Chrome's broker passes PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY in the
+// AttributeList of NtCreateUserProcess.  For sandbox workers, this policy
+// includes PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES
+// (a Code-Integrity-Guard variant) which prevents loading DLLs that are not
+// signed by Microsoft.  VirtHook.dll is unsigned.  When LdrInitializeThunk
+// tries to resolve VirtHook.dll from the import table we patched via
+// DetourUpdateProcessWithDll, CIG rejects the load → the renderer process
+// raises STATUS_BREAKPOINT → Chrome shows "Aw, Snap / STATUS_BREAKPOINT".
+// This only happens with Chrome's sandbox active; --no-sandbox disables CIG
+// on renderer processes, which is why that workaround works.
 //
-// Structure offsets (match StdHandleInjectIntoChild layout):
-//   RTL_USER_PROCESS_PARAMETERS::CommandLine (UNICODE_STRING)
-//     32-bit: struct at +0x40, Buffer pointer at +0x44
-//     64-bit: struct at +0x70, Buffer pointer at +0x78
+// DETECTION
+// ---------
+// Chromium always passes "--type=<worker-type>" (renderer, gpu-process,
+// utility, network, crashpad-handler, …) to every sandboxed child.  The
+// browser / broker process, which has NO sandbox restrictions and where
+// VirtHook works perfectly, does NOT receive this flag.
 //
-// Used to detect Chrome/Chromium sandboxed child types before injection.
-static bool ChildCommandLineContains(PVOID pParams, bool childIs64,
-                                     const wchar_t* needle)
+// We read ProcessParameters.CommandLine in the CALLER'S (broker's) address
+// space — this is safe because ProcessParameters is a plain pointer to data
+// in the current process.  The kernel copies it into the child's address
+// space later; we read it in the broker here.
+//
+// RTL_USER_PROCESS_PARAMETERS.CommandLine offsets (stable Vista – Win11):
+//   x64: UNICODE_STRING.Length  @ ProcParams + 0x70  (USHORT, size in bytes)
+//        UNICODE_STRING.Buffer  @ ProcParams + 0x78  (PWSTR)
+//   x86: UNICODE_STRING.Length  @ ProcParams + 0x40  (USHORT, size in bytes)
+//        UNICODE_STRING.Buffer  @ ProcParams + 0x44  (PWSTR)
+//
+// VIRTUALIZATION COVERAGE
+// -----------------------
+// Skipping injection in the renderer does NOT lose Chrome data virtualization:
+// Chrome's renderer accesses user-data files through Chrome's own IPC (it
+// calls the broker for all file operations that need policy checks).  The
+// broker IS fully virtualized by VirtHook, so every file/registry access
+// the renderer routes through the broker gets redirected as expected.
+static bool IsChromiumSandboxWorker(PVOID ProcessParameters)
 {
-    if (!pParams || !needle || !*needle) return false;
-    __try {
-        const SIZE_T cmdOff = childIs64 ? (SIZE_T)0x70u : (SIZE_T)0x40u;
-        const SIZE_T bufOff = childIs64 ? (SIZE_T)0x78u : (SIZE_T)0x44u;
-        const SIZE_T ptrSz  = childIs64 ? (SIZE_T)8u    : (SIZE_T)4u;
+    if (!ProcessParameters) return false;
+    const BYTE* pp = reinterpret_cast<const BYTE*>(ProcessParameters);
 
-        USHORT cmdLen = 0;
-        memcpy(&cmdLen, (const BYTE*)pParams + cmdOff, sizeof(USHORT));
-        if (cmdLen == 0) return false;
+#ifdef _WIN64
+    USHORT       lenBytes = *reinterpret_cast<const USHORT*>(pp + 0x70);
+    const WCHAR* buf      = *reinterpret_cast<const WCHAR* const*>(pp + 0x78);
+#else
+    USHORT       lenBytes = *reinterpret_cast<const USHORT*>(pp + 0x40);
+    const WCHAR* buf      = *reinterpret_cast<const WCHAR* const*>(pp + 0x44);
+#endif
 
-        ULONG_PTR bufPtr = 0;
-        memcpy(&bufPtr, (const BYTE*)pParams + bufOff, ptrSz);
-        if (!bufPtr) return false;
+    if (!buf || lenBytes < 7 * sizeof(WCHAR)) return false;
 
-        const SIZE_T wchars = cmdLen / sizeof(wchar_t);
-        const SIZE_T nlen   = wcslen(needle);
-        if (nlen > wchars) return false;
-
-        const wchar_t* buf = reinterpret_cast<const wchar_t*>(bufPtr);
-        for (SIZE_T i = 0; i + nlen <= wchars; ++i) {
-            if (_wcsnicmp(buf + i, needle, nlen) == 0) return true;
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    // Search for "--type=" anywhere in the command line.
+    // We do NOT use std::wstring here to avoid heap allocation in a context
+    // that may be called from a hook (keep it plain and allocation-free).
+    const USHORT nChars = lenBytes / (USHORT)sizeof(WCHAR);
+    for (USHORT i = 0; i + 7 <= nChars; ++i) {
+        if (buf[i]   == L'-' && buf[i+1] == L'-' &&
+            buf[i+2] == L't' && buf[i+3] == L'y' &&
+            buf[i+4] == L'p' && buf[i+5] == L'e' &&
+            buf[i+6] == L'=')
+            return true;
+    }
     return false;
 }
 
@@ -8741,6 +8771,34 @@ static NTSTATUS NTAPI Hook_NtCreateUserProcess(
             ProcessDesiredAccess, ThreadDesiredAccess,
             ProcessObjectAttributes, ThreadObjectAttributes,
             ProcessFlags, ThreadFlags,
+            ProcessParameters, CreateInfo, AttributeList);
+    }
+
+    // -----------------------------------------------------------------------
+    // (C) Chromium / Electron sandbox worker — skip injection entirely.
+    //
+    // Chrome's broker sets PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_
+    // MICROSOFT_BINARIES (CIG) on renderer, GPU, network-service and other
+    // sandboxed workers via PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY.  This
+    // blocks loading unsigned DLLs; VirtHook.dll is unsigned.  If we patch
+    // the import table with DetourUpdateProcessWithDll, LdrInitializeThunk
+    // will try to load VirtHook.dll, CIG will reject it, and the process
+    // raises STATUS_BREAKPOINT → "Aw, Snap" tab crash.
+    //
+    // Detection: Chromium always passes "--type=<worker>" to every sandboxed
+    // child; the broker (main process) has no "--type=" flag and is injected
+    // normally.  We pass the ORIGINAL ThreadFlags (no forced-suspend) so
+    // Chrome's broker receives the child in exactly the state it created it.
+    // -----------------------------------------------------------------------
+    if (IsChromiumSandboxWorker(ProcessParameters)) {
+        VL_DBG(L"Hook_NtCreateUserProcess: Chromium --type= worker detected, skipping injection");
+        VL_INFO(L"[VirtLauncher] [NtCreateUserProcess] Chromium sandbox worker"
+                L" -- skipping injection (CIG policy blocks unsigned DLLs)");
+        return Real_NtCreateUserProcess(
+            ProcessHandle, ThreadHandle,
+            ProcessDesiredAccess, ThreadDesiredAccess,
+            ProcessObjectAttributes, ThreadObjectAttributes,
+            ProcessFlags, ThreadFlags,      // original flags, NOT modified
             ProcessParameters, CreateInfo, AttributeList);
     }
 
@@ -8804,51 +8862,6 @@ static NTSTATUS NTAPI Hook_NtCreateUserProcess(
     const char* injectDll = childIs64
         ? (g_DllPathA64[0] ? g_DllPathA64 : dllPath)
         : (g_DllPathA32[0] ? g_DllPathA32 : dllPath);
-
-    // -----------------------------------------------------------------------
-    // (C) ACG-incompatible sandbox child detection.
-    //
-    // Chrome/Chromium's broker applies ProcessDynamicCodePolicy (ACG) to
-    // RENDERER processes (and some utility/extension processes) BEFORE calling
-    // ResumeThread.  Once ACG is active, Detours' DetourTransactionCommit
-    // cannot call VirtualProtect(PAGE_EXECUTE_READWRITE) on ntdll pages.
-    // The failure mode is partial hook installation: Detours writes the first
-    // byte of a JMP stub, VirtualProtect to restore PAGE_EXECUTE_READ then
-    // fails, leaving orphaned 0xCC (INT3) bytes → STATUS_BREAKPOINT the next
-    // time any hooked ntdll function is called from the renderer.
-    //
-    // Fix: detect the process type from its CommandLine before injection.
-    // --type=renderer  → Chrome/Chromium renderer (ACG enabled, strict sandbox)
-    // --type=utility   → Chrome utility process (may also have ACG)
-    //
-    // GPU and network-service processes do NOT receive ACG and are handled
-    // safely by the IsAcgEnabled() guard inside InstallHooks() (belt-and-
-    // suspenders fallback for any process type we didn't predict here).
-    //
-    // When we skip injection we still obey callerWantedSuspended so the
-    // broker's sandbox-setup sequence is not disturbed.
-    // -----------------------------------------------------------------------
-    const bool skipForAcgSandbox =
-        ChildCommandLineContains(ProcessParameters, childIs64, L"--type=renderer") ||
-        ChildCommandLineContains(ProcessParameters, childIs64, L"--type=utility");
-
-    if (skipForAcgSandbox) {
-        const DWORD childPid = GetProcessId(hProcess);
-        VL_DBG(L"Hook_NtCreateUserProcess: child PID=%u has ACG-incompatible "
-               L"--type flag -- skipping import table injection.", childPid);
-        VL_INFO(L"[VirtLauncher] [NtCreateUserProcess] child PID=%u: skipping "
-                L"injection (ACG sandbox type)", childPid);
-
-        if (!callerWantedSuspended) {
-            DWORD prev = ResumeThread(hThread);
-            VL_DBG(L"Hook_NtCreateUserProcess: ResumeThread prevCount=%u "
-                   L"(no injection)", prev);
-        } else {
-            VL_DBG(L"Hook_NtCreateUserProcess: leaving child suspended "
-                   L"(caller requested, no injection)");
-        }
-        return st;
-    }
 
     VL_DBG(L"Hook_NtCreateUserProcess: child PID=%u (%s), patching import table with %S",
            GetProcessId(hProcess), childIs64 ? L"64-bit" : L"32-bit", injectDll);
@@ -8926,11 +8939,78 @@ static NTSTATUS NTAPI Hook_NtCreateUserProcess(
 // Hook Install / Uninstall
 // ============================================================
 
+// ---- NtStubIsExternallyPatched ------------------------------------------
+// Returns true when an ntdll syscall stub has been patched by an external
+// agent BEFORE our Detours hooks run (e.g. Chrome / Edge / Brave sandbox
+// InterceptionManager, Electron sandbox, DBI frameworks).
+//
+// WHY WE NEED THIS
+// ----------------
+// Browser sandbox brokers patch renderer ntdll stubs with JMP instructions
+// pointing to their own IPC thunks while the renderer is suspended (before
+// LdrInitializeThunk runs).  The thunks identify which function intercepted
+// them by checking the call's return address against a table of registered
+// interception sites.
+//
+// If Detours then patches the same stub on top (in VirtHook DllMain), calls
+// reach the IPC thunk via Detours's trampoline buffer.  The trampoline
+// address is NOT in the broker's table → the broker calls __debugbreak()
+// → the renderer crashes with STATUS_BREAKPOINT ("Aw Snap", "Aw Shucks").
+//
+// This is exactly the Chrome sandbox tab-crash bug reproduced by VirtHook:
+//   • Chrome opens fine (broker process is not patched this way)
+//   • A new tab crashes immediately with STATUS_BREAKPOINT
+//   • --no-sandbox eliminates the broker's ntdll patches → no conflict
+//
+// THE CHECK
+// ---------
+// Every unmodified ntdll syscall stub on x64 begins with 0x4C — the REX.W
+// prefix byte of "mov r10, rcx" (4C 8B D1), which is the FIRST instruction
+// in every syscall stub since Windows Vista.  This byte never changes across
+// Windows versions or build numbers.
+//
+// On x86, unmodified stubs begin with 0xB8 ("mov eax, <syscall_number>").
+//
+// If the first byte is anything else (0xE9 = near JMP used by Chrome; 0xFF
+// = indirect JMP; 0xCC = int3 used by some breakpoint-based interceptors)
+// the stub was externally modified and we must not hook it.
+//
+// SCOPE
+// -----
+// This check ONLY applies to ntdll Nt* syscall stubs, never to kernel32 or
+// user32 exports.  CreateProcessW, SetWindowTextW, etc. have diverse
+// function prologues that do not follow the 0x4C / 0xB8 pattern; applying
+// the check to them would incorrectly skip those hooks.
+static bool NtStubIsExternallyPatched(PVOID fn)
+{
+    if (!fn) return false;
+    const BYTE first = *reinterpret_cast<const BYTE*>(fn);
+#ifdef _WIN64
+    return first != 0x4C;   // 0x4C = REX.W prefix of "mov r10, rcx"
+#else
+    return first != 0xB8;   // 0xB8 = "mov eax, <syscall_number>"
+#endif
+}
+
 #define VL_GETPROC(mod, name) \
     Real_##name = reinterpret_cast<Pfn##name>(GetProcAddress(mod, #name))
 
 #define VL_ATTACH(fn) \
     if (Real_##fn) DetourAttach(reinterpret_cast<PVOID*>(&Real_##fn), Hook_##fn)
+
+// VL_ATTACH_NT: variant for ntdll Nt* syscall stubs only.
+// Skips DetourAttach when the stub has already been patched by an external
+// agent (browser sandbox, DBI tool, etc.) to avoid breaking its IPC chain.
+#define VL_ATTACH_NT(fn) \
+    if (Real_##fn) { \
+        if (NtStubIsExternallyPatched(reinterpret_cast<PVOID>(Real_##fn))) { \
+            VL_DBG(L"InstallHooks: SKIP " L#fn \
+                   L" -- externally patched (first byte=0x%02X)", \
+                   (unsigned)*reinterpret_cast<const BYTE*>(Real_##fn)); \
+        } else { \
+            DetourAttach(reinterpret_cast<PVOID*>(&Real_##fn), Hook_##fn); \
+        } \
+    }
 
 #define VL_DETACH(fn) \
     if (Real_##fn) DetourDetach(reinterpret_cast<PVOID*>(&Real_##fn), Hook_##fn)
@@ -9168,63 +9248,7 @@ static BOOL WINAPI Hook_SetConsoleTitleA(LPCSTR lpConsoleTitle) {
     return Real_SetConsoleTitleA(lpConsoleTitle);
 }
 
-// ============================================================
-// ACG (Arbitrary Code Guard) detection
-// ============================================================
-//
-// Returns true if ProcessDynamicCodePolicy (ACG) is active in the current
-// process.  Used by InstallHooks() to skip Detours hook installation in
-// ACG-protected processes (e.g. Chrome renderer), where VirtualProtect on
-// ntdll code pages is blocked and would leave orphaned INT3 bytes.
-//
-// Implementation deliberately avoids Win8 SDK types (PROCESS_MITIGATION_POLICY,
-// PROCESS_MITIGATION_DYNAMIC_CODE_POLICY) so the code compiles with VS2010.
-// GetProcessMitigationPolicy is resolved via GetProcAddress at runtime; on
-// pre-Win8 systems where it is absent the function safely returns false.
-//
-//   ProcessDynamicCodePolicy == 2  (PROCESS_MITIGATION_POLICY enum, Win8+)
-//   PROCESS_MITIGATION_DYNAMIC_CODE_POLICY::Flags bit 0 == ProhibitDynamicCode
-static bool IsAcgEnabled() {
-    // Signature uses plain int/PVOID/SIZE_T to avoid Win8 SDK enum dependency.
-    typedef BOOL (WINAPI *PfnGetPMP)(HANDLE, int, PVOID, SIZE_T);
-    static PfnGetPMP s_fn = reinterpret_cast<PfnGetPMP>(
-        GetProcAddress(GetModuleHandleA("kernel32.dll"),
-                       "GetProcessMitigationPolicy"));
-    if (!s_fn) return false;   // Pre-Win8: ACG does not exist
-
-    // PROCESS_MITIGATION_DYNAMIC_CODE_POLICY is a DWORD Flags field;
-    // bit 0 is ProhibitDynamicCode.  Use a plain DWORD to stay VS2010-safe.
-    DWORD pol = 0;
-    if (!s_fn(GetCurrentProcess(), 2 /*ProcessDynamicCodePolicy*/, &pol, sizeof(pol)))
-        return false;
-    return (pol & 0x1u) != 0;  // bit 0 = ProhibitDynamicCode
-}
-
 static void InstallHooks() {
-    // -----------------------------------------------------------------------
-    // ACG guard: Detours installs hooks by calling VirtualProtect to make ntdll
-    // code pages writable, writing JMP trampolines, then restoring protection.
-    // Both VirtualProtect calls are blocked when ProcessDynamicCodePolicy (ACG)
-    // is active, causing a partial write that leaves INT3 bytes in ntdll stubs
-    // → STATUS_BREAKPOINT on the next call to any hooked function.
-    //
-    // Chrome applies ACG to RENDERER processes before ResumeThread.  The three
-    // non-renderer Chromium process types (gpu-process, utility, network-service)
-    // seen in the debug log do NOT have ACG and hook successfully.
-    //
-    // When ACG is detected we skip hook installation entirely.  The DLL is
-    // already loaded into the process (via import table patching) so this is a
-    // graceful no-op: the process runs without virtualization rather than
-    // crashing.  The companion fix in Hook_NtCreateUserProcess (below) also
-    // prevents injection into renderer/utility children in the first place,
-    // so this guard is a belt-and-suspenders safety net.
-    // -----------------------------------------------------------------------
-    if (IsAcgEnabled()) {
-        VL_DBG(L"InstallHooks: ProcessDynamicCodePolicy (ACG) is active -- "
-               L"skipping Detours hook installation to avoid INT3 corruption.");
-        return;
-    }
-
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
     HMODULE k32   = GetModuleHandleA("kernel32.dll");
     if (!ntdll || !k32) return;
@@ -9355,10 +9379,10 @@ static void InstallHooks() {
     DetourUpdateThread(GetCurrentThread());
 
     // Always
-    VL_ATTACH(NtClose);
+    VL_ATTACH_NT(NtClose);
     VL_ATTACH(CreateProcessW);
     VL_ATTACH(CreateProcessA);
-    if (Real_NtCreateUserProcess) VL_ATTACH(NtCreateUserProcess);
+    if (Real_NtCreateUserProcess) VL_ATTACH_NT(NtCreateUserProcess);
 
     // Window title prefixing
     if (Real_SetWindowTextW)  VL_ATTACH(SetWindowTextW);
@@ -9371,53 +9395,53 @@ static void InstallHooks() {
 
     // Registry
     if (g_RegEnabled) {
-        VL_ATTACH(NtOpenKey);
-        if (Real_NtOpenKeyEx)           VL_ATTACH(NtOpenKeyEx);
-        if (Real_NtOpenKeyTransacted)    VL_ATTACH(NtOpenKeyTransacted);
-        if (Real_NtOpenKeyTransactedEx)  VL_ATTACH(NtOpenKeyTransactedEx);
-        VL_ATTACH(NtCreateKey);
-        if (Real_NtCreateKeyTransacted)  VL_ATTACH(NtCreateKeyTransacted);
-        VL_ATTACH(NtDeleteKey);
-        VL_ATTACH(NtDeleteValueKey);
-        VL_ATTACH(NtEnumerateKey);
-        VL_ATTACH(NtEnumerateValueKey);
-        VL_ATTACH(NtQueryKey);
-        VL_ATTACH(NtQueryValueKey);
-        if (Real_NtQueryMultipleValueKey) VL_ATTACH(NtQueryMultipleValueKey);
-        VL_ATTACH(NtSetValueKey);
-        if (Real_NtRenameKey)            VL_ATTACH(NtRenameKey);
-        if (Real_NtReplaceKey)           VL_ATTACH(NtReplaceKey);
-        if (Real_NtSaveKey)              VL_ATTACH(NtSaveKey);
-        if (Real_NtSaveKeyEx)            VL_ATTACH(NtSaveKeyEx);
-        if (Real_NtLoadKey)              VL_ATTACH(NtLoadKey);
-        if (Real_NtLoadKey2)             VL_ATTACH(NtLoadKey2);
-        if (Real_NtLoadKeyEx)            VL_ATTACH(NtLoadKeyEx);
-        if (Real_NtLoadKey3)             VL_ATTACH(NtLoadKey3);
-        VL_ATTACH(NtNotifyChangeKey);
-        if (Real_NtNotifyChangeMultipleKeys) VL_ATTACH(NtNotifyChangeMultipleKeys);
-        if (Real_NtFlushKey)             VL_ATTACH(NtFlushKey);
-        if (Real_NtRestoreKey)           VL_ATTACH(NtRestoreKey);
-        if (Real_NtSetInformationKey)    VL_ATTACH(NtSetInformationKey);
-        if (Real_NtUnloadKey)            VL_ATTACH(NtUnloadKey);
+        VL_ATTACH_NT(NtOpenKey);
+        if (Real_NtOpenKeyEx)           VL_ATTACH_NT(NtOpenKeyEx);
+        if (Real_NtOpenKeyTransacted)    VL_ATTACH_NT(NtOpenKeyTransacted);
+        if (Real_NtOpenKeyTransactedEx)  VL_ATTACH_NT(NtOpenKeyTransactedEx);
+        VL_ATTACH_NT(NtCreateKey);
+        if (Real_NtCreateKeyTransacted)  VL_ATTACH_NT(NtCreateKeyTransacted);
+        VL_ATTACH_NT(NtDeleteKey);
+        VL_ATTACH_NT(NtDeleteValueKey);
+        VL_ATTACH_NT(NtEnumerateKey);
+        VL_ATTACH_NT(NtEnumerateValueKey);
+        VL_ATTACH_NT(NtQueryKey);
+        VL_ATTACH_NT(NtQueryValueKey);
+        if (Real_NtQueryMultipleValueKey) VL_ATTACH_NT(NtQueryMultipleValueKey);
+        VL_ATTACH_NT(NtSetValueKey);
+        if (Real_NtRenameKey)            VL_ATTACH_NT(NtRenameKey);
+        if (Real_NtReplaceKey)           VL_ATTACH_NT(NtReplaceKey);
+        if (Real_NtSaveKey)              VL_ATTACH_NT(NtSaveKey);
+        if (Real_NtSaveKeyEx)            VL_ATTACH_NT(NtSaveKeyEx);
+        if (Real_NtLoadKey)              VL_ATTACH_NT(NtLoadKey);
+        if (Real_NtLoadKey2)             VL_ATTACH_NT(NtLoadKey2);
+        if (Real_NtLoadKeyEx)            VL_ATTACH_NT(NtLoadKeyEx);
+        if (Real_NtLoadKey3)             VL_ATTACH_NT(NtLoadKey3);
+        VL_ATTACH_NT(NtNotifyChangeKey);
+        if (Real_NtNotifyChangeMultipleKeys) VL_ATTACH_NT(NtNotifyChangeMultipleKeys);
+        if (Real_NtFlushKey)             VL_ATTACH_NT(NtFlushKey);
+        if (Real_NtRestoreKey)           VL_ATTACH_NT(NtRestoreKey);
+        if (Real_NtSetInformationKey)    VL_ATTACH_NT(NtSetInformationKey);
+        if (Real_NtUnloadKey)            VL_ATTACH_NT(NtUnloadKey);
     }
 
     // Files
     if (g_FsEnabled) {
-        VL_ATTACH(NtCreateFile);
-        VL_ATTACH(NtOpenFile);
-        if (Real_NtCreateDirectoryObject) VL_ATTACH(NtCreateDirectoryObject);
-        if (Real_NtOpenDirectoryObject)   VL_ATTACH(NtOpenDirectoryObject);
-        if (Real_NtCreateMailslotFile)    VL_ATTACH(NtCreateMailslotFile);
-        if (Real_NtCreateNamedPipeFile)   VL_ATTACH(NtCreateNamedPipeFile);
-        if (Real_NtDeleteFile)            VL_ATTACH(NtDeleteFile);
-        if (Real_NtQueryAttributesFile)   VL_ATTACH(NtQueryAttributesFile);
-        if (Real_NtQueryFullAttributesFile) VL_ATTACH(NtQueryFullAttributesFile);
-        if (Real_NtQueryInformationByName)  VL_ATTACH(NtQueryInformationByName);
-        if (Real_NtSetInformationFile)    VL_ATTACH(NtSetInformationFile);
-        if (Real_NtFsControlFile)         VL_ATTACH(NtFsControlFile);
-        if (Real_NtQueryDirectoryFile)    VL_ATTACH(NtQueryDirectoryFile);
-        if (Real_NtQueryDirectoryFileEx)  VL_ATTACH(NtQueryDirectoryFileEx);
-        if (Real_NtQueryInformationFile)  VL_ATTACH(NtQueryInformationFile);
+        VL_ATTACH_NT(NtCreateFile);
+        VL_ATTACH_NT(NtOpenFile);
+        if (Real_NtCreateDirectoryObject) VL_ATTACH_NT(NtCreateDirectoryObject);
+        if (Real_NtOpenDirectoryObject)   VL_ATTACH_NT(NtOpenDirectoryObject);
+        if (Real_NtCreateMailslotFile)    VL_ATTACH_NT(NtCreateMailslotFile);
+        if (Real_NtCreateNamedPipeFile)   VL_ATTACH_NT(NtCreateNamedPipeFile);
+        if (Real_NtDeleteFile)            VL_ATTACH_NT(NtDeleteFile);
+        if (Real_NtQueryAttributesFile)   VL_ATTACH_NT(NtQueryAttributesFile);
+        if (Real_NtQueryFullAttributesFile) VL_ATTACH_NT(NtQueryFullAttributesFile);
+        if (Real_NtQueryInformationByName)  VL_ATTACH_NT(NtQueryInformationByName);
+        if (Real_NtSetInformationFile)    VL_ATTACH_NT(NtSetInformationFile);
+        if (Real_NtFsControlFile)         VL_ATTACH_NT(NtFsControlFile);
+        if (Real_NtQueryDirectoryFile)    VL_ATTACH_NT(NtQueryDirectoryFile);
+        if (Real_NtQueryDirectoryFileEx)  VL_ATTACH_NT(NtQueryDirectoryFileEx);
+        if (Real_NtQueryInformationFile)  VL_ATTACH_NT(NtQueryInformationFile);
     }
 
     LONG commitResult = DetourTransactionCommit();
