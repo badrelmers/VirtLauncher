@@ -16,8 +16,8 @@ rem rmdir /Q /S c:\virtl 2>nul
 
 echo virtual store: C:\virtl
 
-set ProfilePath=D:\zbala\GoogleChromePortableProfileeeeeeddd_no-sandbox_32
-VirtLauncher64.exe -r -f C:\virtl -e "E:\archivosdeprogramas\GoogleChromePortable\_last\_chrome\_last\chrome_for_tests.exe"  --start-maximized --new-window --user-data-dir="%ProfilePath%" --restore-last-session --no-default-browser-check --allow-file-access-from-files --no-sandbox
+set ProfilePath=D:\zbala\GoogleChromePortableProfileeeeeeddd_109_sandboxed_64
+VirtLauncher64.exe -r -f C:\virtl -e "E:\archivosdeprogramas\GoogleChromePortable\_last\chrome_109_x64\chrome_v109_x64.exe"  --start-maximized --new-window --user-data-dir="%ProfilePath%" --restore-last-session --no-default-browser-check --allow-file-access-from-files
  
  
  
